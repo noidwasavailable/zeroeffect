@@ -1,0 +1,85 @@
+import { z } from "zod";
+import { NextResponse } from "next/server";
+import { withEmailProvider } from "@/utils/middleware";
+import type { EmailProvider, GetThreadOptions } from "@/utils/email/types";
+import { parseMessageReply } from "@/utils/email/parse-message-reply";
+import { getEmailProviderRateLimitMessage, SafeError } from "@/utils/error";
+import { isEmailProviderRateLimitError } from "@/utils/email/is-provider-rate-limit-error";
+import { isThreadNotFoundError } from "@/utils/email/thread-not-found";
+
+const threadQuery = z.object({ id: z.string() });
+export type ThreadQuery = z.infer<typeof threadQuery>;
+export type ThreadResponse = Awaited<ReturnType<typeof getThread>>;
+
+async function getThread(
+  id: string,
+  options: GetThreadOptions,
+  parseReplies: boolean,
+  emailProvider: EmailProvider,
+) {
+  const thread = await emailProvider.getThread(id, options);
+
+  let filteredMessages = thread.messages;
+  if (parseReplies) {
+    filteredMessages = filteredMessages.map(parseMessageReply);
+  }
+
+  return {
+    thread: {
+      ...thread,
+      messages: filteredMessages,
+    },
+  };
+}
+
+export const maxDuration = 300;
+
+export const GET = withEmailProvider(
+  "threads/detail",
+  async (request, context) => {
+    const { emailProvider } = request;
+
+    const params = await context.params;
+    const { id } = threadQuery.parse(params);
+
+    const { searchParams } = new URL(request.url);
+    const includeDrafts = searchParams.get("includeDrafts") === "true";
+    const parseReplies = searchParams.get("parseReplies") === "true";
+
+    try {
+      const thread = await getThread(
+        id,
+        {
+          includeDrafts,
+          ...(searchParams.get("complete") === "true"
+            ? { complete: true, signal: request.signal }
+            : {}),
+        },
+        parseReplies,
+        emailProvider,
+      );
+      return NextResponse.json(thread);
+    } catch (error) {
+      if (
+        isEmailProviderRateLimitError({
+          error,
+          provider: emailProvider.name,
+        })
+      ) {
+        throw new SafeError(
+          getEmailProviderRateLimitMessage(emailProvider.name),
+          429,
+        );
+      }
+      if (isThreadNotFoundError(error)) {
+        // A just-sent message can take a few seconds to become readable, so
+        // this is not always a permanent failure.
+        throw new SafeError(
+          "This conversation isn't available yet. It may still be syncing with your mailbox, or it was deleted.",
+          404,
+        );
+      }
+      throw error;
+    }
+  },
+);

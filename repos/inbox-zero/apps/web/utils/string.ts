@@ -1,0 +1,141 @@
+import * as he from "he";
+
+export function escapeHtml(text: string | null | undefined): string {
+  if (!text) return "";
+  return he.escape(text);
+}
+
+// Blank lines separate paragraphs, single newlines become line breaks. Escaped
+// because the text is usually model- or user-written and ends up in sent HTML.
+export function textToHtmlParagraphs(text?: string | null): string {
+  if (!text) return "";
+
+  return text
+    .replace(/\r\n/g, "\n")
+    .split(/\n{2,}/)
+    .map((paragraph) => paragraph.trim())
+    .filter((paragraph) => paragraph !== "")
+    .map(
+      (paragraph) => `<p>${escapeHtml(paragraph).replace(/\n/g, "<br />")}</p>`,
+    )
+    .join("");
+}
+
+export function truncate(str: string, length: number) {
+  return str.length > length ? `${sliceHead(str, length)}...` : str;
+}
+
+const HEAD_TAIL_ELLIPSIS = "\n...\n";
+
+// Keep the start and end of a long string so closing asks/CTAs survive truncation.
+export function truncateHeadTail(
+  str: string,
+  maxLength: number,
+  tailLength: number,
+) {
+  if (str.length <= maxLength) return str;
+
+  const ellipsis = HEAD_TAIL_ELLIPSIS;
+  if (maxLength <= ellipsis.length) return sliceHead(str, maxLength);
+
+  const clampedTailLength = Math.max(
+    0,
+    Math.min(tailLength, maxLength - ellipsis.length),
+  );
+  const headLength = maxLength - clampedTailLength - ellipsis.length;
+  if (headLength <= 0) {
+    return `${ellipsis}${sliceTail(str, maxLength - ellipsis.length)}`;
+  }
+
+  return `${sliceHead(str, headLength)}${ellipsis}${sliceTail(str, clampedTailLength)}`;
+}
+
+export function trimToNonEmptyString(value: unknown): string | undefined {
+  if (typeof value !== "string") return;
+
+  const trimmedValue = value.trim();
+  return trimmedValue.length > 0 ? trimmedValue : undefined;
+}
+
+export function removeExcessiveWhitespace(str: string) {
+  return (
+    str
+      // First remove all zero-width spaces, soft hyphens, and other invisible characters
+      // Handle each special character separately to avoid combining character issues
+      .replace(
+        /\u200B|\u200C|\u200D|\u200E|\u200F|\uFEFF|\u3164|\u00AD|\u034F/g,
+        " ",
+      )
+      // Normalize all types of line breaks to \n
+      .replace(/\r\n|\r/g, "\n")
+      // Then collapse multiple newlines (3 or more) into double newlines
+      .replace(/\n\s*\n\s*\n+/g, "\n\n")
+      // Clean up spaces around newlines (but preserve double newlines)
+      .replace(/[^\S\n]*\n[^\S\n]*/g, "\n")
+      // Replace multiple spaces (but not newlines) with single space
+      .replace(/[^\S\n]+/g, " ")
+      // Clean up any trailing/leading whitespace
+      .trim()
+  );
+}
+
+export function generalizeSubject(subject = "") {
+  return (
+    subject
+      // Remove content in parentheses
+      .replace(/\([^)]*\)/g, "")
+      // Remove numbers and IDs
+      .replace(/(?:#\d+|\b\d+\b)/g, "")
+      // Clean up extra whitespace
+      .replace(/\s+/g, " ")
+      .trim()
+  );
+}
+
+export function pluralize(
+  count: number,
+  singular: string,
+  plural = `${singular}s`,
+) {
+  return count === 1 ? singular : plural;
+}
+
+export function formatBulletList(list: string[]) {
+  return list.map((item) => `- ${item}`).join("\n");
+}
+
+export function slugify(text: string): string {
+  return text
+    .toLowerCase()
+    .trim()
+    .replace(/[^\p{L}\p{N}\s_-]/gu, "")
+    .replace(/[\s_-]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+export function convertNewlinesToBr(text: string): string {
+  return text.replace(/\r\n/g, "\n").replace(/\n/g, "<br>");
+}
+
+// slice() counts UTF-16 code units, so a cut can land inside an emoji or other
+// astral character and leave a lone surrogate. Some LLM APIs reject a request
+// body that contains one as invalid JSON, so drop the half character instead.
+function sliceHead(str: string, length: number) {
+  const head = str.slice(0, length);
+  return isHighSurrogate(head.charCodeAt(head.length - 1))
+    ? head.slice(0, -1)
+    : head;
+}
+
+function sliceTail(str: string, length: number) {
+  const tail = str.slice(-length);
+  return isLowSurrogate(tail.charCodeAt(0)) ? tail.slice(1) : tail;
+}
+
+function isHighSurrogate(code: number) {
+  return code >= 0xd8_00 && code <= 0xdb_ff;
+}
+
+function isLowSurrogate(code: number) {
+  return code >= 0xdc_00 && code <= 0xdf_ff;
+}

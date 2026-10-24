@@ -1,0 +1,50 @@
+import { NextResponse } from "next/server";
+import prisma from "@/utils/prisma";
+import { withEmailAccount } from "@/utils/middleware";
+import { getMcpServerAccess } from "@/utils/mcp/access";
+import { listMcpConnections } from "@/utils/mcp/connections";
+
+export type ApiKeyResponse = Awaited<ReturnType<typeof getApiKeys>>;
+
+async function getApiKeys({
+  userId,
+  emailAccountId,
+}: {
+  userId: string;
+  emailAccountId: string;
+}) {
+  const [apiKeys, mcpServerAccess] = await Promise.all([
+    prisma.apiKey.findMany({
+      where: { userId, emailAccountId, isActive: true },
+      select: {
+        id: true,
+        name: true,
+        createdAt: true,
+        expiresAt: true,
+        lastUsedAt: true,
+        scopes: true,
+      },
+      orderBy: { createdAt: "desc" },
+    }),
+    getMcpServerAccess(userId),
+  ]);
+  const mcpConnections = mcpServerAccess.enabled
+    ? await listMcpConnections(userId)
+    : [];
+
+  return {
+    apiKeys,
+    mcpServerAvailable: mcpServerAccess.available,
+    mcpServerEnabled: mcpServerAccess.enabled,
+    mcpConnections,
+  };
+}
+
+export const GET = withEmailAccount("user/api-keys", async (request) => {
+  const userId = request.auth.userId;
+  const emailAccountId = request.auth.emailAccountId;
+
+  const apiKeys = await getApiKeys({ userId, emailAccountId });
+
+  return NextResponse.json(apiKeys);
+});

@@ -1,0 +1,49 @@
+import Link from "next/link";
+import { PageHeading } from "@/components/Typography";
+import { Button } from "@/components/ui/button";
+import { prefixPath } from "@/utils/path";
+import { PageWrapper } from "@/components/PageWrapper";
+
+export default async function DebugPage(props: {
+  params: Promise<{ emailAccountId: string }>;
+}) {
+  const { emailAccountId } = await props.params;
+
+  return (
+    <PageWrapper>
+      <PageHeading>Debug</PageHeading>
+
+      <div className="mt-4 flex flex-wrap gap-2">
+        <Button variant="outline" asChild>
+          <Link href={prefixPath(emailAccountId, "/debug/mail-queue")}>
+            Mail queue
+          </Link>
+        </Button>
+        <Button variant="outline" asChild>
+          <Link href={prefixPath(emailAccountId, "/debug/rules")}>Rules</Link>
+        </Button>
+        {/* <Button variant="outline" asChild>
+          <Link href={prefixPath(emailAccountId, "/debug/drafts")}>Drafts</Link>
+        </Button> */}
+        <Button variant="outline" asChild>
+          <Link href={prefixPath(emailAccountId, "/debug/rule-history")}>
+            Rule History
+          </Link>
+        </Button>
+        <Button variant="outline" asChild>
+          <Link href={prefixPath(emailAccountId, "/debug/follow-up")}>
+            Follow-up
+          </Link>
+        </Button>
+        <Button variant="outline" asChild>
+          <Link href={prefixPath(emailAccountId, "/debug/memories")}>
+            Memories
+          </Link>
+        </Button>
+        {/* <Button variant="outline" asChild>
+          <Link href={prefixPath(emailAccountId, "/debug/report")}>Report</Link>
+        </Button> */}
+      </div>
+    </PageWrapper>
+  );
+}

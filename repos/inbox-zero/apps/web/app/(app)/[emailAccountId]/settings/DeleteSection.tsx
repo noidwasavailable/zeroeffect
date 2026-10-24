@@ -1,0 +1,210 @@
+"use client";
+
+import { useState } from "react";
+import Link from "next/link";
+import { useAction } from "next-safe-action/hooks";
+import { toast } from "sonner";
+import { Button, buttonVariants } from "@/components/ui/button";
+import {
+  Item,
+  ItemContent,
+  ItemTitle,
+  ItemDescription,
+  ItemActions,
+} from "@/components/ui/item";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogTrigger,
+} from "@/components/ui/alert-dialog";
+import { deleteAccountAction } from "@/utils/actions/user";
+import { logOut } from "@/utils/user";
+import { useStatLoader } from "@/providers/StatLoaderProvider";
+import { usePremium } from "@/hooks/usePremium";
+import { hasActiveAppleSubscription } from "@/utils/premium";
+import { useAccounts } from "@/hooks/useAccounts";
+import { LoadingContent } from "@/components/LoadingContent";
+
+export function DeleteSection() {
+  const { onCancelLoadBatch } = useStatLoader();
+  const { premium } = usePremium();
+  const {
+    data: accountsData,
+    isLoading: isLoadingAccounts,
+    error: accountsError,
+  } = useAccounts();
+  const connectedEmails =
+    accountsData?.emailAccounts.map((account) => account.email) ?? [];
+  const connectedEmailParts = new Intl.ListFormat("en", {
+    type: "conjunction",
+  }).formatToParts(connectedEmails);
+  const hasAppleSubscription = hasActiveAppleSubscription(
+    premium?.appleExpiresAt || null,
+    premium?.appleRevokedAt || null,
+    premium?.appleSubscriptionStatus || null,
+  );
+
+  const hasSubscription =
+    premium?.stripeSubscriptionId ||
+    premium?.lemonSqueezySubscriptionId ||
+    hasAppleSubscription;
+
+  const [isDialogOpen, setIsDialogOpen] = useState(false);
+  const [hasConfirmedCancellation, setHasConfirmedCancellation] =
+    useState(false);
+
+  const { executeAsync: executeDeleteAccount } = useAction(
+    deleteAccountAction.bind(null),
+  );
+
+  const handleDeleteAccount = async () => {
+    onCancelLoadBatch();
+    setIsDialogOpen(false);
+
+    toast.promise(
+      async () => {
+        const result = await executeDeleteAccount();
+        await logOut("/");
+        if (result?.serverError) throw new Error(result.serverError);
+      },
+      {
+        loading: "Deleting account...",
+        success: "Account deleted!",
+        error: (err: unknown) =>
+          `Error deleting account: ${
+            err instanceof Error ? err.message : "Unknown error"
+          }`,
+      },
+    );
+  };
+
+  const shouldBlockDeletion = hasSubscription && !hasConfirmedCancellation;
+
+  return (
+    <Item size="sm">
+      <ItemContent>
+        <ItemTitle>Delete account</ItemTitle>
+        <ItemDescription>
+          Removes your Inbox Zero data. Your emails aren't affected.
+        </ItemDescription>
+      </ItemContent>
+      <ItemActions>
+        <AlertDialog open={isDialogOpen} onOpenChange={setIsDialogOpen}>
+          <AlertDialogTrigger asChild>
+            <Button variant="destructiveSoft" size="sm">
+              Delete
+            </Button>
+          </AlertDialogTrigger>
+          <AlertDialogContent>
+            <AlertDialogHeader>
+              <AlertDialogTitle>
+                {shouldBlockDeletion
+                  ? "Cancel subscription first"
+                  : "Delete your Inbox Zero account?"}
+              </AlertDialogTitle>
+              <AlertDialogDescription asChild>
+                <div>
+                  {shouldBlockDeletion ? (
+                    <>
+                      <p className="mb-3">
+                        Please cancel your subscription before deleting your
+                        account.
+                      </p>
+                      <p className="mb-3">
+                        {hasAppleSubscription ? (
+                          <>
+                            You can manage your subscription from your iPhone or
+                            iPad subscription settings.
+                          </>
+                        ) : (
+                          <>
+                            You can manage your subscription by clicking "Manage
+                            Subscription" above or going to the{" "}
+                            <Link
+                              href="/premium"
+                              className="text-blue-600 underline hover:text-blue-800"
+                              onClick={() => setIsDialogOpen(false)}
+                            >
+                              premium page
+                            </Link>{" "}
+                            and clicking "Manage subscription".
+                          </>
+                        )}
+                      </p>
+                      <p className="text-sm text-gray-600">
+                        Already cancelled your subscription? Click the button
+                        below to proceed.
+                      </p>
+                    </>
+                  ) : (
+                    <div className="space-y-3">
+                      <LoadingContent
+                        loading={isLoadingAccounts}
+                        error={accountsError}
+                      >
+                        <p>
+                          This permanently deletes your Inbox Zero data and
+                          disconnects{" "}
+                          {connectedEmailParts.map((part, index) =>
+                            part.type === "element" ? (
+                              <span
+                                key={index}
+                                className="font-medium text-foreground"
+                              >
+                                {part.value}
+                              </span>
+                            ) : (
+                              part.value
+                            ),
+                          )}
+                          . Your emails aren't affected.
+                        </p>
+                      </LoadingContent>
+                      {connectedEmails.length > 1 && (
+                        <Link
+                          href="/accounts"
+                          className="text-foreground underline"
+                          onClick={() => setIsDialogOpen(false)}
+                        >
+                          Remove just one account instead
+                        </Link>
+                      )}
+                    </div>
+                  )}
+                </div>
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            <AlertDialogFooter>
+              <AlertDialogCancel>Cancel</AlertDialogCancel>
+              {shouldBlockDeletion ? (
+                <AlertDialogAction
+                  onClick={(event) => {
+                    // Keep the dialog open so it advances to the delete confirmation
+                    event.preventDefault();
+                    setHasConfirmedCancellation(true);
+                  }}
+                >
+                  I've already cancelled my subscription
+                </AlertDialogAction>
+              ) : (
+                <AlertDialogAction
+                  className={buttonVariants({ variant: "destructive" })}
+                  disabled={!accountsData || Boolean(accountsError)}
+                  onClick={handleDeleteAccount}
+                >
+                  Delete account
+                </AlertDialogAction>
+              )}
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
+      </ItemActions>
+    </Item>
+  );
+}
