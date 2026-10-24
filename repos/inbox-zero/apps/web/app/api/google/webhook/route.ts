@@ -1,0 +1,180 @@
+import { after, NextResponse } from "next/server";
+import { z } from "zod";
+import { withError } from "@/utils/middleware";
+import { env } from "@/env";
+import { processHistoryForUser } from "@/utils/webhook/google/process-history";
+import type { Logger } from "@/utils/logger";
+import { handleWebhookError } from "@/utils/webhook/error-handler";
+import { runWithBackgroundLoggerFlush } from "@/utils/logger-flush";
+import {
+  cleanupWebhookAccountOnRateLimitSkip,
+  getWebhookEmailAccount,
+} from "@/utils/webhook/validate-webhook-account";
+import { getEmailProviderRateLimitState } from "@/utils/email/rate-limit";
+import { isGoogleProvider } from "@/utils/email/provider-types";
+import { markGmailHistoryCatchUp } from "@/utils/redis/gmail-history-catch-up";
+
+import { notifyMailboxChanged } from "@/utils/mailbox-push";
+
+export const maxDuration = 300;
+
+// Google PubSub calls this endpoint each time a user recieves an email. We subscribe for updates via `api/google/watch`
+export const POST = withError("google/webhook", async (request) => {
+  const searchParams = new URL(request.url).searchParams;
+  const token = searchParams.get("token");
+
+  let logger = request.logger;
+
+  const verificationToken = env.GOOGLE_PUBSUB_VERIFICATION_TOKEN;
+
+  if (verificationToken == null) {
+    logger.error("Google webhook verification token is not configured");
+    return NextResponse.json(
+      { message: "Google webhook is not configured" },
+      { status: 503 },
+    );
+  }
+
+  // Empty string intentionally disables query-param verification when
+  // requests are authenticated upstream, such as via the OIDC gateway.
+  if (verificationToken !== "" && token !== verificationToken) {
+    logger.error("Invalid verification token");
+    return NextResponse.json(
+      { message: "Invalid verification token" },
+      { status: 403 },
+    );
+  }
+
+  const body = await request.json();
+  const decodedData = decodeHistoryId(body);
+
+  // A malformed payload can never be processed; report it as a client error
+  // rather than letting a TypeError surface as a 500.
+  if (!decodedData) {
+    logger.warn("Invalid Gmail Pub/Sub notification payload");
+    return NextResponse.json(
+      { message: "Invalid Pub/Sub message payload" },
+      { status: 400 },
+    );
+  }
+
+  logger = logger.with({
+    email: decodedData.emailAddress,
+    historyId: decodedData.historyId,
+    queueMessageId: body.message?.messageId,
+    subscriptionId: body.subscription,
+    sentAt: body.message?.publishTime,
+  });
+
+  logger.info("Received webhook - acknowledging immediately");
+
+  const emailAccount = await getWebhookEmailAccount(
+    { email: decodedData.emailAddress.toLowerCase() },
+    logger,
+  );
+
+  logger = logger.with({ emailAccountId: emailAccount?.id });
+  logger.info("Gmail webhook account lookup completed", {
+    emailAccountFound: !!emailAccount,
+    lastSyncedHistoryId: emailAccount?.lastSyncedHistoryId,
+  });
+
+  if (emailAccount) {
+    // Notify before history processing so early returns still reach clients,
+    // and so this response is not waiting on Apple.
+    after(() =>
+      notifyMailboxChanged({
+        emailAccountId: emailAccount.id,
+        logger,
+      }),
+    );
+    const activeRateLimit = await getEmailProviderRateLimitState({
+      emailAccountId: emailAccount.id,
+      logger,
+    }).catch((error) => {
+      logger.warn("Failed to read provider rate-limit state before enqueue", {
+        error: error instanceof Error ? error.message : error,
+      });
+      return null;
+    });
+
+    if (isGoogleProvider(activeRateLimit?.provider)) {
+      await cleanupWebhookAccountOnRateLimitSkip(emailAccount, logger).catch(
+        (error) => {
+          logger.warn(
+            "Failed to cleanup webhook account during rate-limit skip",
+            {
+              error: error instanceof Error ? error.message : error,
+            },
+          );
+        },
+      );
+      await markGmailHistoryCatchUp(emailAccount.id, logger);
+      logger.warn("Skipping webhook enqueue due to active Gmail rate limit", {
+        retryAt: activeRateLimit.retryAt.toISOString(),
+        rateLimitSource: activeRateLimit.source,
+      });
+      return NextResponse.json({ ok: true });
+    }
+  }
+
+  // Process history asynchronously using after() to avoid Pub/Sub acknowledgment timeout
+  // This ensures we acknowledge the message quickly while still processing it fully
+  after(() =>
+    runWithBackgroundLoggerFlush({
+      logger,
+      task: () => processWebhookAsync(decodedData, logger, emailAccount),
+      extra: { url: "/api/google/webhook" },
+    }),
+  );
+
+  return NextResponse.json({ ok: true });
+});
+
+async function processWebhookAsync(
+  decodedData: { emailAddress: string; historyId: string },
+  logger: Logger,
+  emailAccount?: Awaited<ReturnType<typeof getWebhookEmailAccount>> | null,
+) {
+  try {
+    await processHistoryForUser(
+      decodedData,
+      { preloadedEmailAccount: emailAccount },
+      logger,
+    );
+  } catch (error) {
+    await handleWebhookError(error, {
+      email: decodedData.emailAddress,
+      emailAccountId: emailAccount?.id || "unknown",
+      url: "/api/google/webhook",
+      logger,
+    });
+  }
+}
+
+const gmailNotificationSchema = z.object({
+  emailAddress: z.string().min(1),
+  historyId: z
+    .union([z.number(), z.string()])
+    .transform((historyId) =>
+      typeof historyId === "number" ? historyId.toString() : historyId.trim(),
+    )
+    .pipe(z.string().regex(/^\d+$/)),
+});
+
+function decodeHistoryId(body: { message?: { data?: string } }) {
+  const data = body?.message?.data;
+  if (!data) return null;
+
+  // data is base64url-encoded JSON
+  const base64 = data.replace(/-/g, "+").replace(/_/g, "/");
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(Buffer.from(base64, "base64").toString());
+  } catch {
+    return null;
+  }
+
+  const result = gmailNotificationSchema.safeParse(decoded);
+  return result.success ? result.data : null;
+}

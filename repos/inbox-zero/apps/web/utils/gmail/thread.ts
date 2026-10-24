@@ -1,0 +1,260 @@
+import { Readable } from "node:stream";
+import {
+  COMPLETE_THREAD_MESSAGE_LIMIT,
+  createCompleteThreadBudget,
+  readCompleteThreadJson,
+} from "@/utils/email/complete-thread";
+import type { gmail_v1 } from "@googleapis/gmail";
+import { getBatchWithRetry } from "@/utils/gmail/batch-with-retry";
+import {
+  isDefined,
+  type ThreadWithPayloadMessages,
+  type MessageWithPayload,
+} from "@/utils/types";
+import { parseMessage } from "@/utils/gmail/message";
+import { GmailLabel } from "@/utils/gmail/label";
+import { withGmailRetry } from "@/utils/gmail/retry";
+import type { Logger } from "@/utils/logger";
+
+export async function getCompleteGmailThread(
+  threadId: string,
+  gmail: gmail_v1.Gmail,
+  signal?: AbortSignal,
+) {
+  const response = await withGmailRetry(() => {
+    signal?.throwIfAborted();
+    return gmail.users.threads.get(
+      { userId: "me", id: threadId, format: "full" },
+      { responseType: "stream", signal },
+    );
+  });
+  const result = await readCompleteThreadJson<gmail_v1.Schema$Thread>(
+    // Node's web stream type is a separate declaration from the DOM one.
+    Readable.toWeb(response.data) as unknown as ReadableStream<Uint8Array>,
+    createCompleteThreadBudget(),
+    signal,
+  );
+  if (
+    result.id !== threadId ||
+    !Array.isArray(result.messages) ||
+    // A thread is its messages, so an empty list is a truncated response.
+    !result.messages.length ||
+    result.messages.length > COMPLETE_THREAD_MESSAGE_LIMIT ||
+    result.messages.some(
+      (message) => !message.id || message.threadId !== threadId,
+    ) ||
+    new Set(result.messages.map((message) => message.id)).size !==
+      result.messages.length
+  )
+    throw new Error("Incomplete or oversized conversation snapshot");
+  return result;
+}
+
+export async function getThread(
+  threadId: string,
+  gmail: gmail_v1.Gmail,
+): Promise<ThreadWithPayloadMessages> {
+  const thread = await withGmailRetry(
+    () => gmail.users.threads.get({ userId: "me", id: threadId }),
+    5,
+  );
+  return thread.data as ThreadWithPayloadMessages;
+}
+
+interface MinimalThread {
+  historyId: string;
+  id: string;
+  snippet: string;
+}
+
+export async function getThreads(
+  q: string,
+  labelIds: string[],
+  gmail: gmail_v1.Gmail,
+  maxResults = 100,
+): Promise<{
+  nextPageToken?: string | null;
+  resultSizeEstimate?: number | null;
+  threads: MinimalThread[];
+}> {
+  const threads = await withGmailRetry(
+    () =>
+      gmail.users.threads.list({
+        userId: "me",
+        q,
+        labelIds,
+        maxResults,
+      }),
+    5,
+  );
+  return {
+    nextPageToken: threads.data.nextPageToken,
+    resultSizeEstimate: threads.data.resultSizeEstimate,
+    threads: (threads.data.threads || []) as MinimalThread[],
+  };
+}
+
+export async function getThreadsWithNextPageToken({
+  gmail,
+  q,
+  labelIds,
+  maxResults = 100,
+  pageToken,
+  includeSpamTrash,
+  logger,
+}: {
+  gmail: gmail_v1.Gmail;
+  q?: string;
+  labelIds?: string[];
+  maxResults?: number;
+  pageToken?: string;
+  /** Gmail drops spam and trash from every listing unless this is set, even when they are the requested labels. */
+  includeSpamTrash?: boolean;
+  logger?: Logger;
+}) {
+  const threads = await withGmailRetry(
+    () =>
+      gmail.users.threads.list({
+        userId: "me",
+        q,
+        labelIds,
+        maxResults,
+        pageToken,
+        includeSpamTrash,
+      }),
+    5,
+    { logger },
+  );
+
+  return {
+    threads: threads.data.threads || [],
+    nextPageToken: threads.data.nextPageToken,
+  };
+}
+
+export async function getThreadsBatch(
+  threadIds: string[],
+  accessToken: string,
+  logger: Logger,
+  options?: { format?: "metadata"; includeSpamTrash?: boolean },
+): Promise<ThreadWithPayloadMessages[]> {
+  if (!threadIds.length) return [];
+
+  return getBatchWithRetry<
+    ThreadWithPayloadMessages,
+    ThreadWithPayloadMessages
+  >({
+    ids: threadIds,
+    endpoint: "/gmail/v1/users/me/threads",
+    accessToken,
+    parse: (thread) => thread,
+    logger,
+    queryString: threadBatchQueryString(options),
+  });
+}
+
+function threadBatchQueryString(options?: {
+  format?: "metadata";
+  includeSpamTrash?: boolean;
+}) {
+  const searchParams = new URLSearchParams();
+  if (options?.format === "metadata") {
+    searchParams.set("format", "metadata");
+    for (const header of THREAD_METADATA_HEADERS) {
+      searchParams.append("metadataHeaders", header);
+    }
+  }
+  if (options?.includeSpamTrash) searchParams.set("includeSpamTrash", "true");
+  const query = searchParams.toString();
+  return query || undefined;
+}
+
+const THREAD_METADATA_HEADERS = [
+  "From",
+  "To",
+  "Cc",
+  "Bcc",
+  "Subject",
+  "Date",
+  "Message-ID",
+  "In-Reply-To",
+  "References",
+  "Reply-To",
+];
+
+async function getThreadsFromSender(
+  gmail: gmail_v1.Gmail,
+  sender: string,
+  limit: number,
+): Promise<
+  Array<{
+    id?: string | null;
+    threadId?: string | null;
+    snippet?: string | null;
+  }>
+> {
+  const query = `from:${sender} -label:sent -label:draft`;
+  const response = await withGmailRetry(
+    () =>
+      gmail.users.threads.list({
+        userId: "me",
+        q: query,
+        maxResults: limit,
+      }),
+    5,
+  );
+
+  return response.data.threads || [];
+}
+
+export async function getThreadsFromSenderWithSubject(
+  gmail: gmail_v1.Gmail,
+  accessToken: string,
+  sender: string,
+  limit: number,
+  logger: Logger,
+): Promise<
+  Array<{
+    id: string;
+    snippet: string;
+    subject: string;
+  }>
+> {
+  const threads = await getThreadsFromSender(gmail, sender, limit);
+  const threadIds = threads.map((t) => t.id).filter(isDefined);
+  const threadsWithSubject = await getThreadsBatch(
+    threadIds,
+    accessToken,
+    logger,
+  );
+  return threadsWithSubject
+    .map((t) =>
+      t.id
+        ? {
+            id: t.id,
+            subject:
+              t.messages?.[0]?.payload?.headers?.find(
+                (h) => h.name === "Subject",
+              )?.value || "",
+            snippet: t.messages?.[0]?.snippet || "",
+          }
+        : undefined,
+    )
+    .filter(isDefined);
+}
+
+export async function getThreadMessages(
+  threadId: string,
+  gmail: gmail_v1.Gmail,
+) {
+  const thread = await getThread(threadId, gmail);
+  if (!thread?.messages) return [];
+  return thread.messages
+    .map((m) => parseMessage(m as MessageWithPayload))
+    .filter((m) => !m.labelIds?.includes(GmailLabel.DRAFT));
+}
+
+/** Gmail drops spam and trash unless `includeSpamTrash` is set, even for `in:spam`. */
+export function queryIncludesSpamOrTrash(query: string) {
+  return /(?:^|[\s(])(?:in|label):(spam|trash)\b/i.test(query);
+}

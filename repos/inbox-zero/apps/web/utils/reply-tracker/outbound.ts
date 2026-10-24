@@ -1,0 +1,206 @@
+import type { EmailAccountWithAI } from "@/utils/llms/types";
+import type { ParsedMessage } from "@/utils/types";
+import { aiDetermineThreadStatus } from "@/utils/ai/reply/determine-thread-status";
+import prisma from "@/utils/prisma";
+import type { Logger } from "@/utils/logger";
+import { internalDateToDate, sortByInternalDate } from "@/utils/date";
+import type { EmailProvider } from "@/utils/email/types";
+import { applyThreadStatusLabel } from "./label-helpers";
+import { updateThreadTrackers } from "@/utils/reply-tracker/handle-conversation-status";
+import {
+  CONVERSATION_STATUS_TYPES,
+  type ConversationStatus,
+} from "@/utils/reply-tracker/conversation-status-config";
+import {
+  acquireOutboundThreadStatusLock,
+  clearOutboundThreadStatusLock,
+  markOutboundThreadStatusProcessed,
+} from "@/utils/redis/outbound-thread-status";
+import {
+  buildThreadStatusMessagesForLLM,
+  excludeAssistantMessages,
+} from "@/utils/reply-tracker/thread-status-context";
+import { isFilebotConversationMessage } from "@/utils/filebot/is-filebot-email";
+
+export async function handleOutboundReply({
+  emailAccount,
+  message,
+  provider,
+  logger,
+}: {
+  emailAccount: EmailAccountWithAI;
+  message: ParsedMessage;
+  provider: EmailProvider;
+  logger: Logger;
+}) {
+  logger = logger.with({
+    email: emailAccount.email,
+    messageId: message.id,
+    threadId: message.threadId,
+  });
+
+  if (
+    isFilebotConversationMessage({ userEmail: emailAccount.email, message })
+  ) {
+    logger.info("Skipping. Filing assistant message.");
+    return;
+  }
+
+  const enabledStatuses = await getEnabledStatuses({
+    emailAccountId: emailAccount.id,
+  });
+  if (!enabledStatuses.length) {
+    logger.info("Outbound reply tracking disabled, skipping.");
+    return;
+  }
+
+  const idempotencyKey = {
+    emailAccountId: emailAccount.id,
+    threadId: message.threadId,
+    messageId: message.id,
+  };
+
+  const lockToken = await acquireOutboundThreadStatusLock(idempotencyKey);
+  if (!lockToken) {
+    logger.info(
+      "Outbound thread status already processed or currently processing, skipping.",
+    );
+    return;
+  }
+
+  let processedSuccessfully = false;
+
+  try {
+    logger.info("Determining thread status for outbound message");
+
+    const threadMessages = await provider.getThreadMessages(message.threadId);
+    if (!threadMessages?.length) {
+      logger.error("No thread messages found, cannot proceed.");
+      return;
+    }
+
+    const { isLatest, sortedMessages } = isMessageLatestInThread(
+      message,
+      excludeAssistantMessages({
+        messages: threadMessages,
+        userEmail: emailAccount.email,
+      }),
+    );
+    if (!isLatest) {
+      logger.info(
+        "Outbound message is not the latest in the thread, proceeding anyway.",
+        {
+          processingMessageId: message.id,
+          actualLatestMessageId: sortedMessages.at(-1)?.id,
+        },
+      );
+    }
+
+    const threadMessagesForLLM =
+      buildThreadStatusMessagesForLLM(sortedMessages);
+
+    if (!threadMessagesForLLM.length) {
+      logger.error("No messages for AI analysis");
+      return;
+    }
+
+    const aiResult = await aiDetermineThreadStatus({
+      emailAccount,
+      threadMessages: threadMessagesForLLM,
+      userSentLastEmail: true,
+    });
+
+    logger.info("AI determined thread status", { status: aiResult.status });
+
+    if (!enabledStatuses.includes(aiResult.status)) {
+      logger.info(
+        "Rule for determined status is disabled, skipping label application",
+        { status: aiResult.status },
+      );
+      return;
+    }
+
+    await Promise.all([
+      applyThreadStatusLabel({
+        emailAccountId: emailAccount.id,
+        threadId: message.threadId,
+        messageId: message.id,
+        systemType: aiResult.status,
+        provider,
+        logger,
+      }),
+      updateThreadTrackers({
+        emailAccountId: emailAccount.id,
+        threadId: message.threadId,
+        messageId: message.id,
+        sentAt: internalDateToDate(message.internalDate),
+        status: aiResult.status,
+      }),
+    ]);
+
+    processedSuccessfully = true;
+  } finally {
+    if (processedSuccessfully) {
+      const markedAsProcessed = await markOutboundThreadStatusProcessed({
+        ...idempotencyKey,
+        lockToken,
+      }).catch((error) => {
+        logger.error("Failed to mark outbound thread status as processed", {
+          error,
+        });
+        return false;
+      });
+      if (!markedAsProcessed) {
+        logger.warn(
+          "Skipped marking outbound thread status as processed because lock was no longer owned.",
+        );
+      }
+    } else {
+      const lockCleared = await clearOutboundThreadStatusLock({
+        ...idempotencyKey,
+        lockToken,
+      }).catch((error) => {
+        logger.error("Failed to clear outbound thread status lock", { error });
+        return false;
+      });
+      if (!lockCleared) {
+        logger.warn(
+          "Skipped clearing outbound thread status lock because lock was no longer owned.",
+        );
+      }
+    }
+  }
+}
+
+async function getEnabledStatuses({
+  emailAccountId,
+}: {
+  emailAccountId: string;
+}): Promise<ConversationStatus[]> {
+  const enabledRules = await prisma.rule.findMany({
+    where: {
+      emailAccountId,
+      systemType: { in: CONVERSATION_STATUS_TYPES },
+      enabled: true,
+    },
+    select: { systemType: true },
+  });
+  return enabledRules
+    .map((r) => r.systemType)
+    .filter((s): s is ConversationStatus => s != null);
+}
+
+function isMessageLatestInThread(
+  message: ParsedMessage,
+  threadMessages: ParsedMessage[],
+): { isLatest: boolean; sortedMessages: ParsedMessage[] } {
+  if (!threadMessages.length) return { isLatest: false, sortedMessages: [] }; // Should not happen if called correctly
+
+  const sortedMessages = [...threadMessages].sort(sortByInternalDate());
+  const actualLatestMessage = sortedMessages.at(-1);
+
+  return {
+    isLatest: actualLatestMessage?.id === message.id,
+    sortedMessages,
+  };
+}

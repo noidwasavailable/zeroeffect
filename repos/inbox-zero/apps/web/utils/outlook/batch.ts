@@ -1,0 +1,547 @@
+import type { Message } from "@microsoft/microsoft-graph-types";
+import chunk from "lodash/chunk";
+import type { Logger } from "@/utils/logger";
+import type { OutlookClient } from "@/utils/outlook/client";
+import type { BulkArchiveResult, BulkArchiveThread } from "@/utils/email/types";
+import { escapeODataString } from "@/utils/outlook/odata-escape";
+import { getFolderIds } from "@/utils/outlook/message";
+import { resolveMicrosoftGraphNextLink } from "@/utils/outlook/page-token";
+import {
+  publishBulkActionToTinybird,
+  updateEmailMessagesForSender,
+} from "@/utils/email/bulk-action-tracking";
+
+const GRAPH_JSON_BATCH_LIMIT = 20; // Microsoft Graph JSON batching limit
+const GRAPH_MOVE_BATCH_LIMIT = 4;
+const SENDER_MOVE_CHUNK_SIZE = 100;
+const SENDER_LIST_PAGE_SIZE = 100;
+const THREAD_PARTICIPANT_SELECT_FIELDS =
+  "id,conversationId,from,toRecipients,receivedDateTime";
+
+type GraphBatchRequestItem<TBody = unknown> = {
+  id: string;
+  method: string;
+  url: string;
+  headers?: Record<string, string>;
+  body?: TBody;
+};
+
+type GraphBatchResponseItem<TBody = unknown> = {
+  id: string;
+  status: number;
+  headers?: Record<string, string>;
+  body?: TBody | null;
+};
+
+type GraphBatchResponse<TBody = unknown> = {
+  responses?: GraphBatchResponseItem<TBody>[];
+};
+
+type MoveMessagesBatchResult = {
+  movedMessageIds: string[];
+  hasErrors: boolean;
+};
+
+async function batch<TRequestBody = unknown, TResponseBody = unknown>({
+  client,
+  requests,
+  chunkSize,
+  onFailure,
+  shouldStop,
+  context,
+  logger,
+}: {
+  client: OutlookClient;
+  requests: GraphBatchRequestItem<TRequestBody>[];
+  chunkSize?: number;
+  onFailure?: (params: {
+    request?: GraphBatchRequestItem<TRequestBody>;
+    response: GraphBatchResponseItem<TResponseBody>;
+  }) => void;
+  shouldStop?: (responses: GraphBatchResponseItem<TResponseBody>[]) => boolean;
+  context?: Record<string, unknown>;
+  logger: Logger;
+}): Promise<GraphBatchResponseItem<TResponseBody>[]> {
+  if (requests.length === 0) return [];
+
+  const graphClient = client.getClient();
+  const aggregatedResponses: GraphBatchResponseItem<TResponseBody>[] = [];
+  const effectiveChunkSize = Math.min(
+    chunkSize ?? GRAPH_JSON_BATCH_LIMIT,
+    GRAPH_JSON_BATCH_LIMIT,
+  );
+
+  for (let start = 0; start < requests.length; start += effectiveChunkSize) {
+    const requestChunk = requests.slice(start, start + effectiveChunkSize);
+
+    try {
+      const response = (await graphClient
+        .api("/$batch")
+        .post({ requests: requestChunk })) as GraphBatchResponse<TResponseBody>;
+
+      const responses = response?.responses ?? [];
+      const requestsById = new Map(
+        requestChunk.map((request) => [request.id, request]),
+      );
+
+      responses.forEach((res) => {
+        aggregatedResponses.push(res);
+        if (res.status >= 400 && onFailure) {
+          onFailure({
+            request: requestsById.get(res.id),
+            response: res,
+          });
+        }
+      });
+      if (shouldStop?.(responses)) break;
+    } catch (error) {
+      logger.error("Graph batch request failed", {
+        ...context,
+        chunkSize: requestChunk.length,
+        error,
+      });
+      throw error;
+    }
+  }
+
+  return aggregatedResponses;
+}
+
+export async function getThreadParticipantMessagesInBatches({
+  client,
+  threadIds,
+  logger,
+}: {
+  client: OutlookClient;
+  threadIds: string[];
+  logger: Logger;
+}): Promise<Map<string, Message[]>> {
+  const requestIdToThreadId = new Map<string, string>();
+  let requests = threadIds.map((threadId, index) => {
+    const requestId = `thread-${index}`;
+    requestIdToThreadId.set(requestId, threadId);
+
+    const searchParams = new URLSearchParams({
+      // Unsent drafts would otherwise appear as senders in thread names.
+      $filter: `conversationId eq '${escapeODataString(threadId)}' and isDraft eq false`,
+      $select: THREAD_PARTICIPANT_SELECT_FIELDS,
+      $top: "100",
+    });
+
+    return {
+      id: requestId,
+      method: "GET",
+      url: `/me/messages?${searchParams}`,
+    };
+  });
+
+  const messagesByThreadId = new Map<string, Message[]>();
+  const seenNextLinks = new Set<string>();
+
+  while (requests.length) {
+    const responses = await batch<
+      never,
+      { value?: Message[]; "@odata.nextLink"?: string }
+    >({
+      client,
+      requests,
+      logger,
+      context: { threadCount: threadIds.length },
+      onFailure: ({ request, response }) => {
+        logger.warn("Failed to fetch Outlook thread participants", {
+          threadId: request ? requestIdToThreadId.get(request.id) : undefined,
+          status: response.status,
+        });
+      },
+      shouldStop: (responses) =>
+        responses.some((response) => response.status === 429),
+    });
+    const continuationRequests: typeof requests = [];
+
+    for (const response of responses) {
+      if (response.status >= 400) continue;
+
+      const threadId = requestIdToThreadId.get(response.id);
+      if (!threadId) continue;
+
+      const messages = messagesByThreadId.get(threadId) ?? [];
+      messages.push(...(response.body?.value ?? []));
+      messagesByThreadId.set(threadId, messages);
+
+      const nextLink = response.body?.["@odata.nextLink"];
+      if (!nextLink || seenNextLinks.has(nextLink)) continue;
+
+      seenNextLinks.add(nextLink);
+      continuationRequests.push({
+        id: response.id,
+        method: "GET",
+        url: toGraphBatchUrl(nextLink),
+      });
+    }
+
+    if (responses.some((response) => response.status === 429)) break;
+
+    requests = continuationRequests;
+  }
+
+  return messagesByThreadId;
+}
+
+async function moveMessagesInBatches({
+  client,
+  messageIds,
+  destinationId,
+  action,
+  stopOnError = false,
+  logger,
+}: {
+  client: OutlookClient;
+  messageIds: string[];
+  destinationId: string;
+  action: "archive" | "trash";
+  stopOnError?: boolean;
+  logger: Logger;
+}): Promise<MoveMessagesBatchResult> {
+  if (messageIds.length === 0) {
+    return { movedMessageIds: [], hasErrors: false };
+  }
+
+  const requestIdToMessageId = new Map<string, string>();
+  const requests = messageIds.map((messageId, index) => {
+    const requestId = `${action}-${index}`;
+    requestIdToMessageId.set(requestId, messageId);
+
+    return {
+      id: requestId,
+      method: "POST",
+      url: `/me/messages/${messageId}/move`,
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: {
+        destinationId,
+      },
+    };
+  });
+
+  const responses = await batch({
+    client,
+    requests,
+    chunkSize: GRAPH_MOVE_BATCH_LIMIT,
+    context: {
+      action,
+      destinationId,
+      messageCount: messageIds.length,
+    },
+    logger,
+    onFailure: ({ request, response }) => {
+      const messageId = request ? requestIdToMessageId.get(request.id) : null;
+      const body = response.body;
+      const errorMessage =
+        body && typeof body === "object" && body !== null && "error" in body
+          ? (body as { error?: { message?: string } }).error?.message
+          : body
+            ? JSON.stringify(body)
+            : undefined;
+
+      const context = {
+        action,
+        messageId,
+        status: response.status,
+        error: errorMessage,
+      };
+      if (response.status === 429) {
+        logger.warn("Failed to move message via batch", context);
+      } else {
+        logger.error("Failed to move message via batch", context);
+      }
+    },
+    shouldStop: (responses) =>
+      responses.some((response) => response.status === 429),
+  });
+
+  const movedMessageIds = responses.flatMap((response) => {
+    if (response.status >= 400) return [];
+
+    const messageId = requestIdToMessageId.get(response.id);
+    return messageId ? [messageId] : [];
+  });
+  const hasErrors = responses.some((response) => response.status >= 400);
+
+  if (hasErrors && stopOnError) {
+    logger.error("Graph batch responses contain errors", {
+      action,
+      destinationId,
+      errorCount: responses.filter((response) => response.status >= 400).length,
+      messageCount: messageIds.length,
+      statuses: responses
+        .filter((response) => response.status >= 400)
+        .map((response) => response.status),
+    });
+  }
+
+  return {
+    movedMessageIds,
+    hasErrors,
+  };
+}
+
+export async function moveThreadsInBatches({
+  client,
+  threads,
+  destinationId,
+  ownerEmail,
+  logger,
+}: {
+  client: OutlookClient;
+  threads: BulkArchiveThread[];
+  destinationId: string;
+  ownerEmail: string;
+  logger: Logger;
+}): Promise<BulkArchiveResult> {
+  const messageIds = [
+    ...new Set(threads.flatMap((thread) => thread.messageIds)),
+  ];
+  const { movedMessageIds } = await moveMessagesInBatches({
+    client,
+    messageIds,
+    destinationId,
+    action: "archive",
+    logger,
+  });
+  const movedMessageIdSet = new Set(movedMessageIds);
+  const succeededThreadIds = threads
+    .filter(
+      (thread) =>
+        thread.messageIds.length > 0 &&
+        thread.messageIds.every((messageId) =>
+          movedMessageIdSet.has(messageId),
+        ),
+    )
+    .map((thread) => thread.threadId);
+  const succeededThreadIdSet = new Set(succeededThreadIds);
+  const failedThreadIds = threads
+    .map((thread) => thread.threadId)
+    .filter((threadId) => !succeededThreadIdSet.has(threadId));
+
+  if (succeededThreadIds.length > 0) {
+    await publishBulkActionToTinybird({
+      threadIds: succeededThreadIds,
+      action: "archive",
+      ownerEmail,
+    });
+  }
+
+  return { succeededThreadIds, failedThreadIds };
+}
+
+export async function moveMessagesForSenders({
+  client,
+  senders,
+  destinationId,
+  action,
+  ownerEmail,
+  emailAccountId,
+  continueOnError = true,
+  logger,
+}: {
+  client: OutlookClient;
+  senders: string[];
+  destinationId: string;
+  action: "archive" | "trash";
+  ownerEmail: string;
+  emailAccountId: string;
+  continueOnError?: boolean;
+  logger: Logger;
+}): Promise<number> {
+  if (senders.length === 0) return 0;
+
+  // Resolve the actual inbox folder ID for archive filtering
+  // parentFolderId on messages is the real folder ID (a GUID), not the well-known name
+  let inboxFolderId: string | undefined;
+  if (action === "archive") {
+    const folderIds = await getFolderIds(client, logger, {
+      includeDrafts: false,
+    });
+    inboxFolderId = folderIds.inbox;
+    if (!inboxFolderId) {
+      logger.error(
+        "Could not resolve inbox folder ID — aborting bulk archive to avoid archiving from all folders",
+      );
+      if (!continueOnError) {
+        throw new Error("Could not resolve inbox folder ID for bulk archive");
+      }
+      return 0;
+    }
+  }
+
+  let movedMessagesCount = 0;
+
+  for (const sender of senders) {
+    if (!sender) continue;
+
+    const fromFilter = `from/emailAddress/address eq '${escapeODataString(sender)}'`;
+    const filterExpression = inboxFolderId
+      ? `${fromFilter} and parentFolderId eq '${escapeODataString(inboxFolderId)}'`
+      : fromFilter;
+
+    // Graph's nextLink for /me/messages is offset-based ($skip). Archiving
+    // removes messages from the inbox-filtered set, so moving while paging
+    // shifts every later page and skips a page for every page moved.
+    // Finish enumeration first, then move.
+    const messages = await listSenderMessages({
+      client,
+      filterExpression,
+      sender,
+      action,
+      continueOnError,
+      logger,
+    });
+
+    const publishedThreadIds = new Set<string>();
+
+    for (const chunkMessages of chunk(messages, SENDER_MOVE_CHUNK_SIZE)) {
+      const messageIds = chunkMessages.map((msg) => msg.id);
+
+      try {
+        const { movedMessageIds, hasErrors } = await moveMessagesInBatches({
+          client,
+          messageIds,
+          destinationId,
+          action,
+          stopOnError: !continueOnError,
+          logger,
+        });
+
+        const movedMessageIdSet = new Set(movedMessageIds);
+        const batchThreadIds = new Set(
+          chunkMessages
+            .filter((message) => movedMessageIdSet.has(message.id))
+            .map((message) => message.conversationId),
+        );
+
+        const newThreadIds = Array.from(batchThreadIds).filter(
+          (threadId) => !publishedThreadIds.has(threadId),
+        );
+
+        const promises: Promise<unknown>[] = [];
+
+        if (movedMessageIds.length > 0) {
+          movedMessagesCount += movedMessageIds.length;
+          promises.push(
+            updateEmailMessagesForSender({
+              sender,
+              messageIds: movedMessageIds,
+              emailAccountId,
+              action,
+            }),
+          );
+        }
+
+        if (newThreadIds.length > 0) {
+          promises.push(
+            publishBulkActionToTinybird({
+              threadIds: newThreadIds,
+              action,
+              ownerEmail,
+            }),
+          );
+        }
+
+        await Promise.all(promises);
+
+        newThreadIds.forEach((threadId) => publishedThreadIds.add(threadId));
+
+        if (hasErrors && !continueOnError) {
+          throw new Error("Graph batch returned one or more error responses.");
+        }
+      } catch (error) {
+        logger.error("Failed to move or track messages", {
+          action,
+          sender,
+          ownerEmail,
+          destinationId,
+          messageIds,
+          error,
+        });
+        if (!continueOnError) throw error;
+      }
+    }
+  }
+
+  return movedMessagesCount;
+}
+
+function toGraphBatchUrl(nextLink: string): string {
+  const resolvedNextLink = resolveMicrosoftGraphNextLink(nextLink);
+  if (!resolvedNextLink) {
+    throw new Error("Invalid Outlook participant page token");
+  }
+
+  const url = new URL(resolvedNextLink);
+  const pathname = url.pathname.replace(/^\/(?:v1\.0|beta)(?=\/)/, "");
+  return `${pathname}${url.search}`;
+}
+
+async function listSenderMessages({
+  client,
+  filterExpression,
+  sender,
+  action,
+  continueOnError,
+  logger,
+}: {
+  client: OutlookClient;
+  filterExpression: string;
+  sender: string;
+  action: "archive" | "trash";
+  continueOnError: boolean;
+  logger: Logger;
+}): Promise<{ id: string; conversationId: string }[]> {
+  const messages = new Map<string, { id: string; conversationId: string }>();
+  const visitedLinks = new Set<string>();
+  let nextLink: string | undefined;
+
+  try {
+    do {
+      const response: {
+        value?: Array<{ id?: string | null; conversationId?: string | null }>;
+        "@odata.nextLink"?: string;
+      } = nextLink
+        ? await client.getClient().api(nextLink).get()
+        : await client
+            .getClient()
+            .api("/me/messages")
+            .filter(filterExpression)
+            .top(SENDER_LIST_PAGE_SIZE)
+            .select("id,conversationId")
+            .get();
+
+      for (const message of response.value ?? []) {
+        if (message.id && message.conversationId) {
+          messages.set(message.id, {
+            id: message.id,
+            conversationId: message.conversationId,
+          });
+        }
+      }
+
+      nextLink = response["@odata.nextLink"];
+      if (nextLink && visitedLinks.has(nextLink)) {
+        throw new Error("Outlook sender pagination returned a repeated page");
+      }
+      if (nextLink) visitedLinks.add(nextLink);
+    } while (nextLink);
+  } catch (error) {
+    logger.error("Failed to fetch messages from sender", {
+      sender,
+      action,
+      fetchedCount: messages.size,
+      error,
+    });
+    // With continueOnError, still act on what was listed before the failure.
+    if (!continueOnError) throw error;
+  }
+
+  return [...messages.values()];
+}

@@ -1,0 +1,153 @@
+"use client";
+
+import { useRouter, useSearchParams } from "next/navigation";
+import Link from "next/link";
+import { Suspense, useEffect, useRef } from "react";
+import { usePostHog } from "posthog-js/react";
+import {
+  getEmailAlreadyLinkedDescription,
+  getRequiresReconsentDescription,
+} from "@/app/(landing)/login/messages";
+import { Button } from "@/components/ui/button";
+import { BasicLayout } from "@/components/layouts/BasicLayout";
+import { ErrorPage } from "@/components/ErrorPage";
+import { useUser } from "@/hooks/useUser";
+import { LoadingContent } from "@/components/LoadingContent";
+import { Loading } from "@/components/Loading";
+import { WELCOME_PATH } from "@/utils/config";
+import { CrispChatLoggedOutVisible } from "@/components/CrispChat";
+import { getAndClearAuthErrorCookie } from "@/utils/auth-cookies";
+import { SUPPORT_EMAIL } from "@/utils/branding";
+import {
+  getPendingAuthProvider,
+  trackAuthFailure,
+} from "@/utils/analytics/auth-funnel";
+
+const errorMessages: Record<string, { title: string; description: string }> = {
+  email_not_found: {
+    title: "Account Not Authorized",
+    description:
+      "Your account is not authorized to access this application. This may be because your email is not part of the allowed organization. Please contact your administrator or try signing in with a different account.",
+  },
+  signup_not_allowed: {
+    title: "Sign-up Restricted",
+    description:
+      "This deployment only allows sign-up from specific email addresses or domains. Please contact your administrator or try signing in with a different account.",
+  },
+  email_already_linked: {
+    title: "Email Already Linked",
+    description: getEmailAlreadyLinkedDescription(),
+  },
+  account_not_linked: {
+    title: "Sign-in Method Doesn't Match",
+    description:
+      "An account already exists for this email, but it was created with a different sign-in method or a different provider account. Sign in the way you originally signed up, or contact support so we can reconnect the two.",
+  },
+  org_invite_invalid_code: {
+    title: "Organization Invite Sign-in Failed",
+    description:
+      "We couldn't complete sign-in while joining this organization. Please start from the invitation link again. If it still fails, sign in with the original account for this mailbox, then accept the invite again.",
+  },
+  invalid_code: {
+    title: "Sign-in Session Expired",
+    description:
+      "Your sign-in link is no longer valid. This can happen if the login flow was opened twice, timed out, or already used. Please start sign-in again from the login page.",
+  },
+  requiresreconsent: {
+    title: "Permissions need to be refreshed",
+    description: getRequiresReconsentDescription(),
+  },
+};
+
+function LoginErrorContent() {
+  const posthog = usePostHog();
+  const hasTrackedAuthFailure = useRef(false);
+  const { data, isLoading, error } = useUser();
+  const router = useRouter();
+  const searchParams = useSearchParams();
+  const errorCode = searchParams.get("error")?.toLowerCase();
+  const reason = searchParams.get("reason")?.toLowerCase();
+  const resolvedErrorCode = resolveErrorCode({ errorCode, reason });
+
+  useEffect(() => {
+    if (isLoading || data?.id || hasTrackedAuthFailure.current) return;
+
+    hasTrackedAuthFailure.current = true;
+    trackAuthFailure(posthog, {
+      provider: getPendingAuthProvider(),
+      stage: "callback",
+      errorCode: resolvedErrorCode,
+    });
+  }, [data?.id, isLoading, posthog, resolvedErrorCode]);
+
+  // For some reason users are being sent to this page when logged in
+  // This will redirect them out of this page to the app
+  useEffect(() => {
+    if (data?.id) {
+      const authErrorCookie = getAndClearAuthErrorCookie();
+
+      if (authErrorCookie) {
+        router.push("/accounts");
+      } else {
+        router.push(WELCOME_PATH);
+      }
+    }
+  }, [data, router]);
+
+  if (isLoading) return <Loading />;
+  // will redirect to welcome if user is logged in
+  if (data?.id) return <Loading />;
+
+  const errorInfo = resolvedErrorCode ? errorMessages[resolvedErrorCode] : null;
+  const title = errorInfo?.title || "Error Logging In";
+  const supportText = `If this error persists, please use the support chat or email us at ${SUPPORT_EMAIL}.`;
+  const fallbackDescription = resolvedErrorCode
+    ? `Please try signing in again. (Error code: ${resolvedErrorCode}) ${supportText}`
+    : `Please try signing in again. ${supportText}`;
+  const description = errorInfo?.description
+    ? `${errorInfo.description} ${supportText}`
+    : fallbackDescription;
+
+  return (
+    <LoadingContent loading={isLoading} error={error}>
+      <ErrorPage
+        title={title}
+        description={description}
+        button={
+          <Button asChild>
+            <Link href="/login">Log In</Link>
+          </Button>
+        }
+      />
+      {/* <AutoLogOut loggedIn={!!session?.user.email} /> */}
+    </LoadingContent>
+  );
+}
+
+export default function LogInErrorPage() {
+  return (
+    <BasicLayout>
+      <Suspense fallback={<Loading />}>
+        <LoginErrorContent />
+      </Suspense>
+
+      <Suspense>
+        <CrispChatLoggedOutVisible />
+      </Suspense>
+    </BasicLayout>
+  );
+}
+
+function resolveErrorCode({
+  errorCode,
+  reason,
+}: {
+  errorCode?: string;
+  reason?: string;
+}) {
+  if (reason === "org_invite" && errorCode === "invalid_code") {
+    return "org_invite_invalid_code";
+  }
+
+  return errorCode;
+}

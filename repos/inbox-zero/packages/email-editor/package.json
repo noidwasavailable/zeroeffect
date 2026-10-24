@@ -1,0 +1,76 @@
+{
+  "name": "@inboxzero/email-editor",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Portable email HTML contracts and a Squire web editor for Inbox Zero",
+  "license": "SEE LICENSE IN ../../LICENSE",
+  "keywords": [
+    "email",
+    "editor",
+    "html",
+    "react",
+    "squire"
+  ],
+  "homepage": "https://github.com/elie222/inbox-zero/tree/main/packages/email-editor#readme",
+  "bugs": {
+    "url": "https://github.com/elie222/inbox-zero/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/elie222/inbox-zero.git",
+    "directory": "packages/email-editor"
+  },
+  "type": "module",
+  "sideEffects": [
+    "**/*.css"
+  ],
+  "exports": {
+    "./core": "./src/core/email-html.ts",
+    "./fixtures": "./src/fixtures/email-html.ts",
+    "./web": "./src/web/EmailEditor.tsx"
+  },
+  "scripts": {
+    "build": "node scripts/clean-package.mjs && tsc -p tsconfig.build.json && node scripts/prepare-package.mjs",
+    "pack:check": "pnpm run build && cd dist && pnpm pack --dry-run",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "parse5": "8.0.1"
+  },
+  "peerDependencies": {
+    "dompurify": "3.4.17",
+    "react": ">=19",
+    "react-dom": ">=19",
+    "squire-rte": "2.4.9"
+  },
+  "peerDependenciesMeta": {
+    "dompurify": {
+      "optional": true
+    },
+    "react": {
+      "optional": true
+    },
+    "react-dom": {
+      "optional": true
+    },
+    "squire-rte": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@testing-library/react": "16.3.3",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "dompurify": "3.4.17",
+    "jsdom": "27.3.0",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "squire-rte": "2.4.9",
+    "typescript": "6.0.3",
+    "vitest": "5.0.5"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

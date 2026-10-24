@@ -1,0 +1,14 @@
+{
+  "name": "@inboxzero/tinybird-ai-analytics",
+  "version": "0.0.0",
+  "main": "src/index.ts",
+  "dependencies": {
+    "@chronark/zod-bird": "1.0.0",
+    "zod": "4.2.1"
+  },
+  "devDependencies": {
+    "@types/node": "24.10.1",
+    "tsconfig": "workspace:*",
+    "typescript": "6.0.3"
+  }
+}

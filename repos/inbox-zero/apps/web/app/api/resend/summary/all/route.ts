@@ -1,0 +1,88 @@
+import { NextResponse } from "next/server";
+import { subDays } from "date-fns/subDays";
+import prisma from "@/utils/prisma";
+import { withError } from "@/utils/middleware";
+import {
+  getCronSecretHeader,
+  hasCronSecret,
+  hasPostCronSecret,
+} from "@/utils/cron";
+import { Frequency } from "@/generated/prisma/enums";
+import { captureException } from "@/utils/error";
+import type { Logger } from "@/utils/logger";
+import { getPremiumUserFilter } from "@/utils/premium";
+import type { SendSummaryEmailBody } from "../validation";
+import { enqueueBackgroundJob } from "@/utils/queue/dispatch";
+
+export const maxDuration = 300;
+const RESEND_SUMMARY_TOPIC = "resend-summary";
+const SEND_SPACING_SECONDS = 1;
+
+export const GET = withError("cron/resend/summary/all", async (request) => {
+  if (!hasCronSecret(request)) {
+    captureException(new Error("Unauthorized request: api/resend/summary/all"));
+    return new Response("Unauthorized", { status: 401 });
+  }
+
+  const result = await sendSummaryAllUpdate(request.logger);
+
+  return NextResponse.json(result);
+});
+
+export const POST = withError("cron/resend/summary/all", async (request) => {
+  if (!(await hasPostCronSecret(request))) {
+    captureException(
+      new Error("Unauthorized cron request: api/resend/summary/all"),
+    );
+    return new Response("Unauthorized", { status: 401 });
+  }
+
+  const result = await sendSummaryAllUpdate(request.logger);
+
+  return NextResponse.json(result);
+});
+
+async function sendSummaryAllUpdate(logger: Logger) {
+  logger.info("Sending summary all update");
+
+  const emailAccounts = await prisma.emailAccount.findMany({
+    select: { id: true },
+    where: {
+      summaryEmailFrequency: {
+        not: Frequency.NEVER,
+      },
+      ...getPremiumUserFilter(),
+      // User at least 4 days old
+      createdAt: {
+        lt: subDays(new Date(), 4),
+      },
+    },
+  });
+
+  logger.info("Sending summary to users", { count: emailAccounts.length });
+
+  for (const [index, emailAccount] of emailAccounts.entries()) {
+    try {
+      await enqueueBackgroundJob<SendSummaryEmailBody>({
+        topic: RESEND_SUMMARY_TOPIC,
+        body: { emailAccountId: emailAccount.id },
+        vercel: { delaySeconds: index * SEND_SPACING_SECONDS },
+        qstash: {
+          queueName: "email-summary-all",
+          parallelism: 3,
+          path: "/api/resend/summary",
+          headers: getCronSecretHeader(),
+        },
+        logger,
+      });
+    } catch (error) {
+      logger.error("Failed to enqueue summary send", {
+        emailAccountId: emailAccount.id,
+        error,
+      });
+    }
+  }
+
+  logger.info("All requests initiated", { count: emailAccounts.length });
+  return { count: emailAccounts.length };
+}

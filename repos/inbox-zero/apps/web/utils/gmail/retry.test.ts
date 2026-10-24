@@ -1,0 +1,356 @@
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import {
+  extractErrorInfo,
+  isRetryableError,
+  calculateRetryDelay,
+  withGmailRetry,
+  withGmailNonIdempotentWriteRetry,
+  MAX_GMAIL_BLOCKING_RETRY_DELAY_MS,
+} from "./retry";
+import { sleep } from "@/utils/sleep";
+
+vi.mock("@/utils/sleep", () => ({
+  sleep: vi.fn().mockResolvedValue(undefined),
+}));
+
+describe("Gmail retry helpers", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  describe("isRetryableError", () => {
+    it("should identify 502 status code as retryable server error", () => {
+      const errorInfo = { status: 502, errorMessage: "Server Error" };
+      const result = isRetryableError(errorInfo);
+
+      expect(result.retryable).toBe(true);
+      expect(result.isServerError).toBe(true);
+      expect(result.isRateLimit).toBe(false);
+    });
+
+    it("should identify 502 in error message as retryable (Gmail HTML error)", () => {
+      const errorInfo = {
+        errorMessage: "Error 502 (Server Error)!!1",
+      };
+      const result = isRetryableError(errorInfo);
+
+      expect(result.retryable).toBe(true);
+      expect(result.isServerError).toBe(true);
+      expect(result.isRateLimit).toBe(false);
+    });
+
+    it("should identify 503 in error message as retryable", () => {
+      const errorInfo = {
+        errorMessage: "503 Service Unavailable",
+      };
+      const result = isRetryableError(errorInfo);
+
+      expect(result.retryable).toBe(true);
+      expect(result.isServerError).toBe(true);
+      expect(result.isRateLimit).toBe(false);
+    });
+
+    it("should identify 504 Gateway Timeout as retryable", () => {
+      const errorInfo = { status: 504, errorMessage: "Gateway Timeout" };
+      const result = isRetryableError(errorInfo);
+
+      expect(result.retryable).toBe(true);
+      expect(result.isServerError).toBe(true);
+      expect(result.isRateLimit).toBe(false);
+    });
+
+    it("should identify 429 as a retryable rate limit error", () => {
+      const errorInfo = { status: 429, errorMessage: "Too Many Requests" };
+      const result = isRetryableError(errorInfo);
+
+      expect(result.retryable).toBe(true);
+      expect(result.isRateLimit).toBe(true);
+      expect(result.isServerError).toBe(false);
+    });
+
+    it("should identify 403 with rateLimitExceeded reason as retryable", () => {
+      const errorInfo = {
+        status: 403,
+        reason: "rateLimitExceeded",
+        errorMessage: "Rate limit exceeded",
+      };
+      const result = isRetryableError(errorInfo);
+
+      expect(result.retryable).toBe(true);
+      expect(result.isRateLimit).toBe(true);
+      expect(result.isServerError).toBe(false);
+    });
+
+    it("should identify RESOURCE_EXHAUSTED concurrent request errors as retryable", () => {
+      const errorInfo = {
+        googleErrorStatus: "RESOURCE_EXHAUSTED",
+        errorMessage: "Too many concurrent requests for user",
+      };
+      const result = isRetryableError(errorInfo);
+
+      expect(result.retryable).toBe(true);
+      expect(result.isRateLimit).toBe(true);
+      expect(result.isServerError).toBe(false);
+    });
+
+    it("should identify fetch failed as network error", () => {
+      const errorInfo = { errorMessage: "fetch failed" };
+      const result = isRetryableError(errorInfo);
+
+      expect(result.retryable).toBe(true);
+      expect(result.isRateLimit).toBe(false);
+      expect(result.isServerError).toBe(false);
+      expect(result.isFailedPrecondition).toBe(false);
+    });
+
+    it("should identify 404 as non-retryable", () => {
+      const errorInfo = { status: 404, errorMessage: "Not Found" };
+      const result = isRetryableError(errorInfo);
+
+      expect(result.retryable).toBe(false);
+      expect(result.isRateLimit).toBe(false);
+      expect(result.isServerError).toBe(false);
+      expect(result.isFailedPrecondition).toBe(false);
+    });
+
+    it("should identify 403 without rate limit reason as non-retryable", () => {
+      const errorInfo = {
+        status: 403,
+        reason: "forbidden",
+        errorMessage: "Forbidden",
+      };
+      const result = isRetryableError(errorInfo);
+
+      expect(result.retryable).toBe(false);
+      expect(result.isRateLimit).toBe(false);
+      expect(result.isServerError).toBe(false);
+      expect(result.isFailedPrecondition).toBe(false);
+    });
+
+    it("should identify failedPrecondition as retryable", () => {
+      const errorInfo = {
+        status: 400,
+        reason: "failedPrecondition",
+        errorMessage: "Precondition check failed.",
+      };
+      const result = isRetryableError(errorInfo);
+
+      expect(result.retryable).toBe(true);
+      expect(result.isRateLimit).toBe(false);
+      expect(result.isServerError).toBe(false);
+      expect(result.isFailedPrecondition).toBe(true);
+    });
+
+    it("should not retry duplicate Gmail push client errors", () => {
+      const errorInfo = {
+        status: 400,
+        reason: "failedPrecondition",
+        errorMessage:
+          "Only one user push notification client allowed per developer (call /stop then try again)",
+      };
+      const result = isRetryableError(errorInfo);
+
+      expect(result.retryable).toBe(false);
+      expect(result.isRateLimit).toBe(false);
+      expect(result.isServerError).toBe(false);
+      expect(result.isFailedPrecondition).toBe(false);
+    });
+
+    it("should not retry when Gmail is disabled for the account", () => {
+      const errorInfo = {
+        status: 400,
+        reason: "failedPrecondition",
+        googleErrorStatus: "FAILED_PRECONDITION",
+        errorMessage: "Mail service not enabled",
+      };
+      const result = isRetryableError(errorInfo);
+
+      expect(result.retryable).toBe(false);
+      expect(result.isFailedPrecondition).toBe(false);
+    });
+  });
+
+  describe("calculateRetryDelay", () => {
+    it("should use short exponential backoff for rate limit errors", () => {
+      expect(calculateRetryDelay(true, false, false, 1)).toBe(1000);
+      expect(calculateRetryDelay(true, false, false, 2)).toBe(2000);
+      expect(calculateRetryDelay(true, false, false, 4)).toBe(8000);
+      expect(calculateRetryDelay(true, false, false, 5)).toBe(10_000);
+    });
+
+    it("should use exponential backoff for server errors", () => {
+      expect(calculateRetryDelay(false, true, false, 1)).toBe(5000); // 5s
+      expect(calculateRetryDelay(false, true, false, 2)).toBe(10_000); // 10s
+      expect(calculateRetryDelay(false, true, false, 3)).toBe(20_000); // 20s
+    });
+
+    it("should use fallback delay when retry time is in the past", () => {
+      const pastDate = new Date(Date.now() - 10_000).toISOString();
+      const errorMessage = `Rate limit exceeded. Retry after ${pastDate}`;
+
+      // Should fall back to rate-limit backoff
+      const delay = calculateRetryDelay(
+        true,
+        false,
+        false,
+        1,
+        undefined,
+        errorMessage,
+      );
+      expect(delay).toBe(1000);
+    });
+
+    it("should use retry time from error message when valid", () => {
+      const futureDate = new Date(Date.now() + 15_000).toISOString();
+      const errorMessage = `Rate limit exceeded. Retry after ${futureDate}`;
+
+      const delay = calculateRetryDelay(
+        true,
+        false,
+        false,
+        1,
+        undefined,
+        errorMessage,
+      );
+      expect(delay).toBeGreaterThan(14_000); // Should be ~15s
+      expect(delay).toBeLessThan(16_000);
+    });
+
+    it("should use short backoff for failed precondition", () => {
+      expect(calculateRetryDelay(false, false, true, 1)).toBe(1000);
+      expect(calculateRetryDelay(false, false, true, 3)).toBe(4000);
+      expect(calculateRetryDelay(false, false, true, 5)).toBe(10_000);
+    });
+
+    it("should use default exponential backoff for other retryable errors (e.g., network)", () => {
+      // When no specific error type matches, falls back to default
+      expect(calculateRetryDelay(false, false, false, 1)).toBe(1000); // 1s
+      expect(calculateRetryDelay(false, false, false, 2)).toBe(2000); // 2s
+      expect(calculateRetryDelay(false, false, false, 3)).toBe(4000); // 4s
+      expect(calculateRetryDelay(false, false, false, 4)).toBe(8000); // 8s
+      expect(calculateRetryDelay(false, false, false, 5)).toBe(16_000); // 16s max
+      expect(calculateRetryDelay(false, false, false, 6)).toBe(16_000); // capped at 16s
+    });
+  });
+
+  describe("extractErrorInfo", () => {
+    it("should extract Gmail error details from response payload", () => {
+      const error = {
+        cause: {
+          response: {
+            status: 404,
+            data: {
+              error: {
+                message: "Invalid label: FAKE_LABEL_ID_123",
+                errors: [{ reason: "notFound" }],
+              },
+            },
+          },
+        },
+      };
+
+      const info = extractErrorInfo(error);
+
+      expect(info.status).toBe(404);
+      expect(info.reason).toBe("notFound");
+      expect(info.errorMessage).toBe("Invalid label: FAKE_LABEL_ID_123");
+    });
+
+    it("should extract numeric status from RESOURCE_EXHAUSTED payloads", () => {
+      const error = {
+        cause: {
+          response: {
+            data: {
+              error: {
+                code: "429",
+                status: "RESOURCE_EXHAUSTED",
+                message: "Too many concurrent requests for user",
+              },
+            },
+          },
+        },
+      };
+
+      const info = extractErrorInfo(error);
+
+      expect(info.status).toBe(429);
+      expect(info.code).toBe("429");
+      expect(info.googleErrorStatus).toBe("RESOURCE_EXHAUSTED");
+      expect(info.errorMessage).toBe("Too many concurrent requests for user");
+    });
+
+    it("should fall back to top-level error string when message missing", () => {
+      const error = {
+        error: "Some top-level error",
+      };
+
+      const info = extractErrorInfo(error);
+
+      expect(info.status).toBeUndefined();
+      expect(info.reason).toBeUndefined();
+      expect(info.errorMessage).toBe("Some top-level error");
+    });
+  });
+
+  describe("withGmailRetry", () => {
+    it("aborts retry loop when backoff exceeds serverless cap", async () => {
+      const retryAt = new Date(
+        Date.now() + MAX_GMAIL_BLOCKING_RETRY_DELAY_MS + 60_000,
+      ).toISOString();
+      const error = Object.assign(
+        new Error(`User-rate limit exceeded. Retry after ${retryAt}`),
+        {
+          cause: {
+            status: 429,
+            message: `User-rate limit exceeded. Retry after ${retryAt}`,
+          },
+        },
+      );
+      const operation = vi.fn().mockRejectedValue(error);
+
+      await expect(withGmailRetry(operation, 5)).rejects.toBe(error);
+
+      expect(operation).toHaveBeenCalledTimes(1);
+      expect(sleep).not.toHaveBeenCalled();
+    });
+
+    it("rethrows original non-retryable errors", async () => {
+      const error = Object.assign(new Error("Not Found"), { status: 404 });
+      const operation = vi.fn().mockRejectedValue(error);
+
+      await expect(withGmailRetry(operation, 5)).rejects.toBe(error);
+
+      expect(operation).toHaveBeenCalledTimes(1);
+      expect(sleep).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("withGmailNonIdempotentWriteRetry", () => {
+    it("retries an explicit throttle rejection", async () => {
+      const error = Object.assign(new Error("rate limit exceeded"), {
+        status: 429,
+      });
+      const operation = vi
+        .fn()
+        .mockRejectedValueOnce(error)
+        .mockResolvedValue("sent");
+
+      await expect(
+        withGmailNonIdempotentWriteRetry(operation, 1),
+      ).resolves.toBe("sent");
+      expect(operation).toHaveBeenCalledTimes(2);
+    });
+
+    it.each([
+      Object.assign(new Error("service unavailable"), { status: 503 }),
+      Object.assign(new Error("fetch failed"), { code: "ECONNRESET" }),
+    ])("does not retry an ambiguous failure", async (error) => {
+      const operation = vi.fn().mockRejectedValue(error);
+
+      await expect(withGmailNonIdempotentWriteRetry(operation, 5)).rejects.toBe(
+        error,
+      );
+      expect(operation).toHaveBeenCalledOnce();
+    });
+  });
+});

@@ -1,0 +1,259 @@
+import { deleteContact as deleteLoopsContact } from "@inboxzero/loops";
+import { deleteContact as deleteResendContact } from "@inboxzero/transactional-email";
+import { withThreadPageBufferDeletion } from "@/utils/redis/thread-page-buffer";
+import prisma from "@/utils/prisma";
+import { deleteTinybirdEmailData } from "@inboxzero/tinybird";
+import { after } from "next/server";
+import {
+  deletePosthogUser,
+  trackUserDeleted,
+  trackUserDeletionRequested,
+} from "@/utils/posthog";
+import { captureException, SafeError } from "@/utils/error";
+import { stopWatchingEmailAccount } from "@/utils/email/watch-manager";
+import type { Logger } from "@/utils/logger";
+import { prepareMemberRemovalNotifications } from "@/utils/team-comments/member-removal";
+import { clearCachedResearchForUser } from "@/utils/redis/research-cache";
+import { releaseAccountRecordings } from "@/utils/meeting-recorder/delete-media";
+import {
+  DELETE_ACCOUNT_REQUIRES_OWNER_TRANSFER_ERROR,
+  getDeletableOrganizationIdsOrThrow,
+  getDeletedAccountOwnershipImpact,
+  getDeleteSoloOrganizationsOperation,
+  isMemberEmailAccountForeignKeyError,
+  isOrganizationOwnerInvariantError,
+} from "@/utils/organizations/ownership";
+
+export async function deleteUser({
+  userId,
+  logger,
+}: {
+  userId: string;
+  logger: Logger;
+}) {
+  const accounts = await prisma.account.findMany({
+    where: { userId },
+    select: {
+      provider: true,
+      emailAccount: {
+        select: {
+          id: true,
+          email: true,
+          watchEmailsSubscriptionId: true,
+        },
+      },
+    },
+  });
+  const emailAccountIds = accounts
+    .map((account) => account.emailAccount?.id)
+    .filter((id): id is string => Boolean(id));
+  const ownershipImpact =
+    await getDeletedAccountOwnershipImpact(emailAccountIds);
+  const organizationIdsToDelete = getDeletableOrganizationIdsOrThrow(
+    ownershipImpact,
+    DELETE_ACCOUNT_REQUIRES_OWNER_TRANSFER_ERROR,
+  );
+
+  // Drop every session before the slower resource cleanup so a second device
+  // cannot keep calling the API while deletion is in progress.
+  await prisma.session.deleteMany({ where: { userId } });
+
+  logger.info("Deleting user resources");
+
+  try {
+    await trackUserDeletionRequested(userId).catch((error) => {
+      logger.error("Error tracking user deletion request", { error });
+      captureException(error);
+    });
+
+    clearCachedResearchForUser(userId).catch((error) => {
+      logger.error("Error clearing cached research", { error });
+      captureException(error);
+    });
+
+    await withThreadPageBufferDeletion(emailAccountIds, async () => {
+      await deleteSoloOrganizations({
+        organizationIds: organizationIdsToDelete,
+        deletedEmailAccountIds: emailAccountIds,
+      });
+
+      const emailAccounts = accounts.flatMap((account) =>
+        account.emailAccount
+          ? [{ ...account.emailAccount, provider: account.provider }]
+          : [],
+      );
+
+      // Watches and meeting bots are found through rows that cascade with the
+      // user, so every mailbox is released before the user is deleted.
+      const releases = await Promise.allSettled(
+        emailAccounts.map(async (emailAccount) => {
+          await stopWatchingEmailAccount({
+            emailAccountId: emailAccount.id,
+            provider: emailAccount.provider,
+            subscriptionId: emailAccount.watchEmailsSubscriptionId,
+            logger,
+          });
+          await releaseAccountRecordings({
+            emailAccountId: emailAccount.id,
+            logger,
+          });
+        }),
+      );
+      // Settle every mailbox first so a retry cannot overlap unfinished cleanup.
+      const failedRelease = releases.find(
+        (result): result is PromiseRejectedResult =>
+          result.status === "rejected",
+      );
+      if (failedRelease) throw failedRelease.reason;
+
+      await deleteUserRows({ userId, emailAccountIds, logger });
+
+      await Promise.allSettled(
+        emailAccounts.flatMap(({ email }) => [
+          deleteLoopsContact(email),
+          deletePosthogUser({ email }),
+          deleteResendContact({ email }),
+        ]),
+      );
+
+      logger.info("User resources deleted");
+    });
+
+    const emails = accounts
+      .map((account) => account.emailAccount?.email)
+      .filter((email): email is string => Boolean(email));
+    after(() =>
+      deleteTinybirdEmailData(emails).catch((error) => {
+        logger.error("Error deleting Tinybird data", { error });
+        captureException(error);
+      }),
+    );
+  } catch (error) {
+    logger.error("Error during user resources deletion process", {
+      error,
+    });
+    captureException(error);
+    throw error;
+  }
+}
+
+async function deleteSoloOrganizations({
+  organizationIds,
+  deletedEmailAccountIds,
+}: {
+  organizationIds: string[];
+  deletedEmailAccountIds: string[];
+}) {
+  if (organizationIds.length === 0) return;
+
+  await getDeleteSoloOrganizationsOperation(
+    organizationIds,
+    deletedEmailAccountIds,
+  );
+}
+
+async function deleteUserRows({
+  userId,
+  emailAccountIds,
+  logger,
+}: {
+  userId: string;
+  emailAccountIds: string[];
+  logger: Logger;
+}) {
+  try {
+    // First delete ExecutedRules and their associated ExecutedActions in batches
+    // If we try do this in one go for a user with a lot of executed rules, this will fail
+    logger.info("Deleting ExecutedRules in batches");
+    for (const emailAccountId of emailAccountIds) {
+      await deleteExecutedRulesInBatches({ emailAccountId, logger });
+    }
+
+    logger.info("Deleting user");
+    const notifyConversations = await prepareMemberRemovalNotifications(
+      { emailAccount: { userId } },
+      logger,
+    );
+    // Members restrict email account deletion, so they go first.
+    // Deleting the user cascades through all remaining account data, which
+    // can outlast the default 5s transaction timeout for large accounts.
+    const [, deletedUser] = await prisma.$transaction(
+      [
+        prisma.member.deleteMany({ where: { emailAccount: { userId } } }),
+        prisma.user.deleteMany({ where: { id: userId } }),
+      ],
+      { timeout: 60_000 },
+    );
+    await notifyConversations();
+
+    // PostHog tracks the completed delete after the database delete succeeds.
+    if (deletedUser.count > 0) await trackUserDeleted(userId);
+  } catch (error) {
+    if (
+      isOrganizationOwnerInvariantError(error) ||
+      isMemberEmailAccountForeignKeyError(error)
+    ) {
+      throw new SafeError(DELETE_ACCOUNT_REQUIRES_OWNER_TRANSFER_ERROR);
+    }
+    throw error;
+  }
+}
+
+/**
+ * Delete ExecutedRules and their associated ExecutedActions in batches
+ */
+async function deleteExecutedRulesInBatches({
+  emailAccountId,
+  batchSize = 1000,
+  logger,
+}: {
+  emailAccountId: string;
+  batchSize?: number;
+  logger: Logger;
+}) {
+  let deletedTotal = 0;
+
+  while (true) {
+    // 1. Get a batch of ExecutedRule IDs
+    const executedRules = await prisma.executedRule.findMany({
+      where: { emailAccountId },
+      select: { id: true },
+      orderBy: { id: "asc" },
+      take: batchSize,
+    });
+
+    if (executedRules.length === 0) {
+      logger.info("Completed deletion of ExecutedRules", {
+        total: deletedTotal,
+      });
+      break;
+    }
+
+    const ruleIds = executedRules.map((rule) => rule.id);
+
+    const { count: deletedScheduledActionCount } =
+      await prisma.scheduledAction.deleteMany({
+        where: { executedRuleId: { in: ruleIds } },
+      });
+
+    const { count: deletedExecutedActionCount } =
+      await prisma.executedAction.deleteMany({
+        where: { executedRuleId: { in: ruleIds } },
+      });
+
+    const { count: deletedExecutedRuleCount } =
+      await prisma.executedRule.deleteMany({
+        where: { id: { in: ruleIds } },
+      });
+
+    deletedTotal += deletedExecutedRuleCount;
+    logger.info("Deleted batch of ExecutedRules", {
+      deletedCount: deletedExecutedRuleCount,
+      deletedExecutedActionCount,
+      deletedScheduledActionCount,
+      total: deletedTotal,
+    });
+  }
+
+  return deletedTotal;
+}

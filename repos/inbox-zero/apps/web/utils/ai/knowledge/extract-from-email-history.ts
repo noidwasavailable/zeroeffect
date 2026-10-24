@@ -1,0 +1,112 @@
+import { z } from "zod";
+import type { Logger } from "@/utils/logger";
+import type { EmailAccountWithAI } from "@/utils/llms/types";
+import type { EmailForLLM } from "@/utils/types";
+import { getEmailListPrompt, getTodayForLLM } from "@/utils/ai/helpers";
+import { preprocessBooleanLike } from "@/utils/zod";
+import { getModelForUseCase, LlmUseCase } from "@/utils/llms/use-cases";
+import { createGenerateObject } from "@/utils/llms";
+import { getUserInfoPrompt } from "@/utils/ai/helpers";
+
+const system = `You are an email history analysis agent. Your task is to analyze the provided historical email threads and extract relevant information that would be helpful for drafting a response to the current email thread.
+
+Your task:
+1. Analyze the historical email threads to understand relevant past context and interactions
+2. Identify key points, commitments, questions, and unresolved items from previous conversations
+3. Extract any relevant dates, deadlines, or time-sensitive information mentioned in past exchanges
+4. Note any specific preferences or communication patterns shown in previous exchanges
+
+Provide a concise summary (max 500 characters) that captures the most important historical context needed for drafting a response to the current thread. Focus on:
+- Key unresolved points or questions from past exchanges
+- Any commitments or promises made in previous conversations
+- Important dates or deadlines established in past emails
+- Notable preferences or patterns in communication
+
+Return your response in JSON format.`;
+
+const getUserPrompt = ({
+  currentThreadMessages,
+  historicalMessages,
+  emailAccount,
+}: {
+  currentThreadMessages: EmailForLLM[];
+  historicalMessages: EmailForLLM[];
+  emailAccount: EmailAccountWithAI;
+}) => `<current_email_thread>
+${getEmailListPrompt({ messages: currentThreadMessages, messageMaxLength: 10_000 })}
+</current_email_thread>
+
+${
+  historicalMessages.length > 0
+    ? `<historical_email_threads>
+${getEmailListPrompt({ messages: historicalMessages, messageMaxLength: 10_000 })}
+</historical_email_threads>`
+    : "No historical email threads available."
+}
+
+${getUserInfoPrompt({ emailAccount })}
+
+${getTodayForLLM()}
+Analyze the historical email threads and extract any relevant information that would be helpful for drafting a response to the current email thread. Provide a concise summary of the key historical context.`;
+
+const schema = z.object({
+  hasHistoricalContext: z
+    .preprocess(preprocessBooleanLike, z.boolean())
+    .describe("Whether there is any relevant historical context found."),
+  summary: z
+    .string()
+    .describe(
+      "A concise summary of relevant historical context, including key points, commitments, deadlines, from past conversations.",
+    ),
+});
+
+export async function aiExtractFromEmailHistory({
+  currentThreadMessages,
+  historicalMessages,
+  emailAccount,
+  logger,
+}: {
+  currentThreadMessages: EmailForLLM[];
+  historicalMessages: EmailForLLM[];
+  emailAccount: EmailAccountWithAI;
+  logger: Logger;
+}): Promise<string | null> {
+  try {
+    logger.info("Extracting information from email history", {
+      currentThreadCount: currentThreadMessages.length,
+      historicalCount: historicalMessages.length,
+    });
+
+    if (historicalMessages.length === 0) return null;
+
+    const prompt = getUserPrompt({
+      currentThreadMessages,
+      historicalMessages,
+      emailAccount,
+    });
+
+    const modelOptions = getModelForUseCase(
+      emailAccount.user,
+      LlmUseCase.EmailHistoryExtraction,
+    );
+
+    const generateObject = createGenerateObject({
+      emailAccount,
+      label: "Email history extraction",
+      modelOptions,
+      promptHardening: { trust: "untrusted", level: "compact" },
+    });
+
+    const result = await generateObject({
+      ...modelOptions,
+      instructions: system,
+      prompt,
+      schema,
+    });
+
+    return result.object.summary;
+  } catch (error) {
+    logger.error("Failed to extract information from email history", { error });
+    return null;
+  }
+}
