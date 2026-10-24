@@ -1,0 +1,47 @@
+# VCS
+.git
+
+# Node / package managers
+node_modules
+**/node_modules
+pnpm-store
+.pnpm-store
+
+# Python
+.venv
+__pycache__
+
+# Build outputs / caches
+.next
+**/.next
+.turbo
+**/.turbo
+out
+coverage
+*.log
+
+# OS/editor junk
+.DS_Store
+*.swp
+*.swo
+.idea
+.vscode
+
+# Local env files (do not bake secrets)
+.env
+.env.*
+**/.env
+**/.env.*
+*.env
+*.env.*
+!.env.example
+!**/.env.example
+
+# Docker
+Dockerfile*
+!.dockerignore
+
+# Misc
+*.local
+_tmp
+.tmp

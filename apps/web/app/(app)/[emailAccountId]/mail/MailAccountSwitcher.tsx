@@ -1,0 +1,261 @@
+"use client";
+
+import { MailAccountSwitcherTrigger } from "@inboxzero/mail-ui/MailAccountSwitcherTrigger";
+import { memo, useRef, useState, type ReactNode } from "react";
+import Link from "next/link";
+import {
+  CheckIcon,
+  ChevronsUpDownIcon,
+  PlusIcon,
+  SlidersHorizontalIcon,
+} from "lucide-react";
+import type { GetEmailAccountsResponse } from "@/app/api/user/email-accounts/route";
+import { AllAccountsSelectionDialog } from "@/app/(app)/[emailAccountId]/mail/AllAccountsSelectionDialog";
+import { ProfileImage } from "@/components/ProfileImage";
+import { Kbd } from "@/components/Kbd";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { RailTooltip } from "@/app/(app)/[emailAccountId]/mail/MailSidebar";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+import { useAccount } from "@/providers/EmailAccountProvider";
+import { useAccounts } from "@/hooks/useAccounts";
+import {
+  formatShortcutKeys,
+  getShortcut,
+  getShortcutHint,
+} from "@/lib/shortcuts/registry";
+import { getMailAccountUrl } from "@/app/(app)/[emailAccountId]/mail/mail-account-url";
+import { getInboxZeroDesktopApp } from "@/utils/desktop-app";
+
+export const MailAccountSwitcher = memo(function MailAccountSwitcher({
+  isAllAccounts,
+  isDesktopApp,
+  onSelectAccount,
+  onSelectAll,
+  collapsed = false,
+}: {
+  isAllAccounts: boolean;
+  isDesktopApp: boolean;
+  onSelectAccount: (accountId: string) => void;
+  onSelectAll: () => void;
+  /** Icon-only rail: the trigger shrinks to the account avatar. */
+  collapsed?: boolean;
+}) {
+  const { data, mutate } = useAccounts();
+  const { emailAccount } = useAccount();
+  const [isSelectionOpen, setIsSelectionOpen] = useState(false);
+
+  if (!data) return null;
+
+  const activeLabel = isAllAccounts
+    ? "All accounts"
+    : emailAccount?.name || emailAccount?.email || "Choose account";
+  const activeEmail =
+    !isAllAccounts && emailAccount?.name ? emailAccount.email : null;
+  let activeIcon: ReactNode = null;
+  if (isAllAccounts) {
+    activeIcon = <AllAccountsIcon />;
+  } else if (emailAccount) {
+    activeIcon = (
+      <ProfileImage
+        className="size-8"
+        image={emailAccount.image}
+        label={emailAccount.name || emailAccount.email}
+      />
+    );
+  }
+
+  return (
+    <div className="mt-2 shrink-0 border-border border-t pt-2">
+      <DropdownMenu>
+        <RailTooltip label={collapsed ? activeLabel : null}>
+          <DropdownMenuTrigger asChild>
+            <MailAccountSwitcherTrigger
+              icon={activeIcon}
+              indicator={
+                <ChevronsUpDownIcon className="size-4 text-muted-foreground" />
+              }
+              label={activeLabel}
+              email={activeEmail}
+              collapsed={collapsed}
+            />
+          </DropdownMenuTrigger>
+        </RailTooltip>
+        <DropdownMenuContent
+          align="start"
+          className="w-[--radix-dropdown-menu-trigger-width] min-w-72 rounded-2xl p-2 shadow-xl"
+          // A focused trigger reopens the menu on ArrowUp/ArrowDown, which
+          // would swallow mail list navigation after closing the switcher.
+          onCloseAutoFocus={(event) => event.preventDefault()}
+          side="top"
+          sideOffset={8}
+        >
+          {data.emailAccounts.length > 1 ? (
+            <>
+              <div className="flex items-stretch gap-1">
+                <DropdownMenuItem
+                  className="min-w-0 flex-1 gap-3 rounded-xl p-3"
+                  onSelect={onSelectAll}
+                >
+                  <AllAccountsIcon />
+                  <span className="flex-1 font-medium">All accounts</span>
+                  {isAllAccounts && <CurrentAccountCheck />}
+                  {isDesktopApp && (
+                    <Kbd className="shrink-0">
+                      {getShortcutHint("switchAllAccounts")}
+                    </Kbd>
+                  )}
+                </DropdownMenuItem>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <DropdownMenuItem
+                      aria-label="Choose accounts"
+                      className="w-10 justify-center rounded-xl p-0 text-muted-foreground"
+                      onSelect={() => setIsSelectionOpen(true)}
+                    >
+                      <SlidersHorizontalIcon />
+                    </DropdownMenuItem>
+                  </TooltipTrigger>
+                  <TooltipContent side="right">Choose accounts</TooltipContent>
+                </Tooltip>
+              </div>
+              <DropdownMenuSeparator />
+            </>
+          ) : null}
+          {data.emailAccounts.map((account, index) => (
+            <AccountItem
+              account={account}
+              isActive={!isAllAccounts && account.id === emailAccount?.id}
+              isDesktopApp={isDesktopApp}
+              key={account.id}
+              onSelect={onSelectAccount}
+              shortcutKey={
+                isDesktopApp
+                  ? getShortcut("switchAccount").keys[index]
+                  : undefined
+              }
+            />
+          ))}
+          <DropdownMenuSeparator />
+          <DropdownMenuItem asChild className="gap-3 rounded-xl p-3">
+            <Link href="/accounts">
+              <span className="flex size-8 items-center justify-center rounded-full bg-muted">
+                <PlusIcon className="size-4" />
+              </span>
+              <span className="font-medium text-muted-foreground">
+                Add or manage accounts
+              </span>
+            </Link>
+          </DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
+      {isSelectionOpen ? (
+        <AllAccountsSelectionDialog
+          emailAccounts={data.emailAccounts}
+          onClose={() => setIsSelectionOpen(false)}
+          onSaved={mutate}
+        />
+      ) : null}
+    </div>
+  );
+});
+
+function AccountItem({
+  account,
+  isActive,
+  isDesktopApp,
+  onSelect,
+  shortcutKey,
+}: {
+  account: GetEmailAccountsResponse["emailAccounts"][number];
+  isActive: boolean;
+  isDesktopApp: boolean;
+  onSelect: (accountId: string) => void;
+  shortcutKey: string | undefined;
+}) {
+  // Radix onSelect receives a CustomEvent without metaKey/ctrlKey.
+  const openInNewWindow = useRef(false);
+
+  return (
+    <DropdownMenuItem
+      className="gap-3 rounded-xl p-3"
+      onPointerDown={(event) => {
+        openInNewWindow.current =
+          isDesktopApp && isDesktopNewWindowClick(event);
+      }}
+      onKeyDown={(event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          openInNewWindow.current =
+            isDesktopApp && isDesktopNewWindowClick(event);
+        }
+      }}
+      onSelect={() => {
+        const shouldOpenWindow = openInNewWindow.current;
+        openInNewWindow.current = false;
+        if (shouldOpenWindow) {
+          const openWindow = getInboxZeroDesktopApp()?.openWindow;
+          if (openWindow) {
+            openWindow(getMailAccountUrl(account.id, "")).catch(() => {});
+            return;
+          }
+        }
+        onSelect(account.id);
+      }}
+    >
+      <ProfileImage
+        className="size-10"
+        image={account.image}
+        label={account.name || account.email}
+      />
+      <span className="min-w-0 flex-1">
+        <span className="block truncate font-medium">
+          {account.name || account.email}
+        </span>
+        {account.name ? (
+          <span className="block truncate text-muted-foreground text-xs">
+            {account.email}
+          </span>
+        ) : null}
+      </span>
+      {isActive && <CurrentAccountCheck />}
+      {shortcutKey && (
+        <Kbd className="shrink-0">
+          {formatShortcutKeys({
+            ...getShortcut("switchAccount"),
+            display: [shortcutKey.replace("mod+", "modorctrl+")],
+          })}
+        </Kbd>
+      )}
+    </DropdownMenuItem>
+  );
+}
+
+function CurrentAccountCheck() {
+  return <CheckIcon aria-label="Current account" className="size-4 shrink-0" />;
+}
+
+function AllAccountsIcon() {
+  return (
+    <span className="flex size-8 shrink-0 items-center justify-center gap-0.5 rounded-full bg-muted">
+      <span className="size-2 rounded-full bg-blue-600" />
+      <span className="size-2 rounded-full bg-violet-500" />
+      <span className="size-2 rounded-full bg-emerald-500" />
+    </span>
+  );
+}
+
+function isDesktopNewWindowClick(event: {
+  metaKey: boolean;
+  ctrlKey: boolean;
+}) {
+  return event.metaKey || event.ctrlKey;
+}

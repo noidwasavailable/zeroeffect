@@ -1,0 +1,152 @@
+import { Anchor } from "@/components/new-landing/common/Anchor";
+import { Card, CardContent } from "@/components/new-landing/common/Card";
+import { CardWrapper } from "@/components/new-landing/common/CardWrapper";
+import {
+  Section,
+  SectionContent,
+} from "@/components/new-landing/common/Section";
+import {
+  Paragraph,
+  SectionHeading,
+} from "@/components/new-landing/common/Typography";
+import { env } from "@/env";
+import { BRAND_NAME } from "@/utils/branding";
+
+const faqs: {
+  question: string;
+  answer: React.ReactNode;
+  answerText?: string;
+}[] = [
+  {
+    question: `Which email providers does ${BRAND_NAME} support?`,
+    answer:
+      "We support Gmail, Google Workspace, and Microsoft Outlook email accounts.",
+  },
+  {
+    question: "How can I request a feature?",
+    answer: (
+      <span>
+        Email us or post an issue on{" "}
+        <Anchor href="/github" newTab>
+          GitHub
+        </Anchor>
+        . We're happy to hear how we can improve your email experience.
+      </span>
+    ),
+    answerText:
+      "Email us or post an issue on GitHub. We're happy to hear how we can improve your email experience.",
+  },
+  {
+    question: `Will ${BRAND_NAME} replace my current email app?`,
+    answer: (
+      <span>
+        It doesn't have to. {BRAND_NAME} works inside Gmail and Outlook, so you
+        can keep using them as normal while the assistant works in the
+        background. {BRAND_NAME} also has its own{" "}
+        <Anchor href="/email-client">email app</Anchor> for the web, desktop,
+        and iPhone if you'd like to use it.
+      </span>
+    ),
+    answerText: `It doesn't have to. ${BRAND_NAME} works inside Gmail and Outlook, so you can keep using them as normal while the assistant works in the background. ${BRAND_NAME} also has its own email app for the web, desktop, and iPhone if you'd like to use it.`,
+  },
+  {
+    question: "Is there a mobile app?",
+    answer: (
+      <span>
+        Yes. Our native iPhone app lets you triage your inbox and manage your
+        assistant on the go. We also have an Android app, which is due for an
+        update. Learn more on the <Anchor href="/mobile-app">mobile app</Anchor>{" "}
+        page.
+      </span>
+    ),
+    answerText:
+      "Yes. Our native iPhone app lets you triage your inbox and manage your assistant on the go. We also have an Android app, which is due for an update. Learn more on the mobile app page.",
+  },
+  {
+    question: "Is the code open-source?",
+    answer: (
+      <span>
+        Yes! The AI assistant, the web app, and the desktop email app are open
+        source in our{" "}
+        <Anchor href="/github" newTab>
+          GitHub repo
+        </Anchor>
+        . The iPhone app isn't open source yet, but we plan to open it.
+      </span>
+    ),
+    answerText:
+      "Yes! The AI assistant, the web app, and the desktop email app are open source in our GitHub repo. The iPhone app isn't open source yet, but we plan to open it.",
+  },
+  {
+    question: "Do you offer refunds?",
+    answer: (
+      <span>
+        Yes, if you don't think we provided you with value send us an{" "}
+        <Anchor href={`mailto:${env.NEXT_PUBLIC_SUPPORT_EMAIL}`}>email</Anchor>{" "}
+        within 14 days of upgrading and we'll refund you.
+      </span>
+    ),
+    answerText:
+      "Yes, if you don't think we provided you with value send us an email within 14 days of upgrading and we'll refund you.",
+  },
+  {
+    question: `Can I try ${BRAND_NAME} for free?`,
+    answer:
+      "Yes. The email app is free to use. The AI assistant plans include a 7-day free trial. A credit card is required to start your trial, but you won't be charged until the trial ends. Cancel anytime during the trial to avoid being charged.",
+  },
+];
+
+const faqJsonLd = {
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  mainEntity: faqs
+    .map((faq) => {
+      const text = typeof faq.answer === "string" ? faq.answer : faq.answerText;
+      if (!text) return null;
+      return {
+        "@type": "Question" as const,
+        name: faq.question,
+        acceptedAnswer: { "@type": "Answer" as const, text },
+      };
+    })
+    .filter(Boolean),
+};
+
+export function FAQs() {
+  return (
+    <Section>
+      <script
+        type="application/ld+json"
+        // biome-ignore lint/security/noDangerouslySetInnerHtml: JSON.stringify on controlled object is safe
+        dangerouslySetInnerHTML={{ __html: JSON.stringify(faqJsonLd) }}
+      />
+      <SectionHeading>Frequently asked questions</SectionHeading>
+      <SectionContent>
+        <CardWrapper>
+          <dl className="grid md:grid-cols-2 gap-6">
+            {faqs.map((faq) => (
+              <Card
+                variant="extra-rounding"
+                className="gap-4"
+                key={faq.question}
+              >
+                <CardContent>
+                  <Paragraph
+                    as="dt"
+                    color="gray-900"
+                    className="font-semibold tracking-tight mb-4"
+                  >
+                    {faq.question}
+                  </Paragraph>
+                  <dd>
+                    <Paragraph>{faq.answer}</Paragraph>
+                  </dd>
+                </CardContent>
+              </Card>
+            ))}
+          </dl>
+        </CardWrapper>
+      </SectionContent>
+    </Section>
+  );
+}

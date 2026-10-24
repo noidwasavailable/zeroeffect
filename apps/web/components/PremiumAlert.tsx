@@ -1,0 +1,148 @@
+"use client";
+
+import Link from "next/link";
+import { CrownIcon } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { usePremium } from "@/hooks/usePremium";
+import { Tooltip } from "@/components/Tooltip";
+import { usePremiumModal } from "@/app/(app)/premium/PremiumModal";
+import type { PremiumTier } from "@/generated/prisma/enums";
+import { starterTierName } from "@/app/(app)/premium/config";
+import { ActionCard } from "@/components/ui/card";
+import { EndTrialButton } from "@/components/EndTrialButton";
+import { isActivePremium } from "@/utils/premium";
+
+export function PremiumAiAssistantAlert({
+  showSetApiKey,
+  className,
+  tier,
+  stripeSubscriptionStatus,
+  activeOnly,
+}: {
+  showSetApiKey: boolean;
+  className?: string;
+  tier?: PremiumTier | null;
+  stripeSubscriptionStatus?: string | null;
+  activeOnly?: boolean;
+}) {
+  const { PremiumModal, openModal } = usePremiumModal();
+
+  const isBasicPlan = tier === "BASIC_MONTHLY" || tier === "BASIC_ANNUALLY";
+
+  if (activeOnly && stripeSubscriptionStatus === "trialing") {
+    return (
+      <div className={className}>
+        <ActionCard
+          icon={<CrownIcon className="h-5 w-5" />}
+          title="Active Subscription Required"
+          description="This feature is not available during the free trial. Start your paid plan to use it."
+          action={<EndTrialButton variant="primaryBlack" />}
+        />
+      </div>
+    );
+  }
+
+  return (
+    <div className={className}>
+      {isBasicPlan ? (
+        <ActionCard
+          icon={<CrownIcon className="h-5 w-5" />}
+          title={`${starterTierName} Plan Required`}
+          description={`Switch to the ${starterTierName} plan to use this feature.`}
+          action={
+            <Button variant="primaryBlack" onClick={openModal}>
+              Switch Plan
+            </Button>
+          }
+        />
+      ) : showSetApiKey ? (
+        <ActionCard
+          icon={<CrownIcon className="h-5 w-5" />}
+          title="API Key Required"
+          description="You need to set an AI API key to use this feature."
+          action={
+            <Button variant="primaryBlack" asChild>
+              <Link href="/settings">Set API Key</Link>
+            </Button>
+          }
+        />
+      ) : (
+        <ActionCard
+          icon={<CrownIcon className="h-5 w-5" />}
+          title="Premium Feature"
+          description={`This is a premium feature. Upgrade to the ${starterTierName} plan.`}
+          action={
+            <Button variant="primaryBlack" onClick={openModal}>
+              Upgrade
+            </Button>
+          }
+        />
+      )}
+      <PremiumModal />
+    </div>
+  );
+}
+
+export function PremiumAlertWithData({
+  className,
+  activeOnly,
+}: {
+  className?: string;
+  activeOnly?: boolean;
+}) {
+  const {
+    hasAiAccess,
+    isLoading: isLoadingPremium,
+    isProPlanWithoutApiKey,
+    tier,
+    premium,
+  } = usePremium();
+
+  const needsActiveSubscription = activeOnly && !isActivePremium(premium);
+
+  if (!isLoadingPremium && (!hasAiAccess || needsActiveSubscription)) {
+    return (
+      <PremiumAiAssistantAlert
+        showSetApiKey={isProPlanWithoutApiKey}
+        className={className}
+        tier={tier}
+        stripeSubscriptionStatus={premium?.stripeSubscriptionStatus || null}
+        activeOnly={activeOnly}
+      />
+    );
+  }
+
+  return null;
+}
+
+export function PremiumTooltip(props: {
+  children: React.ReactElement;
+  showTooltip: boolean;
+  openModal: () => void;
+}) {
+  if (!props.showTooltip) return props.children;
+
+  return (
+    <Tooltip
+      contentComponent={<PremiumTooltipContent openModal={props.openModal} />}
+    >
+      <span>{props.children}</span>
+    </Tooltip>
+  );
+}
+
+export function PremiumTooltipContent({
+  openModal,
+}: {
+  openModal: () => void;
+}) {
+  return (
+    <div className="text-center">
+      <p>You{"'"}ve hit the free tier limit 🥺</p>
+      <p>Upgrade to unlock full access.</p>
+      <Button className="mt-1" onClick={openModal} size="xs">
+        Upgrade
+      </Button>
+    </div>
+  );
+}
