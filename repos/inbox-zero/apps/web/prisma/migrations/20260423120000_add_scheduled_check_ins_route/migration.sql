@@ -1,1 +1,0 @@
-ALTER TYPE "MessagingRoutePurpose" ADD VALUE 'SCHEDULED_CHECK_INS';

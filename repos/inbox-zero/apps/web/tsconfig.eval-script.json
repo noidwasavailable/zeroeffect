@@ -1,9 +1,0 @@
-{
-  "extends": "./tsconfig.json",
-  "compilerOptions": {
-    "paths": {
-      "@/*": ["./*"],
-      "server-only": ["./node_modules/server-only/empty.js"]
-    }
-  }
-}
