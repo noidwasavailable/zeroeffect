@@ -102,11 +102,14 @@ describe("Gmail account watch and notification operations", () => {
     await expect(operations.processNotification("null")).resolves.toBe("ignored");
     await expect(operations.processNotification(JSON.stringify({ emailAddress: "", historyId: "123" }))).resolves.toBe("ignored");
     await expect(operations.processNotification(JSON.stringify({ emailAddress: "nobody@example.com", historyId: "123" }))).resolves.toBe("ignored");
+    await expect(operations.processNotification(JSON.stringify({ emailAddress: "work@example.com", historyId: true }))).resolves.toBe("ignored");
     const notification = JSON.stringify({ emailAddress: " WORK@example.com ", historyId: "999999" });
     await expect(operations.processNotification(notification)).rejects.toThrow("temporary Gmail sync failure");
     await expect(operations.processNotification(notification)).resolves.toBe("synced");
+    await expect(operations.processNotification(JSON.stringify({ emailAddress: "work@example.com", historyId: 1234567 }))).resolves.toBe("synced");
 
     expect(calls).toEqual([
+      { accountId: "work", accessToken: "work-token" },
       { accountId: "work", accessToken: "work-token" },
       { accountId: "work", accessToken: "work-token" },
     ]);

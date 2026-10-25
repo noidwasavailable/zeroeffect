@@ -133,10 +133,19 @@ export const createGmailAccountOperations = (config: GmailAccountOperationsConfi
       console.warn("Discarding malformed Gmail Pub/Sub notification JSON.");
       return "ignored";
     }
+    if (typeof notification !== "object" || notification === null) {
+      console.warn("Discarding Gmail Pub/Sub notification without an emailAddress and historyId.");
+      return "ignored";
+    }
+    // Gmail documents historyId as a string, but some Pub/Sub payloads encode it as a JSON number.
+    // We only use it to validate the notification; sync reads the authoritative cursor from this account's DB.
+    const hasHistoryId = typeof notification.historyId === "string"
+      ? notification.historyId.trim().length > 0
+      : typeof notification.historyId === "number" &&
+        Number.isFinite(notification.historyId) && Number.isInteger(notification.historyId) && notification.historyId > 0;
     if (
-      typeof notification !== "object" || notification === null ||
       typeof notification.emailAddress !== "string" || notification.emailAddress.trim().length === 0 ||
-      typeof notification.historyId !== "string" || notification.historyId.trim().length === 0
+      !hasHistoryId
     ) {
       console.warn("Discarding Gmail Pub/Sub notification without an emailAddress and historyId.");
       return "ignored";
