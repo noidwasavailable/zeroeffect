@@ -7,19 +7,44 @@ export interface GooglePubSubClient {
   readonly close: () => Promise<void>;
 }
 
+export interface GooglePubSubOAuthCredentials {
+  readonly type: "authorized_user";
+  readonly client_id: string;
+  readonly client_secret: string;
+  readonly refresh_token: string;
+}
+
+export type GooglePubSubClientFactory = () => GooglePubSubClient | Promise<GooglePubSubClient>;
+
 /** Adapts the Google Cloud Pub/Sub subscriber stream to the listener's async-iterable contract. */
 export class GooglePubSubTransport implements StreamingPullTransport {
   private readonly activeSubscriptions = new Set<Subscription>();
+  private readonly clientFactory: GooglePubSubClientFactory;
+  private readonly immediateClient: GooglePubSubClient | undefined;
+  private clientPromise: Promise<GooglePubSubClient> | undefined;
   private closePromise: Promise<void> | undefined;
 
-  constructor(
-    projectId: string,
-    private readonly client: GooglePubSubClient = new PubSub({ projectId }),
-  ) {}
+  constructor(projectId: string, clientOrFactory?: GooglePubSubClient | GooglePubSubClientFactory) {
+    this.immediateClient = clientOrFactory && typeof clientOrFactory !== "function" ? clientOrFactory : undefined;
+    this.clientFactory = typeof clientOrFactory === "function"
+      ? clientOrFactory
+      : this.immediateClient
+        ? () => this.immediateClient!
+        : () => new PubSub({ projectId });
+    if (this.immediateClient) this.clientPromise = Promise.resolve(this.immediateClient);
+  }
+
+  private getClient(): Promise<GooglePubSubClient> {
+    this.clientPromise ??= Promise.resolve().then(this.clientFactory);
+    return this.clientPromise;
+  }
 
   async *streamingPull(subscriptionName: string): AsyncIterable<PubSubDelivery> {
     if (this.closePromise) throw new Error("Google Pub/Sub transport is already closed.");
-    const subscription = this.client.subscription(subscriptionName, {
+    // Keep injected clients synchronous so listeners are attached before the first
+    // iterator.next() yields; OAuth-backed production factories can resolve async.
+    const client = this.immediateClient ?? await this.getClient();
+    const subscription = client.subscription(subscriptionName, {
       flowControl: { maxMessages: 10 },
     });
     this.activeSubscriptions.add(subscription);
@@ -82,7 +107,8 @@ export class GooglePubSubTransport implements StreamingPullTransport {
         try {
           await Promise.all([...this.activeSubscriptions].map((subscription) => subscription.close()));
         } finally {
-          await this.client.close();
+          const client = await this.clientPromise;
+          await client?.close();
         }
       })();
     }

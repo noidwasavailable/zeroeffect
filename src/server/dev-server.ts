@@ -40,6 +40,11 @@ interface StoredTokens {
 export interface DevServerConfig {
   readonly registry: RegistryDbService;
   readonly oauth: GoogleOAuth2Api;
+  readonly pubsubOAuth?: GoogleOAuth2Api;
+  readonly onPubSubAuthorization?: (refreshToken: string) => void | Promise<void>;
+  readonly pubsubProjectId?: string;
+  readonly pubsubSubscription?: string;
+  readonly pubsubRedirectUri?: string;
   readonly encryptionKey: Uint8Array;
   readonly redirectUri: string;
   readonly accountDataDirectory?: string;
@@ -118,8 +123,15 @@ export const createDevServer = (config: DevServerConfig): Bun.Server<unknown> =>
   const hostname = config.hostname ?? "127.0.0.1";
   if (!isLoopback(hostname)) throw new Error("The Gmail development server must bind to localhost or a loopback address.");
   const vault = OAuthTokenVault.fromKey(config.encryptionKey);
-  const callbackHostname = new URL(config.redirectUri).hostname;
+  const callbackUrl = new URL(config.redirectUri);
+  const callbackHostname = callbackUrl.hostname;
+  const pubsubCallbackUrl = new URL(config.pubsubRedirectUri ?? config.redirectUri);
+  const pubsubCallbackHostname = pubsubCallbackUrl.hostname;
+  if (!isLoopback(callbackHostname) || !isLoopback(pubsubCallbackHostname)) {
+    throw new Error("Google OAuth callbacks must use a loopback hostname.");
+  }
   const pendingStates = new Map<string, { readonly accountId: AccountId; readonly createdAt: number }>();
+  const pendingPubSubStates = new Map<string, number>();
   const syncJobs = new Map<AccountId, SyncJob>();
   const html = renderAccountBindingPage();
 
@@ -159,10 +171,11 @@ export const createDevServer = (config: DevServerConfig): Bun.Server<unknown> =>
       if (
         request.method === "GET" &&
         url.hostname !== callbackHostname &&
-        (url.pathname === "/" || url.pathname === "/auth/google/start")
+        url.hostname !== pubsubCallbackHostname &&
+        (url.pathname === "/" || url.pathname === "/auth/google/start" || url.pathname === "/auth/google/pubsub/start")
       ) {
         const canonicalUrl = new URL(url);
-        canonicalUrl.hostname = callbackHostname;
+        canonicalUrl.hostname = url.pathname === "/auth/google/pubsub/start" ? pubsubCallbackHostname : callbackHostname;
         return new Response(null, {
           status: 302,
           headers: { Location: canonicalUrl.toString(), "Cache-Control": "no-store" },
@@ -198,6 +211,91 @@ export const createDevServer = (config: DevServerConfig): Bun.Server<unknown> =>
             "Cache-Control": "no-store",
           },
         });
+      }
+
+      if (request.method === "GET" && url.pathname === "/auth/google/pubsub/start") {
+        if (url.hostname !== pubsubCallbackHostname) {
+          const canonicalUrl = new URL(url);
+          canonicalUrl.hostname = pubsubCallbackHostname;
+          return new Response(null, { status: 302, headers: { Location: canonicalUrl.toString(), "Cache-Control": "no-store" } });
+        }
+        if (!config.pubsubOAuth) return new Response("Google Pub/Sub OAuth is not configured.", { status: 503 });
+        const now = Date.now();
+        for (const [state, createdAt] of pendingPubSubStates) {
+          if (createdAt < now - 10 * 60_000) pendingPubSubStates.delete(state);
+        }
+        const state = crypto.randomUUID();
+        pendingPubSubStates.set(state, now);
+        return new Response(null, {
+          status: 302,
+          headers: {
+            Location: config.pubsubOAuth.authorizationUrl("pubsub", state, "pubsub").toString(),
+            "Set-Cookie": `ze_pubsub_oauth_state=${state}; HttpOnly; SameSite=Lax; Path=/auth/google/pubsub/callback; Max-Age=600`,
+            "Cache-Control": "no-store",
+          },
+        });
+      }
+
+      if (request.method === "GET" && url.pathname === "/auth/google/pubsub/callback") {
+        if (url.hostname !== pubsubCallbackHostname) {
+          return new Response("Pub/Sub OAuth callback host does not match the configured loopback URI.", { status: 400 });
+        }
+        const suppliedState = url.searchParams.get("state") ?? "";
+        const separator = suppliedState.indexOf(":");
+        const statePurpose = suppliedState.slice(0, separator);
+        const state = suppliedState.slice(separator + 1);
+        const pendingAt = pendingPubSubStates.get(state);
+        const cookieState = request.headers.get("cookie")?.split(";")
+          .map((part) => part.trim())
+          .find((part) => part.startsWith("ze_pubsub_oauth_state="))
+          ?.slice("ze_pubsub_oauth_state=".length);
+        const clearStateCookie = "ze_pubsub_oauth_state=; HttpOnly; SameSite=Lax; Path=/auth/google/pubsub/callback; Max-Age=0";
+        const redirectError = (message: string): Response => new Response(null, {
+          status: 303,
+          headers: {
+            Location: "/?pubsub_error=" + encodeURIComponent(message),
+            "Set-Cookie": clearStateCookie,
+            "Cache-Control": "no-store",
+          },
+        });
+        if (!config.pubsubOAuth || statePurpose !== "pubsub" || !state || pendingAt === undefined || pendingAt < Date.now() - 10 * 60_000 || cookieState !== state) {
+          return new Response("Pub/Sub OAuth state is missing, expired, or invalid. Start connection again.", {
+            status: 400,
+            headers: { "Set-Cookie": clearStateCookie, "Cache-Control": "no-store" },
+          });
+        }
+        pendingPubSubStates.delete(state);
+        const googleError = url.searchParams.get("error");
+        if (googleError) return redirectError(`Google authorization failed: ${googleError}`);
+        const code = url.searchParams.get("code");
+        if (!code) return redirectError("Google did not return an authorization code.");
+        try {
+          const { tokens } = await Effect.runPromise(config.pubsubOAuth.exchangeCode("pubsub", code));
+          const previousEncrypted = await Effect.runPromise(config.registry.getServiceCredential("google_pubsub"));
+          let previousRefreshToken: string | undefined;
+          if (previousEncrypted) {
+            try {
+              const previous = vault.decrypt<{ readonly refreshToken?: unknown }>(previousEncrypted);
+              if (typeof previous.refreshToken === "string") previousRefreshToken = previous.refreshToken;
+            } catch {
+              // A new successful authorization replaces an unreadable stored credential.
+            }
+          }
+          const refreshToken = tokens.refreshToken ?? previousRefreshToken;
+          if (!refreshToken) return redirectError("Google did not issue a refresh token. Revoke ZeroEffect access in your Google Account and connect again.");
+          await Effect.runPromise(config.registry.upsertServiceCredential("google_pubsub", vault.encrypt({ refreshToken })));
+          await config.onPubSubAuthorization?.(refreshToken);
+          return new Response(null, {
+            status: 303,
+            headers: {
+              Location: "/?pubsub_connected=1",
+              "Set-Cookie": clearStateCookie,
+              "Cache-Control": "no-store",
+            },
+          });
+        } catch {
+          return redirectError("Google Pub/Sub authorization could not be saved. Check the local server log and try again.");
+        }
       }
 
       if (request.method === "GET" && url.pathname === "/auth/google/callback") {
@@ -267,6 +365,22 @@ export const createDevServer = (config: DevServerConfig): Bun.Server<unknown> =>
           const message = error instanceof Error ? error.message : "Account binding failed.";
           return redirectError(message.slice(0, 220));
         }
+      }
+
+      if (request.method === "GET" && url.pathname === "/api/pubsub") {
+        let authorized = false;
+        try {
+          authorized = (await Effect.runPromise(config.registry.getServiceCredential("google_pubsub"))) !== null;
+        } catch {
+          return json({ error: "Could not load Pub/Sub authorization status." }, 500);
+        }
+        return json({
+          configured: Boolean(config.pubsubProjectId && config.pubsubSubscription),
+          projectId: config.pubsubProjectId ?? null,
+          subscription: config.pubsubSubscription ?? null,
+          authorized,
+          authorizationAvailable: Boolean(config.pubsubOAuth),
+        });
       }
 
       if (request.method === "GET" && url.pathname === "/api/accounts") {
@@ -379,5 +493,8 @@ export const devServerConfigFromEnvironment = (): Omit<DevServerConfig, "registr
     port,
     accountDataDirectory: process.env.ACCOUNT_DATA_DIRECTORY ?? "./data/accounts",
     gmailApiBaseUrl: process.env.GMAIL_API_BASE_URL,
+    pubsubProjectId: process.env.GCP_PROJECT_ID ?? process.env.GOOGLE_CLOUD_PROJECT ?? process.env.GCLOUD_PROJECT,
+    pubsubSubscription: process.env.GMAIL_PUBSUB_SUBSCRIPTION,
+    pubsubRedirectUri: process.env.GOOGLE_PUBSUB_REDIRECT_URI ?? new URL("/auth/google/pubsub/callback", redirectUri).toString(),
   };
 };

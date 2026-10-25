@@ -9,6 +9,9 @@ export interface RegistryDbService {
   readonly upsertAccount: (account: AccountRecord) => Effect.Effect<void, DatabaseError>;
   readonly getAccount: (id: string) => Effect.Effect<AccountRecord | null, DatabaseError>;
   readonly listAccounts: () => Effect.Effect<ReadonlyArray<Pick<AccountRecord, "id" | "email" | "displayName" | "colorTheme">>, DatabaseError>;
+  readonly upsertServiceCredential: (id: string, credentialsEnc: Uint8Array) => Effect.Effect<void, DatabaseError>;
+  readonly getServiceCredential: (id: string) => Effect.Effect<Uint8Array | null, DatabaseError>;
+  readonly deleteServiceCredential: (id: string) => Effect.Effect<void, DatabaseError>;
   readonly upsertLlmEndpoint: (endpoint: LlmEndpointRecord) => Effect.Effect<void, DatabaseError>;
 }
 
@@ -30,6 +33,11 @@ const initialize = (database: Database): void => {
       watch_expiration_ts INTEGER,
       last_history_id TEXT,
       created_at INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS service_credentials (
+      id TEXT PRIMARY KEY,
+      credentials_enc BLOB NOT NULL,
+      updated_at INTEGER NOT NULL
     );
     CREATE TABLE IF NOT EXISTS llm_endpoints (
       id TEXT PRIMARY KEY,
@@ -97,6 +105,30 @@ const makeService = (database: Database): RegistryDbService => ({
       `).all() as Array<Pick<AccountRecord, "id" | "email" | "displayName" | "colorTheme">>,
       catch: (cause) => new DatabaseError({ message: "Failed to list registry accounts.", operation: "listAccounts", cause }),
     }),
+  upsertServiceCredential: (id, credentialsEnc) =>
+    Effect.try({
+      try: () => {
+        database.prepare(`
+          INSERT INTO service_credentials (id, credentials_enc, updated_at) VALUES (?, ?, ?)
+          ON CONFLICT(id) DO UPDATE SET credentials_enc = excluded.credentials_enc, updated_at = excluded.updated_at
+        `).run(id, credentialsEnc, Date.now());
+      },
+      catch: (cause) => new DatabaseError({ message: "Failed to save registry service credential.", operation: "upsertServiceCredential", cause }),
+    }).pipe(Effect.asVoid),
+  getServiceCredential: (id) =>
+    Effect.try({
+      try: () => {
+        const row = database.prepare("SELECT credentials_enc AS credentialsEnc FROM service_credentials WHERE id = ?")
+          .get(id) as { credentialsEnc: Uint8Array } | null;
+        return row?.credentialsEnc ?? null;
+      },
+      catch: (cause) => new DatabaseError({ message: "Failed to load registry service credential.", operation: "getServiceCredential", cause }),
+    }),
+  deleteServiceCredential: (id) =>
+    Effect.try({
+      try: () => { database.prepare("DELETE FROM service_credentials WHERE id = ?").run(id); },
+      catch: (cause) => new DatabaseError({ message: "Failed to delete registry service credential.", operation: "deleteServiceCredential", cause }),
+    }).pipe(Effect.asVoid),
   upsertLlmEndpoint: (endpoint) =>
     Effect.try({
       try: () => {

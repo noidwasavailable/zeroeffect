@@ -29,6 +29,100 @@ describe("local account setup", () => {
     expect(() => vault.decrypt(tampered)).toThrow();
   });
 
+  test("authorizes Pub/Sub in the browser and stores its refresh token separately and encrypted", async () => {
+    const tokenRequests: URLSearchParams[] = [];
+    const provider = Bun.serve({
+      port: 0,
+      fetch: async (request) => {
+        if (new URL(request.url).pathname !== "/token" || request.method !== "POST") return new Response("Not found", { status: 404 });
+        const body = new URLSearchParams(await request.text());
+        tokenRequests.push(body);
+        return body.get("code") === "no-refresh"
+          ? Response.json({ access_token: "temporary-access", expires_in: 3600 })
+          : Response.json({ access_token: "pubsub-access", refresh_token: "pubsub-refresh-secret", expires_in: 3600 });
+      },
+    });
+    servers.push(provider);
+    const database = new Database(":memory:");
+    const registryLayer = RegistryDbTest(database);
+    const registry = Effect.runSync(Effect.gen(function* () { return yield* RegistryDb; }).pipe(Effect.provide(registryLayer)));
+    const oauthLayer = GoogleOAuth2Live({
+      clientId: "local-client",
+      clientSecret: "local-secret",
+      redirectUri: "http://127.0.0.1:3000/auth/google/pubsub/callback",
+      authorizationEndpoint: `${provider.url}authorize`,
+      tokenEndpoint: `${provider.url}token`,
+    });
+    const pubsubOAuth = Effect.runSync(Effect.gen(function* () { return yield* GoogleOAuth2; }).pipe(Effect.provide(oauthLayer)));
+    const authorizations: string[] = [];
+    const app = createDevServer({
+      registry,
+      oauth: pubsubOAuth,
+      pubsubOAuth,
+      onPubSubAuthorization: (token) => { authorizations.push(token); },
+      pubsubProjectId: "local-project",
+      pubsubSubscription: "gmail-notifications",
+      encryptionKey: new Uint8Array(32).fill(19),
+      redirectUri: "http://127.0.0.1:3000/auth/google/callback",
+      pubsubRedirectUri: "http://127.0.0.1:3000/auth/google/pubsub/callback",
+      port: 0,
+    });
+    servers.push(app);
+    try {
+      const initialStatus = await fetch(new URL("/api/pubsub", app.url));
+      expect(await initialStatus.json()).toEqual({
+        configured: true,
+        projectId: "local-project",
+        subscription: "gmail-notifications",
+        authorized: false,
+        authorizationAvailable: true,
+      });
+
+      const noRefreshStart = await fetch(new URL("/auth/google/pubsub/start", app.url), { redirect: "manual" });
+      const noRefreshUrl = new URL(noRefreshStart.headers.get("location")!);
+      expect(noRefreshUrl.searchParams.get("scope")).toBe("https://www.googleapis.com/auth/pubsub");
+      const noRefreshState = noRefreshUrl.searchParams.get("state")!;
+      const noRefreshCookie = noRefreshStart.headers.get("set-cookie")!.split(";")[0]!;
+      const noRefreshResult = await fetch(new URL(`/auth/google/pubsub/callback?code=no-refresh&state=${encodeURIComponent(noRefreshState)}`, app.url), {
+        headers: { cookie: noRefreshCookie },
+        redirect: "manual",
+      });
+      expect(noRefreshResult.status).toBe(303);
+      expect(new URL(noRefreshResult.headers.get("location")!, app.url).searchParams.has("pubsub_error")).toBe(true);
+      expect(authorizations).toEqual([]);
+
+      const start = await fetch(new URL("/auth/google/pubsub/start", app.url), { redirect: "manual" });
+      const authorizationUrl = new URL(start.headers.get("location")!);
+      const state = authorizationUrl.searchParams.get("state")!;
+      const cookie = start.headers.get("set-cookie")!.split(";")[0]!;
+      const invalidState = await fetch(new URL(`/auth/google/pubsub/callback?code=valid&state=${encodeURIComponent(state)}`, app.url), {
+        headers: { cookie: "ze_pubsub_oauth_state=wrong" },
+        redirect: "manual",
+      });
+      expect(invalidState.status).toBe(400);
+      expect(tokenRequests).toHaveLength(1);
+
+      const callback = await fetch(new URL(`/auth/google/pubsub/callback?code=valid&state=${encodeURIComponent(state)}`, app.url), {
+        headers: { cookie },
+        redirect: "manual",
+      });
+      expect(callback.status).toBe(303);
+      expect(callback.headers.get("location")).toContain("pubsub_connected=1");
+      expect(tokenRequests[1]?.get("redirect_uri")).toBe("http://127.0.0.1:3000/auth/google/pubsub/callback");
+      expect(authorizations).toEqual(["pubsub-refresh-secret"]);
+
+      const saved = Effect.runSync(registry.getServiceCredential("google_pubsub"));
+      expect(saved).not.toBeNull();
+      expect(new TextDecoder().decode(saved!)).not.toContain("pubsub-refresh-secret");
+      expect(OAuthTokenVault.fromKey(new Uint8Array(32).fill(19)).decrypt(saved!)).toEqual({ refreshToken: "pubsub-refresh-secret" });
+      const finalStatus = await fetch(new URL("/api/pubsub", app.url));
+      const statusBody = await finalStatus.json() as { readonly authorized?: unknown };
+      expect(statusBody.authorized).toBe(true);
+    } finally {
+      database.close();
+    }
+  });
+
   test("binds an OAuth callback and runs a bounded background sync into the account silo", async () => {
     const tokenRequests: URLSearchParams[] = [];
     const messageListLimits: number[] = [];

@@ -54,12 +54,16 @@ export const renderAccountBindingPage = (): string => `<!doctype html>
       <p class="intro">Bind Personal and Work separately. Each account is stored in its own database silo. Sync imports the latest conversations up to your chosen limit as a background job and shows progress here.</p>
       <p id="notice" class="notice" role="status" aria-live="polite" hidden></p>
       <section id="accounts" class="accounts" aria-label="Gmail account bindings"></section>
+      <h2>Google Cloud Pub/Sub</h2>
+      <p class="intro">Authorize a Google account in this browser for the local Pub/Sub listener. Create the topic and subscription and grant that account Pub/Sub Subscriber access in Google Cloud Console.</p>
+      <section id="pubsub" class="account" aria-label="Pub/Sub authorization"></section>
       <p class="footnote">This local setup screen does not expose the full mail client or Tailscale authentication. Keep the server bound to localhost and never commit your OAuth credentials.</p>
     </main>
   </div>
   <script>
     const slotNames = { personal: "Personal", work: "Work" };
     const accountsRoot = document.getElementById("accounts");
+    const pubsubRoot = document.getElementById("pubsub");
     const notice = document.getElementById("notice");
     const setNotice = (message, isError = false) => {
       notice.textContent = message;
@@ -191,10 +195,41 @@ export const renderAccountBindingPage = (): string => `<!doctype html>
         accountsRoot.append(card);
       }
     };
+    const refreshPubSub = async () => {
+      const response = await fetch("/api/pubsub", { headers: { Accept: "application/json" } });
+      if (!response.ok) throw new Error("Could not load Pub/Sub configuration.");
+      const status = await response.json();
+      pubsubRoot.replaceChildren();
+      const heading = document.createElement("h3");
+      heading.textContent = status.authorized ? "Google account authorized" : "Google account not authorized";
+      const details = document.createElement("p");
+      details.className = "state";
+      details.textContent = status.configured
+        ? "Project: " + status.projectId + " · Subscription: " + status.subscription
+        : "Set GCP_PROJECT_ID and GMAIL_PUBSUB_SUBSCRIPTION, then restart the server.";
+      const note = document.createElement("p");
+      note.className = "state";
+      note.textContent = status.authorized
+        ? (status.configured ? "Pub/Sub credential is stored encrypted on this machine." : "Authorization is saved; listener starts after project and subscription are configured.")
+        : "Grant this Google account roles/pubsub.subscriber on the subscription in Cloud Console.";
+      pubsubRoot.append(heading, details, note);
+      if (status.authorizationAvailable) {
+        const actions = document.createElement("div");
+        actions.className = "actions";
+        const connect = document.createElement("a");
+        connect.className = "button";
+        connect.href = "/auth/google/pubsub/start";
+        connect.textContent = status.authorized ? "Re-authorize Pub/Sub" : "Connect Pub/Sub account";
+        actions.append(connect);
+        pubsubRoot.append(actions);
+      }
+    };
     const callback = new URLSearchParams(location.search);
     if (callback.has("connected")) setNotice("Gmail account connected. Run Sync now to verify it.");
+    if (callback.has("pubsub_connected")) setNotice("Google Pub/Sub authorization saved on this machine.");
     if (callback.has("error")) setNotice(callback.get("error") || "Google authorization failed.", true);
-    refreshAccounts().catch((error) => setNotice(error.message, true));
+    if (callback.has("pubsub_error")) setNotice(callback.get("pubsub_error") || "Google Pub/Sub authorization failed.", true);
+    Promise.all([refreshAccounts(), refreshPubSub()]).catch((error) => setNotice(error.message, true));
   </script>
 </body>
 </html>`;

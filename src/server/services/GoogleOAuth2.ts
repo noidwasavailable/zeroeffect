@@ -7,6 +7,9 @@ export const GMAIL_OAUTH_SCOPES = [
   "https://www.googleapis.com/auth/gmail.settings.basic",
 ] as const;
 
+export const PUBSUB_OAUTH_SCOPES = ["https://www.googleapis.com/auth/pubsub"] as const;
+export type GoogleOAuthPurpose = "gmail" | "pubsub";
+
 export interface GoogleOAuthTokens {
   readonly accessToken: string;
   readonly refreshToken?: string;
@@ -16,7 +19,7 @@ export interface GoogleOAuthTokens {
 }
 
 export interface GoogleOAuth2Api {
-  readonly authorizationUrl: (accountId: string, state: string) => URL;
+  readonly authorizationUrl: (accountId: string, state: string, purpose?: GoogleOAuthPurpose) => URL;
   readonly exchangeCode: (accountId: string, code: string) => Effect.Effect<{ readonly accountId: string; readonly tokens: GoogleOAuthTokens }, GmailApiError>;
   readonly refreshAccessToken: (accountId: string, refreshToken: string) => Effect.Effect<{ readonly accountId: string; readonly tokens: GoogleOAuthTokens }, GmailApiError>;
 }
@@ -43,7 +46,7 @@ const makeOAuth2 = (config: GoogleOAuth2Config): GoogleOAuth2Api => {
   const authorizationEndpoint = config.authorizationEndpoint ?? "https://accounts.google.com/o/oauth2/v2/auth";
   const tokenEndpoint = config.tokenEndpoint ?? "https://oauth2.googleapis.com/token";
   const fetcher = config.fetch ?? globalThis.fetch;
-  const authorizationUrl = (accountId: string, state: string): URL => {
+  const authorizationUrl = (accountId: string, state: string, purpose: GoogleOAuthPurpose = "gmail"): URL => {
     validateAccountId(accountId);
     if (!state || /[\r\n]/.test(state)) throw new Error("OAuth state must be a non-empty, single-line value.");
     const url = new URL(authorizationEndpoint);
@@ -51,7 +54,7 @@ const makeOAuth2 = (config: GoogleOAuth2Config): GoogleOAuth2Api => {
       client_id: config.clientId,
       redirect_uri: config.redirectUri,
       response_type: "code",
-      scope: GMAIL_OAUTH_SCOPES.join(" "),
+      scope: (purpose === "pubsub" ? PUBSUB_OAUTH_SCOPES : GMAIL_OAUTH_SCOPES).join(" "),
       access_type: "offline",
       prompt: "consent",
       include_granted_scopes: "true",

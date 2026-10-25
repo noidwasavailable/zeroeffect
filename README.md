@@ -10,9 +10,10 @@ ZeroEffect is an in-progress self-hosted Gmail client. The current runnable UI i
 
    ```text
    http://127.0.0.1:3000/auth/google/callback
+   http://127.0.0.1:3000/auth/google/pubsub/callback
    ```
 
-   Configure the OAuth consent screen for testing and add the Google accounts you plan to connect as test users. The app requests Gmail modify, send, and basic settings access.
+   Configure the OAuth consent screen for testing and add the Google accounts you plan to connect as test users. Gmail binding requests Gmail modify, send, and basic settings access; Pub/Sub authorization separately requests the Pub/Sub scope.
 
 2. Copy `.env.example` to `.env`, then add the client ID and secret. Generate a private encryption key for persisted OAuth tokens:
 
@@ -35,11 +36,12 @@ The development server refuses non-loopback binds and the sync endpoint checks s
 
 ## Optional GCP Pub/Sub pull binding
 
-The server can open an outbound Google Cloud Pub/Sub StreamingPull connection and enqueue notification payloads in the local Redis list `gmail:notifications`. It uses Google Application Default Credentials (ADC), so credentials remain on this machine. To enable it:
+The server can open an outbound Google Cloud Pub/Sub StreamingPull connection and enqueue notification payloads in the local Redis list `gmail:notifications`. It obtains a separate Pub/Sub refresh token through browser OAuth and stores it encrypted in the local registry database; it does not use ADC, `gcloud`, or the Personal/Work Gmail tokens. To enable it:
 
-1. In the GCP project used for Gmail, enable the Pub/Sub API, create a topic and a pull subscription, and grant the Gmail push service account `gmail-api-push@system.gserviceaccount.com` permission to publish to the topic. Grant the identity used by ADC `roles/pubsub.subscriber` on the subscription.
-2. Set `GCP_PROJECT_ID` and `GMAIL_PUBSUB_SUBSCRIPTION` in `.env` (the subscription's short ID, not its full resource path). Set `REDIS_URL` if Redis is not listening at the default `redis://127.0.0.1:6379`. Authenticate the local ADC identity with your usual Google Cloud tooling, for example `gcloud auth application-default login`, then start `bun run dev`.
-3. Gmail notifications are only published while a Gmail `users.watch` is active for the topic. This development server does not yet create or renew Gmail watches, and the notification queue does not yet trigger account history sync by itself. A successful Gmail sync or mocked StreamingPull test is therefore not evidence of live Pub/Sub delivery. Keep the server loopback-only; verify a real notification in your own GCP setup before relying on this binding.
+1. In the GCP project used for Gmail, enable the Pub/Sub API, create a topic and a pull subscription, grant the Gmail push service account `gmail-api-push@system.gserviceaccount.com` permission to publish to the topic, and grant the Google account you intend to authorize `roles/pubsub.subscriber` on the subscription. Topic, subscription, and IAM setup remain external Cloud Console tasks.
+2. Add the Pub/Sub callback URI shown above to the OAuth Web client. Set `GCP_PROJECT_ID` and `GMAIL_PUBSUB_SUBSCRIPTION` in `.env` (the subscription's short ID, not its full resource path). Set `REDIS_URL` if Redis is not listening at the default `redis://127.0.0.1:6379`, then start `bun run dev`.
+3. Open `http://127.0.0.1:3000` and use **Connect Pub/Sub account**. Sign in as the Google account with subscriber access and approve the Pub/Sub scope. ZeroEffect uses that account's OAuth refresh token to create an authorized Pub/Sub client; no external CLI authentication is required. Keep `PORT` aligned with both loopback callback URIs.
+4. Gmail notifications are only published while a Gmail `users.watch` is active for the topic. This development server does not yet create or renew Gmail watches, and the notification queue does not yet trigger account history sync by itself. A successful Gmail sync or mocked StreamingPull test is therefore not evidence of live Pub/Sub delivery. Keep the server loopback-only; verify a real notification in your own GCP setup before relying on this binding.
 
 The listener enqueues each Pub/Sub notification before acknowledging it, so Redis enqueue failures leave messages unacknowledged for redelivery. Automatic labeling is not part of this Phase 2 binding.
 
