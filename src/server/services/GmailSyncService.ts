@@ -12,8 +12,20 @@ export interface GmailSyncResult {
   readonly messagesDeleted: number;
 }
 
+export interface GmailSyncProgress {
+  readonly stage: "listing_conversations" | "importing_conversations";
+  readonly conversationsCompleted: number;
+  readonly conversationsTotal: number;
+  readonly messagesUpserted: number;
+}
+
+export interface GmailSyncOptions {
+  readonly initialConversationLimit?: number;
+  readonly onProgress?: (progress: GmailSyncProgress) => void;
+}
+
 export interface GmailSyncServiceApi {
-  readonly sync: () => Effect.Effect<GmailSyncResult, import("../../shared/errors").GmailApiError | import("../../shared/errors").DatabaseError>;
+  readonly sync: (options?: GmailSyncOptions) => Effect.Effect<GmailSyncResult, import("../../shared/errors").GmailApiError | import("../../shared/errors").DatabaseError>;
   readonly syncAliases: () => Effect.Effect<number, import("../../shared/errors").GmailApiError | import("../../shared/errors").DatabaseError>;
   readonly watch: (topicName: string) => Effect.Effect<import("./GmailClient").GmailWatchResponse, import("../../shared/errors").GmailApiError>;
 }
@@ -29,6 +41,7 @@ export const GmailSyncServiceLive: Layer.Layer<GmailSyncService, never, AccountD
       const accountDb = yield* AccountDb;
       const gmail = yield* GmailClient;
       const syncAliases = Effect.gen(function* () {
+        yield* Effect.logInfo(`Gmail Send As sync started for ${accountDb.accountId}`);
         const aliases = yield* gmail.listSendAs();
         yield* accountDb.replaceSendAsAliases(aliases.map((alias) => ({
           sendAsEmail: alias.sendAsEmail,
@@ -39,6 +52,7 @@ export const GmailSyncServiceLive: Layer.Layer<GmailSyncService, never, AccountD
           isDefault: alias.isDefault ?? false,
           verificationStatus: alias.verificationStatus ?? "unknown",
         })));
+        yield* Effect.logInfo(`Gmail Send As sync completed for ${accountDb.accountId}: ${aliases.length} aliases`);
         return aliases.length;
       });
 
@@ -89,27 +103,44 @@ export const GmailSyncServiceLive: Layer.Layer<GmailSyncService, never, AccountD
         return true;
       });
 
-      const hydrateAll = () => Effect.gen(function* () {
+      const hydrateLatest = (limit: number, onProgress?: GmailSyncOptions["onProgress"]) => Effect.gen(function* () {
         let pageToken: string | undefined;
-        let upserted = 0;
-        do {
-          const page = yield* gmail.listMessages(pageToken);
-          for (const item of page.messages) {
-            const message = yield* gmail.getMessage(item.id);
-            if (yield* upsert(message)) upserted++;
+        let conversationsCompleted = 0;
+        let messagesUpserted = 0;
+        onProgress?.({ stage: "listing_conversations", conversationsCompleted, conversationsTotal: limit, messagesUpserted });
+        while (conversationsCompleted < limit) {
+          const page = yield* gmail.listThreads(pageToken, Math.min(100, limit - conversationsCompleted));
+          const threads = page.threads.slice(0, limit - conversationsCompleted);
+          if (threads.length === 0) break;
+          for (const reference of threads) {
+            const thread = yield* gmail.getThread(reference.id);
+            for (const message of thread.messages ?? []) {
+              const normalizedMessage = message.threadId ? message : { ...message, threadId: thread.id };
+              if (yield* upsert(normalizedMessage)) messagesUpserted++;
+            }
+            conversationsCompleted++;
+            onProgress?.({ stage: "importing_conversations", conversationsCompleted, conversationsTotal: limit, messagesUpserted });
           }
           pageToken = page.nextPageToken;
-        } while (pageToken);
-        return upserted;
+          if (!pageToken) break;
+        }
+        return { messagesUpserted, conversationsImported: conversationsCompleted };
       });
 
-      const sync = () => Effect.gen(function* () {
+      const sync = (options: GmailSyncOptions = {}) => Effect.gen(function* () {
+        const initialConversationLimit = options.initialConversationLimit ?? 100;
+        if (!Number.isSafeInteger(initialConversationLimit) || initialConversationLimit < 1) {
+          throw new Error("Initial conversation limit must be a positive safe integer.");
+        }
+        yield* Effect.logInfo(`Gmail sync started for ${accountDb.accountId}`);
         yield* syncAliases;
         const profile = yield* gmail.getProfile();
         const historyId = yield* accountDb.getHistoryId();
         if (!historyId) {
-          const messagesUpserted = yield* hydrateAll();
+          yield* Effect.logInfo(`Gmail initial hydration started for ${accountDb.accountId}: up to ${initialConversationLimit} conversations`);
+          const { messagesUpserted, conversationsImported } = yield* hydrateLatest(initialConversationLimit, options.onProgress);
           yield* accountDb.setHistoryId(profile.historyId);
+          yield* Effect.logInfo(`Gmail initial sync completed for ${accountDb.accountId}: ${conversationsImported} conversations, ${messagesUpserted} messages upserted`);
           return { mode: "initial" as const, messagesUpserted, messagesDeleted: 0 };
         }
 
@@ -141,11 +172,14 @@ export const GmailSyncServiceLive: Layer.Layer<GmailSyncService, never, AccountD
         } while (pageToken);
 
         if (historyExpired) {
-          const messagesUpserted = yield* hydrateAll();
+          yield* Effect.logWarning(`Gmail history expired for ${accountDb.accountId}; re-importing up to ${initialConversationLimit} recent conversations`);
+          const { messagesUpserted, conversationsImported } = yield* hydrateLatest(initialConversationLimit, options.onProgress);
           yield* accountDb.setHistoryId(profile.historyId);
+          yield* Effect.logInfo(`Gmail re-import completed for ${accountDb.accountId}: ${conversationsImported} conversations, ${messagesUpserted} messages upserted`);
           return { mode: "initial" as const, messagesUpserted, messagesDeleted: 0 };
         }
 
+        yield* Effect.logInfo(`Gmail history scan for ${accountDb.accountId}: ${changed.size} changed messages`);
         let messagesUpserted = 0;
         let messagesDeleted = 0;
         for (const [id, action] of changed) {
@@ -157,8 +191,11 @@ export const GmailSyncServiceLive: Layer.Layer<GmailSyncService, never, AccountD
           }
         }
         yield* accountDb.setHistoryId(latestHistoryId ?? profile.historyId);
+        yield* Effect.logInfo(`Gmail incremental sync completed for ${accountDb.accountId}: ${messagesUpserted} upserted, ${messagesDeleted} deleted`);
         return { mode: "incremental" as const, messagesUpserted, messagesDeleted };
-      });
+      }).pipe(Effect.tapError((error) => Effect.logError(
+        `Gmail sync failed for ${accountDb.accountId}: ${error._tag}${error._tag === "GmailApiError" ? ` (HTTP ${error.status}, retryable=${error.retryable})` : ` (${error.operation})`}`,
+      )));
 
       return { sync, syncAliases: () => syncAliases, watch: (topicName) => gmail.watch(topicName) };
     }),

@@ -9,6 +9,27 @@ import { renderAccountBindingPage } from "../client/auth-page";
 
 const ACCOUNT_IDS = ["personal", "work"] as const;
 type AccountId = (typeof ACCOUNT_IDS)[number];
+const DEFAULT_INITIAL_CONVERSATION_LIMIT = 100;
+const MAX_INITIAL_CONVERSATION_LIMIT = 10_000;
+
+type SyncJobProgress = {
+  readonly stage: "queued" | "preparing" | "listing_conversations" | "importing_conversations" | "completed";
+  readonly conversationsCompleted: number;
+  readonly conversationsTotal: number;
+  readonly messagesUpserted: number;
+};
+
+type SyncJob = {
+  readonly id: string;
+  readonly accountId: AccountId;
+  readonly initialConversationLimit: number;
+  readonly createdAt: number;
+  status: "queued" | "running" | "completed" | "failed";
+  updatedAt: number;
+  progress: SyncJobProgress;
+  result?: { readonly mode: "initial" | "incremental"; readonly messagesUpserted: number; readonly messagesDeleted: number };
+  error?: string;
+};
 
 interface StoredTokens {
   readonly tokens: GoogleOAuthTokens;
@@ -44,12 +65,37 @@ const escapeHtml = (value: string): string => value
 const isLoopback = (hostname: string): boolean =>
   hostname === "127.0.0.1" || hostname === "::1" || hostname === "localhost";
 
+const runSyncJob = async (
+  job: SyncJob,
+  work: () => Promise<SyncJob["result"]>,
+): Promise<void> => {
+  job.status = "running";
+  job.updatedAt = Date.now();
+  job.progress = { ...job.progress, stage: "preparing" };
+  try {
+    const result = await work();
+    job.result = result;
+    job.status = "completed";
+    job.progress = {
+      stage: "completed",
+      conversationsCompleted: result?.mode === "initial" ? job.progress.conversationsCompleted : 0,
+      conversationsTotal: result?.mode === "initial" ? job.progress.conversationsCompleted : 0,
+      messagesUpserted: result?.messagesUpserted ?? 0,
+    };
+  } catch {
+    job.status = "failed";
+    job.error = "Gmail sync failed. Check the local server logs for details.";
+  }
+  job.updatedAt = Date.now();
+};
+
 export const createDevServer = (config: DevServerConfig): Bun.Server<unknown> => {
   const hostname = config.hostname ?? "127.0.0.1";
   if (!isLoopback(hostname)) throw new Error("The Gmail development server must bind to localhost or a loopback address.");
   const vault = OAuthTokenVault.fromKey(config.encryptionKey);
   const callbackHostname = new URL(config.redirectUri).hostname;
   const pendingStates = new Map<string, { readonly accountId: AccountId; readonly createdAt: number }>();
+  const syncJobs = new Map<AccountId, SyncJob>();
   const html = renderAccountBindingPage();
 
   const getUsableAccessToken = async (accountId: AccountId) => {
@@ -81,6 +127,8 @@ export const createDevServer = (config: DevServerConfig): Bun.Server<unknown> =>
   return Bun.serve({
     hostname,
     port: config.port ?? 3000,
+    // Initial hydration fetches Gmail messages one at a time and can exceed Bun's 10s default.
+    idleTimeout: 255,
     fetch: async (request) => {
       const url = new URL(request.url);
       if (
@@ -205,13 +253,52 @@ export const createDevServer = (config: DevServerConfig): Bun.Server<unknown> =>
       }
 
       const syncMatch = /^\/api\/accounts\/([^/]+)\/sync$/.exec(url.pathname);
-      if (request.method === "POST" && syncMatch) {
+      if (syncMatch && (request.method === "GET" || request.method === "POST")) {
+        const accountId = syncMatch[1] ?? null;
+        if (!isAccountId(accountId)) return json({ error: "Account id must be personal or work." }, 400);
+        if (request.method === "GET") {
+          const job = syncJobs.get(accountId);
+          return json({ job: job ?? null });
+        }
         if (request.headers.get("origin") !== url.origin || request.headers.get("x-zeroeffect-local") !== "1") {
           return json({ error: "Sync requests must come from the local account screen." }, 403);
         }
-        const accountId = syncMatch[1] ?? null;
-        if (!isAccountId(accountId)) return json({ error: "Account id must be personal or work." }, 400);
+        let requestBody: unknown = {};
         try {
+          const bodyText = await request.text();
+          if (bodyText.trim()) requestBody = JSON.parse(bodyText);
+        } catch {
+          return json({ error: "Sync request must contain valid JSON." }, 400);
+        }
+        if (typeof requestBody !== "object" || requestBody === null || Array.isArray(requestBody)) {
+          return json({ error: "Sync request must be a JSON object." }, 400);
+        }
+        const suppliedLimit = (requestBody as { initialConversationLimit?: unknown }).initialConversationLimit;
+        const initialConversationLimit = suppliedLimit === undefined ? DEFAULT_INITIAL_CONVERSATION_LIMIT : suppliedLimit;
+        if (!Number.isSafeInteger(initialConversationLimit) || (initialConversationLimit as number) < 1 || (initialConversationLimit as number) > MAX_INITIAL_CONVERSATION_LIMIT) {
+          return json({ error: `Initial conversation limit must be an integer between 1 and ${MAX_INITIAL_CONVERSATION_LIMIT}.` }, 400);
+        }
+        const existing = syncJobs.get(accountId);
+        if (existing && (existing.status === "queued" || existing.status === "running")) {
+          return json({ error: "A sync is already running for this account.", job: existing }, 409);
+        }
+        const now = Date.now();
+        const job: SyncJob = {
+          id: crypto.randomUUID(),
+          accountId,
+          initialConversationLimit: initialConversationLimit as number,
+          createdAt: now,
+          updatedAt: now,
+          status: "queued",
+          progress: {
+            stage: "queued",
+            conversationsCompleted: 0,
+            conversationsTotal: initialConversationLimit as number,
+            messagesUpserted: 0,
+          },
+        };
+        syncJobs.set(accountId, job);
+        void runSyncJob(job, async () => {
           const accessToken = await getUsableAccessToken(accountId);
           const dependencies = Layer.merge(
             AccountDbLive(accountId, config.accountDataDirectory),
@@ -220,15 +307,18 @@ export const createDevServer = (config: DevServerConfig): Bun.Server<unknown> =>
           const runtime = ManagedRuntime.make(Layer.provide(GmailSyncServiceLive, dependencies));
           try {
             const service = await runtime.runPromise(Effect.gen(function* () { return yield* GmailSyncService; }));
-            const result = await runtime.runPromise(service.sync());
-            return json(result);
+            return await runtime.runPromise(service.sync({
+              initialConversationLimit: job.initialConversationLimit,
+              onProgress: (progress) => {
+                job.progress = progress;
+                job.updatedAt = Date.now();
+              },
+            }));
           } finally {
             await runtime.dispose();
           }
-        } catch (error) {
-          const message = error instanceof Error ? error.message : "Gmail sync failed.";
-          return json({ error: message.slice(0, 500) }, 502);
-        }
+        });
+        return json({ job }, 202);
       }
 
       return new Response("Not found", { status: 404 });

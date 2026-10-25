@@ -21,6 +21,8 @@ export const renderAccountBindingPage = (): string => `<!doctype html>
     .account h3 { margin: 0; font-size: 1.1rem; }
     .email { min-height: 28px; margin: 10px 0 16px; color: #596273; overflow-wrap: anywhere; }
     .state { min-height: 24px; margin: 0 0 16px; font-size: .9rem; color: #596273; }
+    .sync-options { display: grid; gap: 6px; margin: 0 0 14px; color: #596273; font-size: .9rem; }
+    .sync-options input { width: 9rem; min-height: 38px; padding: 6px 9px; border: 1px solid #aeb6c4; border-radius: 7px; background: transparent; color: inherit; font: inherit; }
     .actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: auto; }
     button, .button { display: inline-flex; align-items: center; justify-content: center; min-height: 42px; padding: 8px 14px; border: 1px solid #263d7a; border-radius: 8px; background: #263d7a; color: #fff; font: inherit; font-weight: 600; text-decoration: none; cursor: pointer; }
     button.secondary { background: transparent; color: #263d7a; }
@@ -32,7 +34,8 @@ export const renderAccountBindingPage = (): string => `<!doctype html>
       :root { background: #14171d; color: #edf0f5; }
       .topbar, .account { border-color: #343a46; }
       .account { background: #1c2028; box-shadow: none; }
-      .environment, .intro, .email, .state, .footnote { color: #aab2c1; }
+      .environment, .intro, .email, .state, .sync-options, .footnote { color: #aab2c1; }
+      .sync-options input { border-color: #596273; }
       button, .button { border-color: #a8baff; background: #a8baff; color: #171c2a; }
       button.secondary { background: transparent; color: #c5d0ff; }
       .notice { background: #202b46; color: #c5d0ff; }
@@ -48,7 +51,7 @@ export const renderAccountBindingPage = (): string => `<!doctype html>
     </header>
     <main>
       <h2>Connect Gmail accounts</h2>
-      <p class="intro">Bind Personal and Work separately. Each account is stored in its own database silo. After connecting, run a sync to verify Gmail access, message hydration, and Send As aliases.</p>
+      <p class="intro">Bind Personal and Work separately. Each account is stored in its own database silo. Sync imports the latest conversations up to your chosen limit as a background job and shows progress here.</p>
       <p id="notice" class="notice" role="status" aria-live="polite" hidden></p>
       <section id="accounts" class="accounts" aria-label="Gmail account bindings"></section>
       <p class="footnote">This local setup screen does not expose the full mail client or Tailscale authentication. Keep the server bound to localhost and never commit your OAuth credentials.</p>
@@ -70,6 +73,44 @@ export const renderAccountBindingPage = (): string => `<!doctype html>
       if (className) element.className = className;
       element.addEventListener("click", action);
       return element;
+    };
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    const describeJob = (job) => {
+      if (job.status === "failed") return job.error || "Sync failed.";
+      if (job.status === "completed") {
+        const result = job.result;
+        return result
+          ? "Sync complete: " + job.progress.conversationsCompleted + " conversations, " + result.messagesUpserted + " messages updated and " + result.messagesDeleted + " deleted."
+          : "Sync complete.";
+      }
+      if (job.progress.stage === "listing_conversations") return "Finding the latest conversations (up to " + job.initialConversationLimit + ")…";
+      if (job.progress.stage === "importing_conversations") {
+        return "Imported " + job.progress.conversationsCompleted + " of up to " + job.initialConversationLimit + " conversations · " + job.progress.messagesUpserted + " messages";
+      }
+      return job.status === "queued" ? "Sync queued…" : "Preparing Gmail sync…";
+    };
+    const watchSync = async (id, progress, control, limitInput, announce = false) => {
+      while (true) {
+        const response = await fetch("/api/accounts/" + id + "/sync", { headers: { Accept: "application/json" } });
+        if (!response.ok) throw new Error("Could not load sync progress.");
+        const { job } = await response.json();
+        if (!job) {
+          progress.textContent = "Connected";
+          control.disabled = false;
+          limitInput.disabled = false;
+          return;
+        }
+        progress.textContent = describeJob(job);
+        if (job.status === "completed" || job.status === "failed") {
+          control.disabled = false;
+          limitInput.disabled = false;
+          if (announce) setNotice(job.status === "failed" ? id + " sync failed: " + (job.error || "Unknown error.") : id + " sync completed.", job.status === "failed");
+          return;
+        }
+        control.disabled = true;
+        limitInput.disabled = true;
+        await sleep(750);
+      }
     };
     const refreshAccounts = async () => {
       const response = await fetch("/api/accounts", { headers: { Accept: "application/json" } });
@@ -95,24 +136,58 @@ export const renderAccountBindingPage = (): string => `<!doctype html>
         connect.href = "/auth/google/start?accountId=" + encodeURIComponent(id);
         connect.textContent = account ? "Re-connect" : "Connect Gmail";
         actions.append(connect);
+        let progress;
         if (account) {
-          actions.append(button("Sync now", "secondary", async (event) => {
-            const control = event.currentTarget;
-            control.disabled = true;
-            setNotice("Syncing " + slotNames[id] + "…");
-            try {
-              const syncResponse = await fetch("/api/accounts/" + id + "/sync", { method: "POST", headers: { Accept: "application/json", "X-ZeroEffect-Local": "1" } });
-              const result = await syncResponse.json();
-              if (!syncResponse.ok) throw new Error(result.error || "Sync failed.");
-              setNotice(slotNames[id] + " sync complete: " + result.messagesUpserted + " messages updated and " + result.messagesDeleted + " deleted. Send As aliases were synchronized.");
-            } catch (error) {
-              setNotice(error instanceof Error ? error.message : "Sync failed.", true);
-            } finally {
-              control.disabled = false;
+          const syncOptions = document.createElement("label");
+          syncOptions.className = "sync-options";
+          syncOptions.textContent = "Initial import limit (conversations)";
+          const limitInput = document.createElement("input");
+          limitInput.type = "number";
+          limitInput.min = "1";
+          limitInput.max = "10000";
+          limitInput.step = "1";
+          limitInput.value = localStorage.getItem("zeroeffect.initialConversationLimit." + id) || "100";
+          limitInput.setAttribute("aria-label", "Initial import limit for " + slotNames[id]);
+          limitInput.addEventListener("change", () => localStorage.setItem("zeroeffect.initialConversationLimit." + id, limitInput.value));
+          syncOptions.append(limitInput);
+          progress = document.createElement("p");
+          progress.className = "state";
+          progress.setAttribute("role", "status");
+          progress.setAttribute("aria-live", "polite");
+          progress.textContent = "Connected";
+          const syncButton = button("Sync now", "secondary", async () => {
+            const limit = Number(limitInput.value);
+            if (!Number.isSafeInteger(limit) || limit < 1 || limit > 10000) {
+              setNotice("Choose an initial import limit from 1 to 10000 conversations.", true);
+              return;
             }
-          }));
+            localStorage.setItem("zeroeffect.initialConversationLimit." + id, String(limit));
+            syncButton.disabled = true;
+            limitInput.disabled = true;
+            try {
+              const syncResponse = await fetch("/api/accounts/" + id + "/sync", {
+                method: "POST",
+                headers: { Accept: "application/json", "Content-Type": "application/json", "X-ZeroEffect-Local": "1" },
+                body: JSON.stringify({ initialConversationLimit: limit }),
+              });
+              const responseBody = await syncResponse.json();
+              if (!syncResponse.ok && syncResponse.status !== 409) throw new Error(responseBody.error || "Could not start sync.");
+              await watchSync(id, progress, syncButton, limitInput, true);
+            } catch (error) {
+              progress.textContent = error instanceof Error ? error.message : "Sync failed.";
+              setNotice(progress.textContent, true);
+              syncButton.disabled = false;
+              limitInput.disabled = false;
+            }
+          });
+          actions.append(syncButton);
+          card.append(heading, email, state, syncOptions, progress, actions);
+          watchSync(id, progress, syncButton, limitInput).catch((error) => {
+            progress.textContent = error instanceof Error ? error.message : "Could not load sync progress.";
+          });
+        } else {
+          card.append(heading, email, state, actions);
         }
-        card.append(heading, email, state, actions);
         accountsRoot.append(card);
       }
     };

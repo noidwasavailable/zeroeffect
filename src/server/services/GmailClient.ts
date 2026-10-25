@@ -18,6 +18,11 @@ export interface GmailProfile {
   readonly historyId: string;
 }
 
+export interface GmailThread {
+  readonly id: string;
+  readonly messages: ReadonlyArray<GmailMessage>;
+}
+
 export interface GmailHistoryPage {
   readonly history?: ReadonlyArray<{
     readonly id: string;
@@ -52,6 +57,11 @@ export interface GmailClientService {
     readonly nextPageToken?: string;
   }, GmailApiError>;
   readonly getMessage: (id: string) => Effect.Effect<GmailMessage, GmailApiError>;
+  readonly listThreads: (pageToken?: string, maxResults?: number) => Effect.Effect<{
+    readonly threads: ReadonlyArray<{ readonly id: string }>;
+    readonly nextPageToken?: string;
+  }, GmailApiError>;
+  readonly getThread: (id: string) => Effect.Effect<GmailThread, GmailApiError>;
   readonly listHistory: (startHistoryId: string, pageToken?: string) => Effect.Effect<GmailHistoryPage, GmailApiError>;
   readonly listSendAs: () => Effect.Effect<ReadonlyArray<GmailSendAs>, GmailApiError>;
   readonly watch: (topicName: string) => Effect.Effect<GmailWatchResponse, GmailApiError>;
@@ -115,6 +125,8 @@ const makeClient = (config: GmailClientConfig): GmailClientService => {
     getProfile: () => request("/users/me/profile"),
     listMessages: (pageToken) => request("/users/me/messages", { maxResults: 100, pageToken }),
     getMessage: (id) => request(`/users/me/messages/${encodeURIComponent(id)}`, { format: "full" }),
+    listThreads: (pageToken, maxResults = 100) => request("/users/me/threads", { maxResults, pageToken }),
+    getThread: (id) => request(`/users/me/threads/${encodeURIComponent(id)}`, { format: "full" }),
     listHistory: (startHistoryId, pageToken) => request("/users/me/history", {
       startHistoryId,
       pageToken,

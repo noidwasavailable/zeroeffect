@@ -29,8 +29,9 @@ describe("local account setup", () => {
     expect(() => vault.decrypt(tampered)).toThrow();
   });
 
-  test("binds an OAuth callback to its browser state and syncs into the account silo", async () => {
+  test("binds an OAuth callback and runs a bounded background sync into the account silo", async () => {
     const tokenRequests: URLSearchParams[] = [];
+    const threadListLimits: number[] = [];
     const provider = Bun.serve({
       port: 0,
       fetch: async (request) => {
@@ -45,7 +46,10 @@ describe("local account setup", () => {
         if (url.pathname === "/gmail/v1/users/me/profile") {
           return Response.json({ emailAddress: "personal@example.test", historyId: "history-1" });
         }
-        if (url.pathname === "/gmail/v1/users/me/messages") return Response.json({ messages: [] });
+        if (url.pathname === "/gmail/v1/users/me/threads") {
+          threadListLimits.push(Number(url.searchParams.get("maxResults")));
+          return Response.json({ threads: [] });
+        }
         if (url.pathname === "/gmail/v1/users/me/settings/sendAs") {
           return Response.json({ sendAs: [{ sendAsEmail: "personal@example.test", isPrimary: true, verificationStatus: "accepted" }] });
         }
@@ -115,12 +119,38 @@ describe("local account setup", () => {
     const origin = new URL(app.url).origin;
     const deniedSync = await fetch(new URL("/api/accounts/personal/sync", app.url), { method: "POST" });
     expect(deniedSync.status).toBe(403);
+    const invalidLimit = await fetch(new URL("/api/accounts/personal/sync", app.url), {
+      method: "POST",
+      headers: { Origin: origin, "X-ZeroEffect-Local": "1", "Content-Type": "application/json" },
+      body: JSON.stringify({ initialConversationLimit: 0 }),
+    });
+    expect(invalidLimit.status).toBe(400);
     const sync = await fetch(new URL("/api/accounts/personal/sync", app.url), {
       method: "POST",
       headers: { Origin: origin, "X-ZeroEffect-Local": "1" },
     });
-    expect(sync.status).toBe(200);
-    expect(await sync.json()).toEqual({ mode: "initial", messagesUpserted: 0, messagesDeleted: 0 });
+    expect(sync.status).toBe(202);
+    const started = await sync.json() as { job: { id: string; status: string; initialConversationLimit: number } };
+    expect(started.job.id).toBeTruthy();
+    expect(started.job.initialConversationLimit).toBe(100);
+
+    type SyncJobView = { status: string; progress: { stage: string; conversationsCompleted: number }; result?: { mode: string; messagesUpserted: number; messagesDeleted: number } };
+    let job: SyncJobView | null = null;
+    for (let attempt = 0; attempt < 100; attempt++) {
+      const statusResponse = await fetch(new URL("/api/accounts/personal/sync", app.url));
+      expect(statusResponse.status).toBe(200);
+      job = (await statusResponse.json() as { job: SyncJobView | null }).job;
+      if (job?.status === "completed" || job?.status === "failed") break;
+      await Bun.sleep(10);
+    }
+    expect(job).toMatchObject({
+      status: "completed",
+      progress: { stage: "completed", conversationsCompleted: 0 },
+      result: { mode: "initial", messagesUpserted: 0, messagesDeleted: 0 },
+    });
+    expect(threadListLimits).toEqual([100]);
+    const workJobResponse = await fetch(new URL("/api/accounts/work/sync", app.url));
+    expect(await workJobResponse.json()).toEqual({ job: null });
 
     const accountDatabase = new Database(join(workDirectory, "personal.sqlite"));
     try {
