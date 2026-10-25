@@ -41,6 +41,8 @@ export interface AccountDbService {
   readonly accountId: string;
   readonly upsertThread: (thread: ThreadRecord) => Effect.Effect<void, DatabaseError>;
   readonly getThread: (id: string) => Effect.Effect<FilterThread | null, DatabaseError>;
+  readonly listPersistedThreadIds: () => Effect.Effect<ReadonlyArray<string>, DatabaseError>;
+  readonly markThreadHydrated: (id: string) => Effect.Effect<void, DatabaseError>;
   readonly queryThreads: (filter: CompiledFilter) => Effect.Effect<ReadonlyArray<FilterThread>, DatabaseError>;
   readonly upsertMessage: (message: MessageRecord) => Effect.Effect<void, DatabaseError>;
   readonly deleteMessage: (id: string) => Effect.Effect<void, DatabaseError>;
@@ -123,6 +125,12 @@ const initialize = (database: Database): void => {
     CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
       thread_id UNINDEXED, subject, from_address, body_markdown
     );
+    CREATE TABLE IF NOT EXISTS gmail_hydrated_threads (
+      thread_id TEXT PRIMARY KEY REFERENCES threads(id) ON DELETE CASCADE
+    );
+    CREATE TABLE IF NOT EXISTS schema_migrations (
+      id TEXT PRIMARY KEY
+    );
     CREATE TABLE IF NOT EXISTS saved_views (
       id TEXT PRIMARY KEY,
       name TEXT NOT NULL,
@@ -158,6 +166,21 @@ const initialize = (database: Database): void => {
       created_at INTEGER NOT NULL
     );
   `);
+
+  const migrationId = "gmail-hydrated-threads-v1";
+  const migrationExists = database.prepare("SELECT 1 FROM schema_migrations WHERE id = ?").get(migrationId);
+  if (!migrationExists) {
+    database.transaction(() => {
+      // Existing rows were written only after each thread's messages had been
+      // processed by the pre-marker importer. Preserve them as resumable cache.
+      database.prepare(`
+        INSERT OR IGNORE INTO gmail_hydrated_threads (thread_id)
+        SELECT threads.id FROM threads
+        WHERE EXISTS (SELECT 1 FROM messages WHERE messages.thread_id = threads.id)
+      `).run();
+      database.prepare("INSERT OR IGNORE INTO schema_migrations (id) VALUES (?)").run(migrationId);
+    })();
+  }
 };
 
 const toFilterThread = (row: Pick<ThreadRow, "id" | "subject" | "sender_summary" | "labels_json" | "is_unread" | "is_starred" | "is_archived">): FilterThread => ({
@@ -217,6 +240,21 @@ const makeService = (accountId: string, database: Database): AccountDbService =>
       },
       catch: (cause) => new DatabaseError({ message: "Failed to load thread.", operation: "getThread", cause }),
     }),
+  listPersistedThreadIds: () =>
+    Effect.try({
+      try: () => (database.prepare(`
+        SELECT thread_id AS id FROM gmail_hydrated_threads
+      `).all() as Array<{ id: string }>).map((row) => row.id),
+      catch: (cause) => new DatabaseError({ message: "Failed to list persisted Gmail conversations.", operation: "listPersistedThreadIds", cause }),
+    }),
+  markThreadHydrated: (id) =>
+    Effect.try({
+      try: () => database.prepare(`
+        INSERT INTO gmail_hydrated_threads (thread_id) VALUES (?)
+        ON CONFLICT(thread_id) DO NOTHING
+      `).run(id),
+      catch: (cause) => new DatabaseError({ message: "Failed to mark Gmail conversation as complete.", operation: "markThreadHydrated", cause }),
+    }).pipe(Effect.asVoid),
   queryThreads: (filter) =>
     Effect.try({
       try: () => {

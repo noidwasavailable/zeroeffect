@@ -16,10 +16,10 @@ import { GmailApiError, RedisQueueError } from "../src/shared/errors";
 const closeables: Array<{ close: () => void }> = [];
 afterAll(() => { for (const item of closeables) item.close(); });
 
-const makeAccountDb = () => {
+const makeAccountDb = (accountId = "personal") => {
   const database = new Database(":memory:");
   closeables.push(database);
-  const layer = AccountDbTest("personal", database);
+  const layer = AccountDbTest(accountId, database);
   const service = Effect.runSync(Effect.gen(function* () { return yield* AccountDb; }).pipe(Effect.provide(layer)));
   return { layer, service, database };
 };
@@ -63,7 +63,7 @@ describe("Phase 2: Gmail sync, aliases and Pub/Sub", () => {
     let historyCalls = 0;
     const gmail: GmailClientService = {
       getProfile: () => Effect.succeed({ emailAddress: "personal@example.com", historyId: "h-2" }),
-      listMessages: () => Effect.succeed({ messages: [{ id: "m1" }] }),
+      listMessages: () => Effect.succeed({ messages: [{ id: "m1", threadId: "thread-m1" }] }),
       getMessage: (id) => Effect.succeed(messages.get(id)! ),
       listThreads: () => Effect.succeed({ threads: [{ id: "thread-m1" }] }),
       getThread: (id) => Effect.succeed({ id, messages: [messages.get("m1")!] }),
@@ -111,14 +111,14 @@ describe("Phase 2: Gmail sync, aliases and Pub/Sub", () => {
     ]);
     const gmail: GmailClientService = {
       getProfile: () => Effect.succeed({ emailAddress: "me@example.com", historyId: "initial-history" }),
-      listMessages: () => Effect.succeed({ messages: [] }),
-      getMessage: () => Effect.fail({} as never),
-      listThreads: (pageToken, maxResults) => {
-        pages.push({ ...(pageToken === undefined ? {} : { pageToken }), ...(maxResults === undefined ? {} : { maxResults }) });
+      listMessages: (pageToken) => {
+        pages.push({ ...(pageToken === undefined ? {} : { pageToken }) });
         return Effect.succeed(pageToken
-          ? { threads: [{ id: "t2" }, { id: "t3" }] }
-          : { threads: [{ id: "t1" }], nextPageToken: "next" });
+          ? { messages: [{ id: "m2", threadId: "t2" }, { id: "m3", threadId: "t3" }] }
+          : { messages: [{ id: "m1-newest", threadId: "t1" }, { id: "m1-older", threadId: "t1" }], nextPageToken: "next" });
       },
+      getMessage: () => Effect.fail({} as never),
+      listThreads: () => Effect.succeed({ threads: [] }),
       getThread: (id) => {
         requestedThreads.push(id);
         return Effect.succeed({ id, messages: threadMessages.get(id)! });
@@ -138,7 +138,7 @@ describe("Phase 2: Gmail sync, aliases and Pub/Sub", () => {
     }));
 
     expect(result).toEqual({ mode: "initial", messagesUpserted: 3, messagesDeleted: 0 });
-    expect(pages).toEqual([{ maxResults: 2 }, { pageToken: "next", maxResults: 1 }]);
+    expect(pages).toEqual([{}, { pageToken: "next" }]);
     expect(requestedThreads).toEqual(["t1", "t2"]);
     expect(progress).toEqual([
       { conversationsCompleted: 0, messagesUpserted: 0 },
@@ -150,13 +150,87 @@ describe("Phase 2: Gmail sync, aliases and Pub/Sub", () => {
     expect(await Effect.runPromise(accountDb.getThread("t3"))).toBeNull();
   });
 
+  test("resumes hydration from saved conversations without fetching them again", async () => {
+    const { service: accountDb, database } = makeAccountDb();
+    for (const id of ["latest-saved", "second-saved"]) {
+      await Effect.runPromise(accountDb.upsertThread({
+        id, subject: id, senderSummary: "sender@example.com", labels: [],
+        isUnread: false, isStarred: false, isArchived: false,
+      }));
+      await Effect.runPromise(accountDb.upsertMessage({
+        id: `${id}-message`, threadId: id, fromAddress: "sender@example.com",
+        toAddresses: [], ccAddresses: [], deliveredTo: null, dateTs: 1710000000000,
+        bodyMarkdown: "saved", bodyHtmlSanitized: "", rawHeaders: {},
+      }));
+    }
+    // Simulate a database created by the earlier importer, before completion markers existed.
+    database.prepare("DROP TABLE gmail_hydrated_threads").run();
+    database.prepare("DELETE FROM schema_migrations WHERE id = ?").run("gmail-hydrated-threads-v1");
+    const accountLayer = AccountDbTest("personal", database);
+    // Layer acquisition reruns the migration against this legacy-shaped database.
+    Effect.runSync(Effect.gen(function* () { return yield* AccountDb; }).pipe(Effect.provide(accountLayer)));
+
+    const requestedThreads: string[] = [];
+    const gmail: GmailClientService = {
+      getProfile: () => Effect.succeed({ emailAddress: "me@example.com", historyId: "initial-history" }),
+      listMessages: () => Effect.succeed({ messages: [
+        { id: "latest-saved-newest-message", threadId: "latest-saved" },
+        { id: "latest-saved-older-message", threadId: "latest-saved" },
+        { id: "second-saved-message", threadId: "second-saved" },
+        { id: "third-missing-message", threadId: "third-missing" },
+        { id: "fourth-missing-message", threadId: "fourth-missing" },
+      ] }),
+      getMessage: () => Effect.fail({} as never),
+      listThreads: () => Effect.succeed({ threads: [] }),
+      getThread: (id) => {
+        requestedThreads.push(id);
+        return Effect.succeed({ id, messages: [mockMessage(`${id}-message`, id)] });
+      },
+      listHistory: () => Effect.fail({} as never),
+      listSendAs: () => Effect.succeed([]),
+      watch: () => Effect.succeed({ historyId: "initial-history", expiration: "1710000000000" }),
+      sendRaw: () => Effect.succeed({ id: "sent", threadId: "sent" }),
+    };
+    const layer = Layer.provide(GmailSyncServiceLive, Layer.merge(accountLayer, Layer.succeed(GmailClient, gmail)));
+    const service = Effect.runSync(Effect.gen(function* () { return yield* GmailSyncService; }).pipe(Effect.provide(layer)));
+    const progress: number[] = [];
+
+    const result = await Effect.runPromise(service.sync({
+      initialConversationLimit: 3,
+      onProgress: ({ conversationsCompleted }) => progress.push(conversationsCompleted),
+    }));
+
+    expect(result).toEqual({ mode: "initial", messagesUpserted: 1, messagesDeleted: 0 });
+    expect(requestedThreads).toEqual(["third-missing"]);
+    expect(progress).toEqual([0, 1, 2, 3]);
+    expect(await Effect.runPromise(accountDb.listPersistedThreadIds())).toEqual(expect.arrayContaining([
+      "latest-saved", "second-saved", "third-missing",
+    ]));
+    expect(await Effect.runPromise(accountDb.getThread("fourth-missing"))).toBeNull();
+    expect(await Effect.runPromise(accountDb.getHistoryId())).toBe("initial-history");
+  });
+
+  test("keeps hydration completion markers isolated per account", async () => {
+    const personal = makeAccountDb("personal");
+    const work = makeAccountDb("work");
+    await Effect.runPromise(personal.service.upsertThread({
+      id: "shared-gmail-thread-id", subject: "Personal", senderSummary: "sender@example.com", labels: [],
+      isUnread: false, isStarred: false, isArchived: false,
+    }));
+    await Effect.runPromise(personal.service.markThreadHydrated("shared-gmail-thread-id"));
+
+    expect(await Effect.runPromise(personal.service.listPersistedThreadIds())).toEqual(["shared-gmail-thread-id"]);
+    expect(await Effect.runPromise(work.service.listPersistedThreadIds())).toEqual([]);
+    expect(await Effect.runPromise(work.service.getThread("shared-gmail-thread-id"))).toBeNull();
+  });
+
   test("keeps each successfully hydrated conversation when a later thread request fails", async () => {
     const { layer: accountLayer, service: accountDb, database } = makeAccountDb();
     const gmail: GmailClientService = {
       getProfile: () => Effect.succeed({ emailAddress: "me@example.com", historyId: "initial-history" }),
-      listMessages: () => Effect.succeed({ messages: [] }),
+      listMessages: () => Effect.succeed({ messages: [{ id: "m1", threadId: "t1" }, { id: "m2", threadId: "t2" }] }),
       getMessage: () => Effect.fail({} as never),
-      listThreads: () => Effect.succeed({ threads: [{ id: "t1" }, { id: "t2" }] }),
+      listThreads: () => Effect.succeed({ threads: [] }),
       getThread: (id) => id === "t1"
         ? Effect.succeed({ id, messages: [mockMessage("m1", id)] })
         : Effect.fail(new GmailApiError({
@@ -194,7 +268,7 @@ describe("Phase 2: Gmail sync, aliases and Pub/Sub", () => {
     await Effect.runPromise(accountDb.setHistoryId("expired"));
     const gmail: GmailClientService = {
       getProfile: () => Effect.succeed({ emailAddress: "me@example.com", historyId: "fresh" }),
-      listMessages: () => Effect.succeed({ messages: [{ id: "recovered" }] }),
+      listMessages: () => Effect.succeed({ messages: [{ id: "recovered", threadId: "recovered-thread" }] }),
       getMessage: () => Effect.succeed(mockMessage("recovered")),
       listThreads: () => Effect.succeed({ threads: [{ id: "recovered-thread" }] }),
       getThread: () => Effect.succeed({ id: "recovered-thread", messages: [mockMessage("recovered", "recovered-thread")] }),
@@ -270,22 +344,36 @@ describe("Phase 2: Gmail sync, aliases and Pub/Sub", () => {
       apiBaseUrl: "http://gmail.test/gmail/v1",
       fetch: async () => {
         rateLimitCalls++;
-        if (rateLimitCalls === 1) {
+        if (rateLimitCalls < 3) {
           return Response.json({
             error: {
               code: 403,
               message: "private server detail that must not be surfaced",
               status: "PERMISSION_DENIED",
-              errors: [{ reason: "userRateLimitExceeded" }],
+              errors: [{ reason: "rateLimitExceeded" }],
             },
-          }, { status: 403, headers: { "Retry-After": "0" } });
+          }, { status: 403 });
         }
         return Response.json({ id: "t1", messages: [] });
       },
     });
     const rateLimitedClient = Effect.runSync(Effect.gen(function* () { return yield* GmailClient; }).pipe(Effect.provide(rateLimitedClientLayer)));
     expect(await Effect.runPromise(rateLimitedClient.getThread("t1"))).toMatchObject({ id: "t1" });
-    expect(rateLimitCalls).toBe(2);
+    expect(rateLimitCalls).toBe(3);
+
+    let exhaustedRateLimitCalls = 0;
+    const exhaustedClientLayer = GmailClientLive({
+      accessToken: "access-token",
+      apiBaseUrl: "http://gmail.test/gmail/v1",
+      fetch: async () => {
+        exhaustedRateLimitCalls++;
+        return Response.json({ error: { status: "RESOURCE_EXHAUSTED", errors: [{ reason: "userRateLimitExceeded" }] } }, { status: 403 });
+      },
+    });
+    const exhaustedClient = Effect.runSync(Effect.gen(function* () { return yield* GmailClient; }).pipe(Effect.provide(exhaustedClientLayer)));
+    const exhaustedResult = await Effect.runPromiseExit(exhaustedClient.getThread("t1"));
+    expect(exhaustedResult._tag).toBe("Failure");
+    expect(exhaustedRateLimitCalls).toBe(6); // initial request plus five scheduled retries
 
     let forbiddenCalls = 0;
     const forbiddenClientLayer = GmailClientLive({
@@ -321,7 +409,7 @@ describe("Phase 2: Gmail sync, aliases and Pub/Sub", () => {
       expect(result.error.operation).not.toContain("sensitive-thread-id");
     }
     expect(forbiddenCalls).toBe(1);
-  });
+  }, 15_000);
 
   test("selects the matching Delivered-To alias and creates Gmail raw RFC 2822 data", async () => {
     const { layer: accountLayer, service: accountDb } = makeAccountDb();

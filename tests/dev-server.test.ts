@@ -31,7 +31,7 @@ describe("local account setup", () => {
 
   test("binds an OAuth callback and runs a bounded background sync into the account silo", async () => {
     const tokenRequests: URLSearchParams[] = [];
-    const threadListLimits: number[] = [];
+    const messageListLimits: number[] = [];
     const provider = Bun.serve({
       port: 0,
       fetch: async (request) => {
@@ -46,9 +46,9 @@ describe("local account setup", () => {
         if (url.pathname === "/gmail/v1/users/me/profile") {
           return Response.json({ emailAddress: "personal@example.test", historyId: "history-1" });
         }
-        if (url.pathname === "/gmail/v1/users/me/threads") {
-          threadListLimits.push(Number(url.searchParams.get("maxResults")));
-          return Response.json({ threads: [] });
+        if (url.pathname === "/gmail/v1/users/me/messages") {
+          messageListLimits.push(Number(url.searchParams.get("maxResults")));
+          return Response.json({ messages: [] });
         }
         if (url.pathname === "/gmail/v1/users/me/settings/sendAs") {
           return Response.json({ sendAs: [{ sendAsEmail: "personal@example.test", isPrimary: true, verificationStatus: "accepted" }] });
@@ -148,7 +148,7 @@ describe("local account setup", () => {
       progress: { stage: "completed", conversationsCompleted: 0 },
       result: { mode: "initial", messagesUpserted: 0, messagesDeleted: 0 },
     });
-    expect(threadListLimits).toEqual([100]);
+    expect(messageListLimits).toEqual([100]);
     const workJobResponse = await fetch(new URL("/api/accounts/work/sync", app.url));
     expect(await workJobResponse.json()).toEqual({ job: null });
 

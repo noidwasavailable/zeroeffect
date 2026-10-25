@@ -107,19 +107,43 @@ export const GmailSyncServiceLive: Layer.Layer<GmailSyncService, never, AccountD
         let pageToken: string | undefined;
         let conversationsCompleted = 0;
         let messagesUpserted = 0;
+        const persistedThreadIds = new Set(yield* accountDb.listPersistedThreadIds());
+        const visitedThreadIds = new Set<string>();
         onProgress?.({ stage: "listing_conversations", conversationsCompleted, conversationsTotal: limit, messagesUpserted });
+        // Gmail documents messages.list as reverse chronological. Deduplicating
+        // its message results by threadId selects conversations by their latest
+        // message; threads.list does not promise an ordering.
         while (conversationsCompleted < limit) {
-          const page = yield* gmail.listThreads(pageToken, Math.min(100, limit - conversationsCompleted));
-          const threads = page.threads.slice(0, limit - conversationsCompleted);
-          if (threads.length === 0) break;
-          for (const reference of threads) {
-            const thread = yield* gmail.getThread(reference.id);
-            for (const message of thread.messages ?? []) {
-              const normalizedMessage = message.threadId ? message : { ...message, threadId: thread.id };
-              if (yield* upsert(normalizedMessage)) messagesUpserted++;
+          const page = yield* gmail.listMessages(pageToken);
+          if (page.messages.length === 0) break;
+          for (const messageReference of page.messages) {
+            const threadId = messageReference.threadId;
+            if (!threadId || visitedThreadIds.has(threadId)) continue;
+            visitedThreadIds.add(threadId);
+
+            if (persistedThreadIds.has(threadId)) {
+              // Already-complete local conversations count toward the hydration
+              // target, but don't incur a threads.get request or another write.
+              conversationsCompleted++;
+              onProgress?.({ stage: "importing_conversations", conversationsCompleted, conversationsTotal: limit, messagesUpserted });
+            } else {
+              const thread = yield* gmail.getThread(threadId);
+              let threadMessagesUpserted = 0;
+              for (const threadMessage of thread.messages ?? []) {
+                const normalizedMessage = threadMessage.threadId ? threadMessage : { ...threadMessage, threadId: thread.id };
+                if (yield* upsert(normalizedMessage)) {
+                  messagesUpserted++;
+                  threadMessagesUpserted++;
+                }
+              }
+              if (threadMessagesUpserted > 0) {
+                yield* accountDb.markThreadHydrated(threadId);
+                persistedThreadIds.add(threadId);
+              }
+              conversationsCompleted++;
+              onProgress?.({ stage: "importing_conversations", conversationsCompleted, conversationsTotal: limit, messagesUpserted });
             }
-            conversationsCompleted++;
-            onProgress?.({ stage: "importing_conversations", conversationsCompleted, conversationsTotal: limit, messagesUpserted });
+            if (conversationsCompleted >= limit) break;
           }
           pageToken = page.nextPageToken;
           if (!pageToken) break;

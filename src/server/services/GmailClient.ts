@@ -1,4 +1,4 @@
-import { Context, Effect, Layer } from "effect";
+import { Context, Effect, Layer, Schedule } from "effect";
 import { GmailApiError } from "../../shared/errors";
 import type { GmailMimePart } from "./MimeParser";
 
@@ -107,72 +107,61 @@ const parseGoogleErrorDetails = (body: string): { readonly reason?: string; read
 const describeOperation = (method: string, path: string): string =>
   `${method} ${path.replace(/\/threads\/[^/]+/g, "/threads/{threadId}").replace(/\/messages\/[^/]+/g, "/messages/{messageId}")}`;
 
-const retryDelay = (retryAfter: string | null, attempt: number): number => {
-  if (retryAfter !== null) {
-    const seconds = Number(retryAfter);
-    const requestedDelay = Number.isFinite(seconds) ? seconds * 1000 : Date.parse(retryAfter) - Date.now();
-    if (Number.isFinite(requestedDelay) && requestedDelay >= 0) return Math.min(requestedDelay, 5_000);
-  }
-  return Math.min(250 * 2 ** attempt, 2_000);
-};
-
-const delay = (milliseconds: number): Promise<void> =>
-  new Promise((resolve) => setTimeout(resolve, milliseconds));
-
 const makeClient = (config: GmailClientConfig): GmailClientService => {
   const apiBaseUrl = (config.apiBaseUrl ?? "https://gmail.googleapis.com/gmail/v1").replace(/\/$/, "");
   const fetcher = config.fetch ?? globalThis.fetch;
-  const request = <A>(path: string, query: Record<string, string | number | ReadonlyArray<string> | undefined> = {}, body?: unknown): Effect.Effect<A, GmailApiError> =>
-    Effect.tryPromise({
+  const request = <A>(path: string, query: Record<string, string | number | ReadonlyArray<string> | undefined> = {}, body?: unknown): Effect.Effect<A, GmailApiError> => {
+    const operation = describeOperation(body === undefined ? "GET" : "POST", path);
+    const requestOnce = Effect.tryPromise({
       try: async () => {
         const url = new URL(`${apiBaseUrl}${path}`);
         for (const [key, value] of Object.entries(query)) {
           if (Array.isArray(value)) for (const item of value) url.searchParams.append(key, item);
           else if (value !== undefined) url.searchParams.set(key, String(value));
         }
-        const method = body === undefined ? "GET" : "POST";
-        const operation = describeOperation(method, path);
-        for (let attempt = 0; ; attempt++) {
-          const response = await fetcher(url, {
-            method,
-            headers: {
-              Authorization: `Bearer ${config.accessToken}`,
-              ...(body === undefined ? {} : { "Content-Type": "application/json" }),
-            },
-            ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+        const response = await fetcher(url, {
+          method: body === undefined ? "GET" : "POST",
+          headers: {
+            Authorization: `Bearer ${config.accessToken}`,
+            ...(body === undefined ? {} : { "Content-Type": "application/json" }),
+          },
+          ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+        });
+        const responseBody = await response.text();
+        if (!response.ok) {
+          const details = parseGoogleErrorDetails(responseBody);
+          const rateLimited = response.status === 403
+            && (details.reason === "rateLimitExceeded" || details.reason === "userRateLimitExceeded");
+          throw new GmailApiError({
+            message: `Gmail API returned HTTP ${response.status}${details.reason ? ` (${details.reason})` : ""}.`,
+            status: response.status,
+            retryable: response.status === 408 || response.status === 429 || response.status >= 500 || rateLimited,
+            ...details,
+            operation,
           });
-          const responseBody = await response.text();
-          if (!response.ok) {
-            const details = parseGoogleErrorDetails(responseBody);
-            const rateLimited = response.status === 403
-              && (details.reason === "rateLimitExceeded" || details.reason === "userRateLimitExceeded");
-            const error = new GmailApiError({
-              message: `Gmail API returned HTTP ${response.status}${details.reason ? ` (${details.reason})` : ""}.`,
-              status: response.status,
-              retryable: response.status === 408 || response.status === 429 || response.status >= 500 || rateLimited,
-              ...details,
-              operation,
-            });
-            // Gmail documents these 403 reasons as quota/rate-limit responses that
-            // should use exponential backoff. Other 403s need different fixes and
-            // must not be retried as though they were transient.
-            if (rateLimited && attempt < 3) {
-              await delay(retryDelay(response.headers.get("Retry-After"), attempt));
-              continue;
-            }
-            throw error;
-          }
-          try {
-            return (responseBody ? JSON.parse(responseBody) : {}) as A;
-          } catch {
-            throw new GmailApiError({ message: "Gmail API returned invalid JSON.", status: response.status, retryable: false, operation });
-          }
+        }
+        try {
+          return (responseBody ? JSON.parse(responseBody) : {}) as A;
+        } catch {
+          throw new GmailApiError({ message: "Gmail API returned invalid JSON.", status: response.status, retryable: false, operation });
         }
       },
       catch: (cause) => cause instanceof GmailApiError
         ? cause
-        : new GmailApiError({ message: `Gmail API request failed: ${String(cause)}`, status: 0, retryable: true }),
+        : new GmailApiError({ message: "Gmail API request failed.", status: 0, retryable: true, operation }),
     });
+
+    // Rate-limit responses (including quota-related 403s) are the documented
+    // exception to non-retryable Gmail errors. Retry a bounded number of times
+    // using Effect's exponential schedule; permission and other 403s fail fast.
+    return Effect.retry(requestOnce, {
+      schedule: Schedule.exponential("250 millis").pipe(Schedule.upTo({ times: 5 })),
+      while: (error) => error.status === 429 || (
+        error.status === 403
+        && (error.reason === "rateLimitExceeded" || error.reason === "userRateLimitExceeded")
+      ),
+    });
+  };
 
   return {
     getProfile: () => request("/users/me/profile"),
