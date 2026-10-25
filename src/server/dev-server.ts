@@ -42,8 +42,10 @@ export interface DevServerConfig {
   readonly oauth: GoogleOAuth2Api;
   readonly pubsubOAuth?: GoogleOAuth2Api;
   readonly onPubSubAuthorization?: (refreshToken: string) => void | Promise<void>;
+  readonly onGmailAccountConnected?: (accountId: AccountId) => void | Promise<void>;
   readonly pubsubProjectId?: string;
   readonly pubsubSubscription?: string;
+  readonly pubsubTopicId?: string;
   readonly pubsubRedirectUri?: string;
   readonly encryptionKey: Uint8Array;
   readonly redirectUri: string;
@@ -353,6 +355,11 @@ export const createDevServer = (config: DevServerConfig): Bun.Server<unknown> =>
             ...(previousAccount?.lastHistoryId !== undefined ? { lastHistoryId: previousAccount.lastHistoryId } : {}),
             createdAt: previousAccount?.createdAt ?? Date.now(),
           }));
+          try {
+            await config.onGmailAccountConnected?.(pending.accountId);
+          } catch (error) {
+            console.error(`Could not establish a Gmail Pub/Sub watch for newly connected account ${pending.accountId}.`, error);
+          }
           return new Response(null, {
             status: 303,
             headers: {
@@ -375,9 +382,10 @@ export const createDevServer = (config: DevServerConfig): Bun.Server<unknown> =>
           return json({ error: "Could not load Pub/Sub authorization status." }, 500);
         }
         return json({
-          configured: Boolean(config.pubsubProjectId && config.pubsubSubscription),
+          configured: Boolean(config.pubsubProjectId && config.pubsubSubscription && config.pubsubTopicId),
           projectId: config.pubsubProjectId ?? null,
           subscription: config.pubsubSubscription ?? null,
+          topic: config.pubsubTopicId ?? null,
           authorized,
           authorizationAvailable: Boolean(config.pubsubOAuth),
         });
@@ -495,6 +503,7 @@ export const devServerConfigFromEnvironment = (): Omit<DevServerConfig, "registr
     gmailApiBaseUrl: process.env.GMAIL_API_BASE_URL,
     pubsubProjectId: process.env.GCP_PROJECT_ID ?? process.env.GOOGLE_CLOUD_PROJECT ?? process.env.GCLOUD_PROJECT,
     pubsubSubscription: process.env.GMAIL_PUBSUB_SUBSCRIPTION,
+    pubsubTopicId: process.env.GMAIL_PUBSUB_TOPIC,
     pubsubRedirectUri: process.env.GOOGLE_PUBSUB_REDIRECT_URI ?? new URL("/auth/google/pubsub/callback", redirectUri).toString(),
   };
 };

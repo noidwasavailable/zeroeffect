@@ -337,7 +337,7 @@ describe("Phase 2: Gmail sync, aliases and Pub/Sub", () => {
     expect(requests[3]?.url).toContain("/users/me/threads/t1?format=full");
   });
 
-  test("parses safe Gmail 403 details and retries only rate-limited requests", async () => {
+  test("parses safe Gmail 403 details and retries typed transient failures", async () => {
     let rateLimitCalls = 0;
     const rateLimitedClientLayer = GmailClientLive({
       accessToken: "access-token",
@@ -360,6 +360,21 @@ describe("Phase 2: Gmail sync, aliases and Pub/Sub", () => {
     const rateLimitedClient = Effect.runSync(Effect.gen(function* () { return yield* GmailClient; }).pipe(Effect.provide(rateLimitedClientLayer)));
     expect(await Effect.runPromise(rateLimitedClient.getThread("t1"))).toMatchObject({ id: "t1" });
     expect(rateLimitCalls).toBe(3);
+
+    let transientCalls = 0;
+    const transientClientLayer = GmailClientLive({
+      accessToken: "access-token",
+      apiBaseUrl: "http://gmail.test/gmail/v1",
+      fetch: async () => {
+        transientCalls++;
+        return transientCalls === 1
+          ? Response.json({ error: { status: "UNAVAILABLE" } }, { status: 503 })
+          : Response.json({ id: "t1", messages: [] });
+      },
+    });
+    const transientClient = Effect.runSync(Effect.gen(function* () { return yield* GmailClient; }).pipe(Effect.provide(transientClientLayer)));
+    expect(await Effect.runPromise(transientClient.getThread("t1"))).toMatchObject({ id: "t1" });
+    expect(transientCalls).toBe(2);
 
     let exhaustedRateLimitCalls = 0;
     const exhaustedClientLayer = GmailClientLive({
@@ -451,6 +466,10 @@ describe("Phase 2: Gmail sync, aliases and Pub/Sub", () => {
       enqueue: (queue: string, payload: unknown): Effect.Effect<void, RedisQueueError> => Effect.sync(() => {
         events.push(`${queue}:${JSON.stringify(payload)}`);
       }),
+      reserve: () => Effect.succeed(null),
+      acknowledge: () => Effect.void,
+      retry: () => Effect.void,
+      recover: () => Effect.succeed(0),
     };
     const transport = { streamingPull: async function* () { yield delivery; } };
     const layer = Layer.provide(PubSubListenerServiceLive(transport), Layer.succeed(RedisQueueService, queueApi));
@@ -471,6 +490,10 @@ describe("Phase 2: Gmail sync, aliases and Pub/Sub", () => {
     };
     const queueApi = {
       enqueue: (): Effect.Effect<void, RedisQueueError> => Effect.fail(new RedisQueueError({ message: "Redis unavailable." })),
+      reserve: () => Effect.succeed(null),
+      acknowledge: () => Effect.void,
+      retry: () => Effect.void,
+      recover: () => Effect.succeed(0),
     };
     const transport = { streamingPull: async function* () { yield delivery; } };
     const layer = Layer.provide(PubSubListenerServiceLive(transport), Layer.succeed(RedisQueueService, queueApi));

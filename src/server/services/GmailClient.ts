@@ -151,15 +151,11 @@ const makeClient = (config: GmailClientConfig): GmailClientService => {
         : new GmailApiError({ message: "Gmail API request failed.", status: 0, retryable: true, operation }),
     });
 
-    // Rate-limit responses (including quota-related 403s) are the documented
-    // exception to non-retryable Gmail errors. Retry a bounded number of times
-    // using Effect's exponential schedule; permission and other 403s fail fast.
+    // Retry transient failures and rate-limited 403s, as identified by the typed
+    // error. Permission and other permanent failures are marked non-retryable.
     return Effect.retry(requestOnce, {
       schedule: Schedule.exponential("250 millis").pipe(Schedule.upTo({ times: 5 })),
-      while: (error) => error.status === 429 || (
-        error.status === 403
-        && (error.reason === "rateLimitExceeded" || error.reason === "userRateLimitExceeded")
-      ),
+      while: (error) => error.retryable,
     });
   };
 

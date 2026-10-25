@@ -205,12 +205,12 @@ export const renderAccountBindingPage = (): string => `<!doctype html>
       const details = document.createElement("p");
       details.className = "state";
       details.textContent = status.configured
-        ? "Project: " + status.projectId + " · Subscription: " + status.subscription
-        : "Set GCP_PROJECT_ID and GMAIL_PUBSUB_SUBSCRIPTION, then restart the server.";
+        ? "Project: " + status.projectId + " · Topic: " + status.topic + " · Subscription: " + status.subscription
+        : "Set GCP_PROJECT_ID, GMAIL_PUBSUB_TOPIC, and GMAIL_PUBSUB_SUBSCRIPTION, then restart the server.";
       const note = document.createElement("p");
       note.className = "state";
       note.textContent = status.authorized
-        ? (status.configured ? "Pub/Sub credential is stored encrypted on this machine." : "Authorization is saved; listener starts after project and subscription are configured.")
+        ? (status.configured ? "Pub/Sub credential is stored encrypted on this machine." : "Authorization is saved; listener starts after project, topic, and subscription are configured.")
         : "Grant this Google account roles/pubsub.subscriber on the subscription in Cloud Console.";
       pubsubRoot.append(heading, details, note);
       if (status.authorizationAvailable) {

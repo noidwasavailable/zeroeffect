@@ -62,6 +62,7 @@ describe("local account setup", () => {
       onPubSubAuthorization: (token) => { authorizations.push(token); },
       pubsubProjectId: "local-project",
       pubsubSubscription: "gmail-notifications",
+      pubsubTopicId: "gmail-topic",
       encryptionKey: new Uint8Array(32).fill(19),
       redirectUri: "http://127.0.0.1:3000/auth/google/callback",
       pubsubRedirectUri: "http://127.0.0.1:3000/auth/google/pubsub/callback",
@@ -74,6 +75,7 @@ describe("local account setup", () => {
         configured: true,
         projectId: "local-project",
         subscription: "gmail-notifications",
+        topic: "gmail-topic",
         authorized: false,
         authorizationAvailable: true,
       });
