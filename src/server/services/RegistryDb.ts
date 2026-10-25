@@ -7,6 +7,7 @@ import type { AccountRecord, LlmEndpointRecord } from "../../shared/schemas";
 
 export interface RegistryDbService {
   readonly upsertAccount: (account: AccountRecord) => Effect.Effect<void, DatabaseError>;
+  readonly getAccount: (id: string) => Effect.Effect<AccountRecord | null, DatabaseError>;
   readonly listAccounts: () => Effect.Effect<ReadonlyArray<Pick<AccountRecord, "id" | "email" | "displayName" | "colorTheme">>, DatabaseError>;
   readonly upsertLlmEndpoint: (endpoint: LlmEndpointRecord) => Effect.Effect<void, DatabaseError>;
 }
@@ -74,6 +75,20 @@ const makeService = (database: Database): RegistryDbService => ({
       },
       catch: (cause) => new DatabaseError({ message: "Failed to save registry account.", operation: "upsertAccount", cause }),
     }).pipe(Effect.asVoid),
+  getAccount: (id) =>
+    Effect.try({
+      try: () => {
+        const row = database.prepare(`
+          SELECT id, email, display_name AS displayName, color_theme AS colorTheme,
+            oauth_tokens_enc AS oauthTokensEnc, pubsub_topic AS pubsubTopic,
+            watch_expiration_ts AS watchExpirationTs, last_history_id AS lastHistoryId,
+            created_at AS createdAt
+          FROM accounts WHERE id = ?
+        `).get(id) as (AccountRecord & { oauthTokensEnc: Uint8Array }) | null;
+        return row;
+      },
+      catch: (cause) => new DatabaseError({ message: "Failed to load registry account.", operation: "getAccount", cause }),
+    }),
   listAccounts: () =>
     Effect.try({
       try: () => database.prepare(`

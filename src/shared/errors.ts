@@ -23,6 +23,15 @@ export class LlmEndpointError extends Data.TaggedError("LlmEndpointError")<{
   readonly rawBody: string;
 }> {}
 
+export class SendAsComposeError extends Data.TaggedError("SendAsComposeError")<{
+  readonly message: string;
+}> {}
+
+export class RedisQueueError extends Data.TaggedError("RedisQueueError")<{
+  readonly message: string;
+  readonly cause?: unknown;
+}> {}
+
 export class DatabaseError extends Data.TaggedError("DatabaseError")<{
   readonly message: string;
   readonly operation: string;

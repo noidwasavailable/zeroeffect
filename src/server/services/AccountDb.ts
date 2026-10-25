@@ -14,11 +14,40 @@ export interface ThreadRecord extends FilterThread {
   readonly aiStatus?: "pending" | "processed" | "skipped" | "error";
 }
 
+export interface SendAsAliasRecord {
+  readonly sendAsEmail: string;
+  readonly displayName: string;
+  readonly replyToAddress: string | null;
+  readonly signatureHtml: string | null;
+  readonly isPrimary: boolean;
+  readonly isDefault: boolean;
+  readonly verificationStatus: string;
+}
+
+export interface MessageRecord {
+  readonly id: string;
+  readonly threadId: string;
+  readonly fromAddress: string;
+  readonly toAddresses: ReadonlyArray<string>;
+  readonly ccAddresses: ReadonlyArray<string>;
+  readonly deliveredTo: string | null;
+  readonly dateTs: number;
+  readonly bodyMarkdown: string;
+  readonly bodyHtmlSanitized: string;
+  readonly rawHeaders: Readonly<Record<string, string>>;
+}
+
 export interface AccountDbService {
   readonly accountId: string;
   readonly upsertThread: (thread: ThreadRecord) => Effect.Effect<void, DatabaseError>;
   readonly getThread: (id: string) => Effect.Effect<FilterThread | null, DatabaseError>;
   readonly queryThreads: (filter: CompiledFilter) => Effect.Effect<ReadonlyArray<FilterThread>, DatabaseError>;
+  readonly upsertMessage: (message: MessageRecord) => Effect.Effect<void, DatabaseError>;
+  readonly deleteMessage: (id: string) => Effect.Effect<void, DatabaseError>;
+  readonly replaceSendAsAliases: (aliases: ReadonlyArray<SendAsAliasRecord>) => Effect.Effect<void, DatabaseError>;
+  readonly listSendAsAliases: () => Effect.Effect<ReadonlyArray<SendAsAliasRecord>, DatabaseError>;
+  readonly getHistoryId: () => Effect.Effect<string | null, DatabaseError>;
+  readonly setHistoryId: (historyId: string) => Effect.Effect<void, DatabaseError>;
 }
 
 export class AccountDb extends Context.Service<AccountDb, AccountDbService>()(
@@ -50,6 +79,10 @@ const initialize = (database: Database): void => {
       type TEXT NOT NULL CHECK (type IN ('system', 'user')),
       color_bg TEXT,
       color_text TEXT
+    );
+    CREATE TABLE IF NOT EXISTS gmail_sync_state (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      history_id TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS send_as_aliases (
       send_as_email TEXT PRIMARY KEY,
@@ -194,6 +227,119 @@ const makeService = (accountId: string, database: Database): AccountDbService =>
       },
       catch: (cause) => new DatabaseError({ message: "Failed to query threads.", operation: "queryThreads", cause }),
     }),
+  upsertMessage: (message) =>
+    Effect.try({
+      try: () => {
+        database.transaction(() => {
+          database.prepare(`
+            INSERT INTO messages (
+              id, thread_id, from_address, to_addresses_json, cc_addresses_json,
+              delivered_to, date_ts, body_markdown, body_html_sanitized, raw_headers_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+              thread_id = excluded.thread_id,
+              from_address = excluded.from_address,
+              to_addresses_json = excluded.to_addresses_json,
+              cc_addresses_json = excluded.cc_addresses_json,
+              delivered_to = excluded.delivered_to,
+              date_ts = excluded.date_ts,
+              body_markdown = excluded.body_markdown,
+              body_html_sanitized = excluded.body_html_sanitized,
+              raw_headers_json = excluded.raw_headers_json
+          `).run(
+            message.id,
+            message.threadId,
+            message.fromAddress,
+            JSON.stringify(message.toAddresses),
+            JSON.stringify(message.ccAddresses),
+            message.deliveredTo,
+            message.dateTs,
+            message.bodyMarkdown,
+            message.bodyHtmlSanitized,
+            JSON.stringify(message.rawHeaders),
+          );
+          database.prepare("DELETE FROM messages_fts WHERE thread_id = ?").run(message.threadId);
+          database.prepare(`
+            INSERT INTO messages_fts (thread_id, subject, from_address, body_markdown)
+            SELECT messages.thread_id, threads.subject, messages.from_address, messages.body_markdown
+            FROM messages JOIN threads ON threads.id = messages.thread_id
+            WHERE messages.thread_id = ?
+          `).run(message.threadId);
+        })();
+      },
+      catch: (cause) => new DatabaseError({ message: "Failed to save message.", operation: "upsertMessage", cause }),
+    }).pipe(Effect.asVoid),
+  deleteMessage: (id) =>
+    Effect.try({
+      try: () => {
+        const row = database.prepare("SELECT thread_id FROM messages WHERE id = ?").get(id) as { thread_id: string } | null;
+        database.prepare("DELETE FROM messages WHERE id = ?").run(id);
+        if (row) {
+          database.prepare("DELETE FROM messages_fts WHERE thread_id = ?").run(row.thread_id);
+          database.prepare(`
+            INSERT INTO messages_fts (thread_id, subject, from_address, body_markdown)
+            SELECT messages.thread_id, threads.subject, messages.from_address, messages.body_markdown
+            FROM messages JOIN threads ON threads.id = messages.thread_id
+            WHERE messages.thread_id = ?
+          `).run(row.thread_id);
+        }
+      },
+      catch: (cause) => new DatabaseError({ message: "Failed to delete message.", operation: "deleteMessage", cause }),
+    }).pipe(Effect.asVoid),
+  replaceSendAsAliases: (aliases) =>
+    Effect.try({
+      try: () => {
+        database.transaction(() => {
+          database.prepare("DELETE FROM send_as_aliases").run();
+          const insert = database.prepare(`
+            INSERT INTO send_as_aliases (
+              send_as_email, display_name, reply_to_address, signature_html,
+              is_primary, is_default, verification_status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+          `);
+          for (const alias of aliases) {
+            insert.run(
+              alias.sendAsEmail,
+              alias.displayName,
+              alias.replyToAddress,
+              alias.signatureHtml,
+              Number(alias.isPrimary),
+              Number(alias.isDefault),
+              alias.verificationStatus,
+            );
+          }
+        })();
+      },
+      catch: (cause) => new DatabaseError({ message: "Failed to replace Send As aliases.", operation: "replaceSendAsAliases", cause }),
+    }).pipe(Effect.asVoid),
+  listSendAsAliases: () =>
+    Effect.try({
+      try: () => (database.prepare(`
+        SELECT send_as_email AS sendAsEmail, display_name AS displayName,
+          reply_to_address AS replyToAddress, signature_html AS signatureHtml,
+          is_primary AS isPrimary, is_default AS isDefault,
+          verification_status AS verificationStatus
+        FROM send_as_aliases ORDER BY is_default DESC, is_primary DESC, send_as_email
+      `).all() as Array<Omit<SendAsAliasRecord, "isPrimary" | "isDefault"> & { isPrimary: number; isDefault: number }>).map((row) => ({
+        ...row,
+        isPrimary: row.isPrimary === 1,
+        isDefault: row.isDefault === 1,
+      })),
+      catch: (cause) => new DatabaseError({ message: "Failed to load Send As aliases.", operation: "listSendAsAliases", cause }),
+    }),
+  getHistoryId: () =>
+    Effect.try({
+      try: () => (database.prepare("SELECT history_id FROM gmail_sync_state WHERE id = 1").get() as { history_id: string } | null)?.history_id ?? null,
+      catch: (cause) => new DatabaseError({ message: "Failed to load Gmail history cursor.", operation: "getHistoryId", cause }),
+    }),
+  setHistoryId: (historyId) =>
+    Effect.try({
+      try: () => database.prepare(`
+        INSERT INTO gmail_sync_state (id, history_id) VALUES (1, ?)
+        ON CONFLICT(id) DO UPDATE SET history_id = excluded.history_id
+      `).run(historyId),
+      catch: (cause) => new DatabaseError({ message: "Failed to save Gmail history cursor.", operation: "setHistoryId", cause }),
+    }).pipe(Effect.asVoid),
 });
 
 const validateAccountId = (accountId: string): Effect.Effect<void, AccountIsolationError> =>

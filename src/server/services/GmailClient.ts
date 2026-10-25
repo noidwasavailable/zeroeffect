@@ -1,0 +1,130 @@
+import { Context, Effect, Layer } from "effect";
+import { GmailApiError } from "../../shared/errors";
+import type { GmailMimePart } from "./MimeParser";
+
+export interface GmailMessage {
+  readonly id: string;
+  readonly threadId: string;
+  readonly snippet?: string;
+  readonly internalDate?: string;
+  readonly labelIds?: ReadonlyArray<string>;
+  readonly payload?: GmailMimePart & {
+    readonly headers?: ReadonlyArray<{ readonly name?: string | null; readonly value?: string | null }>;
+  };
+}
+
+export interface GmailProfile {
+  readonly emailAddress: string;
+  readonly historyId: string;
+}
+
+export interface GmailHistoryPage {
+  readonly history?: ReadonlyArray<{
+    readonly id: string;
+    readonly messagesAdded?: ReadonlyArray<{ readonly message?: { readonly id?: string } }>;
+    readonly messagesDeleted?: ReadonlyArray<{ readonly message?: { readonly id?: string } }>;
+    readonly labelsAdded?: ReadonlyArray<{ readonly message?: { readonly id?: string } }>;
+    readonly labelsRemoved?: ReadonlyArray<{ readonly message?: { readonly id?: string } }>;
+  }>;
+  readonly nextPageToken?: string;
+  readonly historyId?: string;
+}
+
+export interface GmailWatchResponse {
+  readonly historyId: string;
+  readonly expiration: string;
+}
+
+export interface GmailSendAs {
+  readonly sendAsEmail: string;
+  readonly displayName?: string;
+  readonly replyToAddress?: string;
+  readonly signature?: string;
+  readonly isPrimary?: boolean;
+  readonly isDefault?: boolean;
+  readonly verificationStatus?: string;
+}
+
+export interface GmailClientService {
+  readonly getProfile: () => Effect.Effect<GmailProfile, GmailApiError>;
+  readonly listMessages: (pageToken?: string) => Effect.Effect<{
+    readonly messages: ReadonlyArray<{ readonly id: string; readonly threadId?: string }>;
+    readonly nextPageToken?: string;
+  }, GmailApiError>;
+  readonly getMessage: (id: string) => Effect.Effect<GmailMessage, GmailApiError>;
+  readonly listHistory: (startHistoryId: string, pageToken?: string) => Effect.Effect<GmailHistoryPage, GmailApiError>;
+  readonly listSendAs: () => Effect.Effect<ReadonlyArray<GmailSendAs>, GmailApiError>;
+  readonly watch: (topicName: string) => Effect.Effect<GmailWatchResponse, GmailApiError>;
+  readonly sendRaw: (raw: string) => Effect.Effect<{ readonly id: string; readonly threadId: string }, GmailApiError>;
+}
+
+export class GmailClient extends Context.Service<GmailClient, GmailClientService>()(
+  "zeroeffect/GmailClient",
+) {}
+
+export interface GmailClientConfig {
+  readonly accessToken: string;
+  readonly apiBaseUrl?: string;
+  readonly fetch?: (input: URL, init?: RequestInit) => Promise<Response>;
+}
+
+export const GmailClientLive = (config: GmailClientConfig): Layer.Layer<GmailClient> =>
+  Layer.succeed(GmailClient, makeClient(config));
+
+export const GmailClientTest = GmailClientLive;
+
+const makeClient = (config: GmailClientConfig): GmailClientService => {
+  const apiBaseUrl = (config.apiBaseUrl ?? "https://gmail.googleapis.com/gmail/v1").replace(/\/$/, "");
+  const fetcher = config.fetch ?? globalThis.fetch;
+  const request = <A>(path: string, query: Record<string, string | number | ReadonlyArray<string> | undefined> = {}, body?: unknown): Effect.Effect<A, GmailApiError> =>
+    Effect.tryPromise({
+      try: async () => {
+        const url = new URL(`${apiBaseUrl}${path}`);
+        for (const [key, value] of Object.entries(query)) {
+          if (Array.isArray(value)) for (const item of value) url.searchParams.append(key, item);
+          else if (value !== undefined) url.searchParams.set(key, String(value));
+        }
+        const response = await fetcher(url, {
+          method: body === undefined ? "GET" : "POST",
+          headers: {
+            Authorization: `Bearer ${config.accessToken}`,
+            ...(body === undefined ? {} : { "Content-Type": "application/json" }),
+          },
+          ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+        });
+        const responseBody = await response.text();
+        if (!response.ok) {
+          throw new GmailApiError({
+            message: `Gmail API returned ${response.status}: ${responseBody.slice(0, 500)}`,
+            status: response.status,
+            retryable: response.status === 408 || response.status === 429 || response.status >= 500,
+          });
+        }
+        try {
+          return (responseBody ? JSON.parse(responseBody) : {}) as A;
+        } catch (cause) {
+          throw new GmailApiError({ message: `Gmail API returned invalid JSON: ${String(cause)}`, status: response.status, retryable: false });
+        }
+      },
+      catch: (cause) => cause instanceof GmailApiError
+        ? cause
+        : new GmailApiError({ message: `Gmail API request failed: ${String(cause)}`, status: 0, retryable: true }),
+    });
+
+  return {
+    getProfile: () => request("/users/me/profile"),
+    listMessages: (pageToken) => request("/users/me/messages", { maxResults: 100, pageToken }),
+    getMessage: (id) => request(`/users/me/messages/${encodeURIComponent(id)}`, { format: "full" }),
+    listHistory: (startHistoryId, pageToken) => request("/users/me/history", {
+      startHistoryId,
+      pageToken,
+      maxResults: 100,
+      historyTypes: ["messageAdded", "messageDeleted", "labelAdded", "labelRemoved"],
+    }),
+    listSendAs: () => request<{ sendAs?: ReadonlyArray<GmailSendAs> }>("/users/me/settings/sendAs").pipe(
+      Effect.map((result) => result.sendAs ?? []),
+    ),
+    watch: (topicName) => request("/users/me/watch", {}, { topicName }),
+    sendRaw: (raw) => request("/users/me/messages/send", {}, { raw }),
+  };
+};
