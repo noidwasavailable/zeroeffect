@@ -71,6 +71,7 @@ describe("local account setup", () => {
       registry,
       oauth,
       encryptionKey: new Uint8Array(32).fill(9),
+      redirectUri: "http://127.0.0.1:3000/auth/google/callback",
       accountDataDirectory: workDirectory,
       gmailApiBaseUrl: `${provider.url}gmail/v1`,
       port: 0,
@@ -81,7 +82,12 @@ describe("local account setup", () => {
     expect(page.status).toBe(200);
     expect(await page.text()).toContain("Connect Gmail accounts");
 
-    const start = await fetch(new URL("/auth/google/start?accountId=personal", app.url), { redirect: "manual" });
+    const aliasStart = await fetch(`http://localhost:${app.port}/auth/google/start?accountId=personal`, { redirect: "manual" });
+    expect(aliasStart.status).toBe(302);
+    const canonicalStartUrl = new URL(aliasStart.headers.get("location")!);
+    expect(canonicalStartUrl.hostname).toBe("127.0.0.1");
+    expect(canonicalStartUrl.port).toBe(String(app.port));
+    const start = await fetch(canonicalStartUrl, { redirect: "manual" });
     expect(start.status).toBe(302);
     const authorizationUrl = new URL(start.headers.get("location")!);
     const state = authorizationUrl.searchParams.get("state")!;

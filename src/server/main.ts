@@ -15,6 +15,10 @@ const main = async (): Promise<void> => {
   ) {
     throw new Error("GOOGLE_REDIRECT_URI must be a loopback HTTP URL ending in /auth/google/callback.");
   }
+  const redirectPort = redirectUri.port ? Number(redirectUri.port) : 80;
+  if (config.port === 0 || redirectPort !== config.port) {
+    throw new Error("PORT must match the port in GOOGLE_REDIRECT_URI (PORT=0 is not supported for OAuth callbacks).");
+  }
 
   const registryRuntime = ManagedRuntime.make(RegistryDbLive(process.env.REGISTRY_DB_PATH ?? "./data/registry.sqlite"));
   const registry = await registryRuntime.runPromise(Effect.gen(function* () { return yield* RegistryDb; }));

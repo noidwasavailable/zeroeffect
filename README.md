@@ -6,7 +6,7 @@ ZeroEffect is an in-progress self-hosted Gmail client. The current runnable UI i
 
 ## Connect Gmail accounts locally
 
-1. In Google Cloud Console, enable the Gmail API and create an OAuth 2.0 **Web application** client. Add this exact authorized redirect URI:
+1. In your own Google Cloud project, enable the Gmail API and create an OAuth 2.0 **Web application** client. Under **Google Auth Platform → Branding**, set the app name to **ZeroEffect**. The consent-screen app name comes from this Google Cloud project, not this repository; verify `GOOGLE_CLIENT_ID` belongs to that project (do not reuse an Inbox Zero client). Add this exact authorized redirect URI:
 
    ```text
    http://127.0.0.1:3000/auth/google/callback
@@ -29,7 +29,7 @@ ZeroEffect is an in-progress self-hosted Gmail client. The current runnable UI i
    bun run dev
    ```
 
-4. Open `http://127.0.0.1:3000`, connect Personal and Work, and use **Sync now** to verify Gmail profile access, message hydration/history updates, and Send As alias sync. Data is stored in `./data/registry.sqlite` and separate `./data/accounts/personal.sqlite` / `work.sqlite` files. Stop with `Ctrl+C` when done.
+4. Open `http://127.0.0.1:3000`, connect Personal and Work, and use **Sync now** to verify Gmail profile access, message hydration/history updates, and Send As alias sync. If you open the page as `localhost`, it redirects the UI and OAuth start to the hostname configured in `GOOGLE_REDIRECT_URI`, so the browser's state cookie stays on the callback host. Keep `PORT` aligned with the port in that redirect URI. Data is stored in `./data/registry.sqlite` and separate `./data/accounts/personal.sqlite` / `work.sqlite` files. Stop with `Ctrl+C` when done.
 
 The development server refuses non-loopback binds and the sync endpoint checks same-origin requests. Do not expose this temporary setup UI to a network or put real credentials in source control. The outbound Pub/Sub transport still requires deployment-specific GCP configuration; this screen verifies Gmail sync but does not claim live Pub/Sub delivery.
 

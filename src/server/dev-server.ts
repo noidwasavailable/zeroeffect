@@ -19,6 +19,7 @@ export interface DevServerConfig {
   readonly registry: RegistryDbService;
   readonly oauth: GoogleOAuth2Api;
   readonly encryptionKey: Uint8Array;
+  readonly redirectUri: string;
   readonly accountDataDirectory?: string;
   readonly gmailApiBaseUrl?: string;
   readonly hostname?: string;
@@ -47,6 +48,7 @@ export const createDevServer = (config: DevServerConfig): Bun.Server<unknown> =>
   const hostname = config.hostname ?? "127.0.0.1";
   if (!isLoopback(hostname)) throw new Error("The Gmail development server must bind to localhost or a loopback address.");
   const vault = OAuthTokenVault.fromKey(config.encryptionKey);
+  const callbackHostname = new URL(config.redirectUri).hostname;
   const pendingStates = new Map<string, { readonly accountId: AccountId; readonly createdAt: number }>();
   const html = renderAccountBindingPage();
 
@@ -81,6 +83,19 @@ export const createDevServer = (config: DevServerConfig): Bun.Server<unknown> =>
     port: config.port ?? 3000,
     fetch: async (request) => {
       const url = new URL(request.url);
+      if (
+        request.method === "GET" &&
+        url.hostname !== callbackHostname &&
+        (url.pathname === "/" || url.pathname === "/auth/google/start")
+      ) {
+        const canonicalUrl = new URL(url);
+        canonicalUrl.hostname = callbackHostname;
+        return new Response(null, {
+          status: 302,
+          headers: { Location: canonicalUrl.toString(), "Cache-Control": "no-store" },
+        });
+      }
+
       if (request.method === "GET" && url.pathname === "/") {
         return new Response(html, {
           headers: {
