@@ -21,9 +21,9 @@ This workspace contains local clones of upstream repositories inside `./repos/` 
 Before implementing Effect services, schemas, streams, or layers, search `./repos/effect`:
 
 - **Core Effect, Layers, Context & Fibers:** `./repos/effect/packages/effect/src/`
-  - Look up `Effect.gen`, `Context.Tag`, `Layer.effect`, `Layer.scoped`, `Schedule.exponential`, `Stream.async`, and `Data.TaggedError`.
-- **Schema & Recursive ASTs (`@effect/schema`):** `./repos/effect/packages/schema/src/`
-  - Look up `Schema.suspend` (required for the recursive `FilterExpr` Boolean AST), `Schema.TaggedStruct`, `Schema.decodeUnknown`, and JSON Schema generation for LLM structured outputs.
+  - Look up `Effect.gen`, `Context.Service`, `Layer.effect`, `Effect.acquireRelease`, `Schedule.exponential`, `Stream.async`, and `Data.TaggedError`.
+- **Schema & Recursive ASTs (Effect v4):** `./repos/effect/packages/effect/src/Schema.ts`
+  - Import schemas from `effect/Schema`. Look up `Schema.suspend` (required for the recursive `FilterExpr` Boolean AST), `Schema.TaggedStruct`, `Schema.decodeUnknown`, and JSON Schema generation for LLM structured outputs.
 - **Bun Platform Integration:** `./repos/effect/packages/platform-bun/src/`
 
 ### 1.2 When to Consult `./repos/inbox-zero`
@@ -44,8 +44,8 @@ Before writing Gmail API synchronization, MIME parsing, or LLM prompt constructi
 1. **Everything Side-Effectful is an `Effect`:**
    - All database queries, Gmail HTTP requests, Redis operations, and LLM calls must return `Effect.Effect<A, E, R>`.
    - Never use bare `async/await` or untyped `try/catch` inside `src/server/services/`. Use `Effect.try` or `Effect.tryPromise` at the boundary with a specific `Data.TaggedError`.
-2. **Dependency Injection via `Context.Tag` and `Layer`:**
-   - Every service (`RegistryDb`, `AccountDb`, `RedisQueue`, `BooleanFilter`, `GmailClient`, `PubSubStream`, `LlmProvider`, `AiRuleWorker`) must define a `Context.Tag` and expose both a `Live` layer and a `Test` layer.
+2. **Dependency Injection via `Context.Service` and `Layer`:**
+   - Every service (`RegistryDb`, `AccountDb`, `RedisQueue`, `BooleanFilter`, `GmailClient`, `PubSubStream`, `LlmProvider`, `AiRuleWorker`) must define a `Context.Service` and expose both a `Live` layer and a `Test` layer.
 3. **Exhaustive Domain Errors (`src/shared/errors.ts`):**
    - Define tagged error classes using `Data.TaggedError`:
      - `AccountIsolationError`
@@ -70,7 +70,7 @@ Before writing Gmail API synchronization, MIME parsing, or LLM prompt constructi
 ### 2.4 Dual LLM API Requirement (`/v1/responses` AND `/v1/chat/completions`)
 
 - `LlmProviderService` must support switching between `apiMode: "responses"` and `apiMode: "chat_completions"` per endpoint or per rule.
-- Both modes must enforce structured JSON output matching the `@effect/schema` definition for `LabellingDecision` (`matched`, `labelsToAdd`, `labelsToRemove`, `archive`, `confidence`, `reasoning`).
+- Both modes must enforce structured JSON output matching the Effect Schema definition for `LabellingDecision` (`matched`, `labelsToAdd`, `labelsToRemove`, `archive`, `confidence`, `reasoning`).
 
 ### 2.5 Hybrid UI Requirement (`Cmd+K` + Clickable Buttons + Vim Keys)
 
@@ -157,7 +157,7 @@ zero-effect/
 │   │   └── hooks/
 │   │       └── useVimShortcuts.ts
 │   └── shared/
-│       ├── schemas.ts              # @effect/schema definitions
+│       ├── schemas.ts              # Effect Schema definitions
 │       └── errors.ts               # Data.TaggedError definitions
 ├── tests/
 │   ├── helpers/

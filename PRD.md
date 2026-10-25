@@ -1,7 +1,7 @@
 # Product Requirements Document (PRD): ZeroEffect
 
 **Project Name:** ZeroEffect — Bespoke AI Email Server & Web Client  
-**Runtime & Stack:** Bun (`Bun.serve`, `bun:sqlite`, `Bun.RedisClient`, `bun:test`), Effect-TS (`effect`, `@effect/schema`, `@effect/platform-bun`), React 19, Tailwind CSS, `cmdk`  
+**Runtime & Stack:** Bun (`Bun.serve`, `bun:sqlite`, `Bun.RedisClient`, `bun:test`), Effect-TS (`effect`, `@effect/platform-bun`; schemas from `effect/Schema`), React 19, Tailwind CSS, `cmdk`  
 **Deployment Target:** Local Machine / Homelab exposed privately via Tailscale (`tailscale serve`)  
 **Companion Document:** See `./AGENTS.md` for coding standards, `./repos/` reference lookup rules, and testing enforcement.
 
@@ -36,11 +36,11 @@ Incoming emails are ingested in real time via outbound Google Cloud Pub/Sub stre
 |  +-----------------------------------------------------------------------------+  |
 |                                         | (Typed RPC / REST + SSE Stream)         |
 |  +-----------------------------------------------------------------------------+  |
-|  | EFFECT-TS APPLICATION LAYER (Context.Tag + Layer Dependency Graph)          |  |
+|  | EFFECT-TS APPLICATION LAYER (Context.Service + Layer Dependency Graph)       |  |
 |  |                                                                             |  |
 |  |  +-----------------------+  +-----------------------+  +-----------------+  |  |
 |  |  | AccountSiloService    |  | BooleanFilterService  |  | LlmAiService    |  |  |
-|  |  | Per-account isolated  |  | @effect/schema AST    |  | Dual support:   |  |  |
+|  |  | Per-account isolated  |  | effect/Schema AST    |  | Dual support:   |  |  |
 |  |  | bun:sqlite instances  |  | Recursive AND/OR/NOT  |  | /v1/responses & |  |  |
 |  |  | (personal.db/work.db) |  | SQL + Memory Eval     |  | /chat/comple... |  |  |
 |  |  +-----------------------+  +-----------------------+  +-----------------+  |  |
@@ -215,7 +215,7 @@ CREATE TABLE saved_views (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
     sort_order INTEGER NOT NULL,
-    filter_ast_json TEXT NOT NULL,       -- Serialized @effect/schema FilterExpr
+    filter_ast_json TEXT NOT NULL,       -- Serialized Effect Schema FilterExpr
     dsl_string TEXT NOT NULL             -- e.g., 'is:unread AND (label:"A" OR label:"B")'
 );
 
@@ -258,7 +258,7 @@ CREATE TABLE ai_audit_logs (
 - **Scope:**
   - Workspace setup (`package.json`, `tsconfig.json`, `./repos/` setup script).
   - `RegistryDbService` and `AccountDbService` with isolated SQLite files (`personal` vs `work`).
-  - `BooleanFilterService`: DSL parser (`is:unread AND (label:A OR label:B OR label:C)`), `@effect/schema` AST, SQLite query compiler (`json_each`), and in-memory predicate evaluator.
+  - `BooleanFilterService`: DSL parser (`is:unread AND (label:A OR label:B OR label:C)`), Effect Schema AST, SQLite query compiler (`json_each`), and in-memory predicate evaluator.
 - **🛑 HARD CHECKPOINT 1:**
   - Run `bun test tests/phase1-db-and-filter.test.ts` (verifying 100% SQL-to-memory parity across 15+ nested `AND`/`OR`/`NOT` expressions and strict DB isolation).
   - Run `bun run scripts/cli-filter-demo.ts 'is:unread AND (label:A OR label:B OR label:C)'` to manually inspect generated AST and SQL.
