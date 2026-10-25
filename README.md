@@ -31,7 +31,17 @@ ZeroEffect is an in-progress self-hosted Gmail client. The current runnable UI i
 
 4. Open `http://127.0.0.1:3000`, connect Personal and Work, and use **Sync now** to verify Gmail profile access, message hydration/history updates, and Send As alias sync. If you open the page as `localhost`, it redirects the UI and OAuth start to the hostname configured in `GOOGLE_REDIRECT_URI`, so the browser's state cookie stays on the callback host. Keep `PORT` aligned with the port in that redirect URI. Data is stored in `./data/registry.sqlite` and separate `./data/accounts/personal.sqlite` / `work.sqlite` files. Stop with `Ctrl+C` when done.
 
-The development server refuses non-loopback binds and the sync endpoint checks same-origin requests. Do not expose this temporary setup UI to a network or put real credentials in source control. The outbound Pub/Sub transport still requires deployment-specific GCP configuration; this screen verifies Gmail sync but does not claim live Pub/Sub delivery.
+The development server refuses non-loopback binds and the sync endpoint checks same-origin requests. Do not expose this temporary setup UI to a network or put real credentials in source control.
+
+## Optional GCP Pub/Sub pull binding
+
+The server can open an outbound Google Cloud Pub/Sub StreamingPull connection and enqueue notification payloads in the local Redis list `gmail:notifications`. It uses Google Application Default Credentials (ADC), so credentials remain on this machine. To enable it:
+
+1. In the GCP project used for Gmail, enable the Pub/Sub API, create a topic and a pull subscription, and grant the Gmail push service account `gmail-api-push@system.gserviceaccount.com` permission to publish to the topic. Grant the identity used by ADC `roles/pubsub.subscriber` on the subscription.
+2. Set `GCP_PROJECT_ID` and `GMAIL_PUBSUB_SUBSCRIPTION` in `.env` (the subscription's short ID, not its full resource path). Set `REDIS_URL` if Redis is not listening at the default `redis://127.0.0.1:6379`. Authenticate the local ADC identity with your usual Google Cloud tooling, for example `gcloud auth application-default login`, then start `bun run dev`.
+3. Gmail notifications are only published while a Gmail `users.watch` is active for the topic. This development server does not yet create or renew Gmail watches, and the notification queue does not yet trigger account history sync by itself. A successful Gmail sync or mocked StreamingPull test is therefore not evidence of live Pub/Sub delivery. Keep the server loopback-only; verify a real notification in your own GCP setup before relying on this binding.
+
+The listener enqueues each Pub/Sub notification before acknowledging it, so Redis enqueue failures leave messages unacknowledged for redelivery. Automatic labeling is not part of this Phase 2 binding.
 
 ## Checks
 

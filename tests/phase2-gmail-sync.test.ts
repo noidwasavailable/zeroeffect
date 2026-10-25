@@ -461,4 +461,22 @@ describe("Phase 2: Gmail sync, aliases and Pub/Sub", () => {
     expect(JSON.parse(queued.data)).toEqual({ emailAddress: "me@example.com", historyId: "h2" });
     expect(events[1]).toBe("ack");
   });
+
+  test("does not acknowledge a Pub/Sub message when Redis enqueue fails", async () => {
+    let acknowledged = false;
+    const delivery: PubSubDelivery = {
+      messageId: "gcp-retry",
+      data: Buffer.from("{}", "utf8").toString("base64"),
+      ack: async () => { acknowledged = true; },
+    };
+    const queueApi = {
+      enqueue: (): Effect.Effect<void, RedisQueueError> => Effect.fail(new RedisQueueError({ message: "Redis unavailable." })),
+    };
+    const transport = { streamingPull: async function* () { yield delivery; } };
+    const layer = Layer.provide(PubSubListenerServiceLive(transport), Layer.succeed(RedisQueueService, queueApi));
+    const listener = Effect.runSync(Effect.gen(function* () { return yield* PubSubListenerService; }).pipe(Effect.provide(layer)));
+
+    await expect(Effect.runPromise(listener.listen("gmail-updates"))).rejects.toBeInstanceOf(RedisQueueError);
+    expect(acknowledged).toBe(false);
+  });
 });
