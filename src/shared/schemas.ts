@@ -66,3 +66,21 @@ export interface LlmEndpointRecord {
   readonly timeoutMs?: number;
   readonly maxConcurrency?: number;
 }
+
+export interface LabellingDecision {
+  readonly matched: boolean;
+  readonly labelsToAdd: ReadonlyArray<string>;
+  readonly labelsToRemove: ReadonlyArray<string>;
+  readonly archive: boolean;
+  readonly confidence: number;
+  readonly reasoning: string;
+}
+
+export const LabellingDecisionSchema: Schema.Codec<LabellingDecision> = Schema.Struct({
+  matched: Schema.Boolean,
+  labelsToAdd: Schema.Array(Schema.String),
+  labelsToRemove: Schema.Array(Schema.String),
+  archive: Schema.Boolean,
+  confidence: Schema.Number,
+  reasoning: Schema.String,
+});

@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { Context, Effect, Layer } from "effect";
 import { Database } from "bun:sqlite";
 import { AccountIsolationError, DatabaseError } from "../../shared/errors";
-import type { FilterThread } from "../../shared/schemas";
+import type { FilterExpr, FilterThread } from "../../shared/schemas";
 import type { CompiledFilter } from "./BooleanFilter";
 
 export interface ThreadRecord extends FilterThread {
@@ -37,6 +37,53 @@ export interface MessageRecord {
   readonly rawHeaders: Readonly<Record<string, string>>;
 }
 
+export interface AiRuleRecord {
+  readonly id: string;
+  readonly name: string;
+  readonly priority: number;
+  readonly dryRun: boolean;
+  readonly minConfidence: number;
+  readonly precondition: FilterExpr;
+  readonly systemPrompt: string;
+  readonly actions: unknown;
+  readonly llmEndpointId: string;
+  readonly apiModeOverride: "responses" | "chat_completions" | null;
+}
+
+export interface AiThreadContext {
+  readonly thread: FilterThread;
+  readonly subject: string;
+  readonly snippet: string;
+  readonly ghostLabels: ReadonlyArray<string>;
+  readonly messages: ReadonlyArray<Pick<MessageRecord, "id" | "fromAddress" | "bodyMarkdown">>;
+}
+
+export interface AiAppliedAction {
+  readonly labelsBefore: ReadonlyArray<string>;
+  readonly labelsAdded: ReadonlyArray<string>;
+  readonly labelsRemoved: ReadonlyArray<string>;
+  readonly archivedBefore: boolean;
+  readonly archivedAfter: boolean;
+  readonly ghostLabelsBefore: ReadonlyArray<string>;
+  readonly ghostLabelsAfter: ReadonlyArray<string>;
+  readonly dryRun: boolean;
+  readonly gmailMessageIds: ReadonlyArray<string>;
+}
+
+export interface AiAuditRecord {
+  readonly id: string;
+  readonly threadId: string;
+  readonly ruleId: string | null;
+  readonly endpointId: string;
+  readonly apiModeUsed: "responses" | "chat_completions";
+  readonly modelUsed: string;
+  readonly confidence: number;
+  readonly reasoning: string;
+  readonly actionsApplied: AiAppliedAction;
+  readonly latencyMs: number;
+  readonly createdAt: number;
+}
+
 export interface AccountDbService {
   readonly accountId: string;
   readonly upsertThread: (thread: ThreadRecord) => Effect.Effect<void, DatabaseError>;
@@ -50,6 +97,12 @@ export interface AccountDbService {
   readonly listSendAsAliases: () => Effect.Effect<ReadonlyArray<SendAsAliasRecord>, DatabaseError>;
   readonly getHistoryId: () => Effect.Effect<string | null, DatabaseError>;
   readonly setHistoryId: (historyId: string) => Effect.Effect<void, DatabaseError>;
+  readonly listEnabledAiRules: () => Effect.Effect<ReadonlyArray<AiRuleRecord>, DatabaseError>;
+  readonly getAiThreadContext: (id: string) => Effect.Effect<AiThreadContext | null, DatabaseError>;
+  readonly updateAiThread: (id: string, update: { readonly labels: ReadonlyArray<string>; readonly ghostLabels: ReadonlyArray<string>; readonly isArchived: boolean; readonly aiStatus: "processed" | "skipped" | "error" }) => Effect.Effect<void, DatabaseError>;
+  readonly insertAiAudit: (audit: AiAuditRecord) => Effect.Effect<void, DatabaseError>;
+  readonly getLatestUndoableAiAudit: () => Effect.Effect<AiAuditRecord | null, DatabaseError>;
+  readonly markAiAuditReverted: (id: string) => Effect.Effect<void, DatabaseError>;
 }
 
 export class AccountDb extends Context.Service<AccountDb, AccountDbService>()(
@@ -377,6 +430,108 @@ const makeService = (accountId: string, database: Database): AccountDbService =>
         ON CONFLICT(id) DO UPDATE SET history_id = excluded.history_id
       `).run(historyId),
       catch: (cause) => new DatabaseError({ message: "Failed to save Gmail history cursor.", operation: "setHistoryId", cause }),
+    }).pipe(Effect.asVoid),
+  listEnabledAiRules: () =>
+    Effect.try({
+      try: () => (database.prepare(`
+        SELECT id, name, priority, dry_run AS dryRun, min_confidence AS minConfidence,
+          precondition_ast_json AS preconditionJson, system_prompt AS systemPrompt,
+          actions_json AS actionsJson, llm_endpoint_id AS llmEndpointId,
+          api_mode_override AS apiModeOverride
+        FROM ai_rules WHERE enabled = 1 ORDER BY priority ASC, id ASC
+      `).all() as Array<{
+        id: string; name: string; priority: number; dryRun: number; minConfidence: number;
+        preconditionJson: string; systemPrompt: string; actionsJson: string;
+        llmEndpointId: string; apiModeOverride: "responses" | "chat_completions" | null;
+      }>).map((row) => ({
+        id: row.id,
+        name: row.name,
+        priority: row.priority,
+        dryRun: row.dryRun === 1,
+        minConfidence: row.minConfidence,
+        precondition: JSON.parse(row.preconditionJson) as FilterExpr,
+        systemPrompt: row.systemPrompt,
+        actions: JSON.parse(row.actionsJson) as unknown,
+        llmEndpointId: row.llmEndpointId,
+        apiModeOverride: row.apiModeOverride,
+      })),
+      catch: (cause) => new DatabaseError({ message: "Failed to load AI rules.", operation: "listEnabledAiRules", cause }),
+    }),
+  getAiThreadContext: (id) =>
+    Effect.try({
+      try: () => {
+        const row = database.prepare("SELECT * FROM threads WHERE id = ?").get(id) as ThreadRow | null;
+        if (!row) return null;
+        const messages = database.prepare(`
+          SELECT id, from_address AS fromAddress, body_markdown AS bodyMarkdown
+          FROM messages WHERE thread_id = ? ORDER BY date_ts ASC, id ASC
+        `).all(id) as Array<{ id: string; fromAddress: string; bodyMarkdown: string }>;
+        return {
+          thread: toFilterThread(row),
+          subject: row.subject,
+          snippet: row.snippet,
+          ghostLabels: JSON.parse(row.ghost_labels_json) as string[],
+          messages,
+        };
+      },
+      catch: (cause) => new DatabaseError({ message: "Failed to load AI thread context.", operation: "getAiThreadContext", cause }),
+    }),
+  updateAiThread: (id, update) =>
+    Effect.try({
+      try: () => database.prepare(`
+        UPDATE threads SET labels_json = ?, ghost_labels_json = ?, is_archived = ?, ai_status = ?
+        WHERE id = ?
+      `).run(JSON.stringify(update.labels), JSON.stringify(update.ghostLabels), Number(update.isArchived), update.aiStatus, id),
+      catch: (cause) => new DatabaseError({ message: "Failed to update AI thread state.", operation: "updateAiThread", cause }),
+    }).pipe(Effect.asVoid),
+  insertAiAudit: (audit) =>
+    Effect.try({
+      try: () => database.prepare(`
+        INSERT INTO ai_audit_logs (
+          id, thread_id, rule_id, endpoint_id, api_mode_used, model_used, confidence,
+          reasoning, actions_applied_json, reverted, latency_ms, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+      `).run(
+        audit.id, audit.threadId, audit.ruleId, audit.endpointId, audit.apiModeUsed,
+        audit.modelUsed, audit.confidence, audit.reasoning, JSON.stringify(audit.actionsApplied),
+        audit.latencyMs, audit.createdAt,
+      ),
+      catch: (cause) => new DatabaseError({ message: "Failed to write AI audit log.", operation: "insertAiAudit", cause }),
+    }).pipe(Effect.asVoid),
+  getLatestUndoableAiAudit: () =>
+    Effect.try({
+      try: () => {
+        const row = database.prepare(`
+          SELECT id, thread_id AS threadId, rule_id AS ruleId, endpoint_id AS endpointId,
+            api_mode_used AS apiModeUsed, model_used AS modelUsed, confidence, reasoning,
+            actions_applied_json AS actionsJson, latency_ms AS latencyMs, created_at AS createdAt
+          FROM ai_audit_logs WHERE reverted = 0 ORDER BY created_at DESC, rowid DESC LIMIT 1
+        `).get() as {
+          id: string; threadId: string; ruleId: string | null; endpointId: string;
+          apiModeUsed: "responses" | "chat_completions"; modelUsed: string; confidence: number;
+          reasoning: string; actionsJson: string; latencyMs: number; createdAt: number;
+        } | null;
+        if (!row) return null;
+        return {
+          id: row.id,
+          threadId: row.threadId,
+          ruleId: row.ruleId,
+          endpointId: row.endpointId,
+          apiModeUsed: row.apiModeUsed,
+          modelUsed: row.modelUsed,
+          confidence: row.confidence,
+          reasoning: row.reasoning,
+          actionsApplied: JSON.parse(row.actionsJson) as AiAppliedAction,
+          latencyMs: row.latencyMs,
+          createdAt: row.createdAt,
+        };
+      },
+      catch: (cause) => new DatabaseError({ message: "Failed to load undoable AI audit log.", operation: "getLatestUndoableAiAudit", cause }),
+    }),
+  markAiAuditReverted: (id) =>
+    Effect.try({
+      try: () => database.prepare("UPDATE ai_audit_logs SET reverted = 1 WHERE id = ? AND reverted = 0").run(id),
+      catch: (cause) => new DatabaseError({ message: "Failed to mark AI audit log as reverted.", operation: "markAiAuditReverted", cause }),
     }).pipe(Effect.asVoid),
 });
 

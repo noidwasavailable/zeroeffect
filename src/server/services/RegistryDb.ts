@@ -13,6 +13,7 @@ export interface RegistryDbService {
   readonly getServiceCredential: (id: string) => Effect.Effect<Uint8Array | null, DatabaseError>;
   readonly deleteServiceCredential: (id: string) => Effect.Effect<void, DatabaseError>;
   readonly upsertLlmEndpoint: (endpoint: LlmEndpointRecord) => Effect.Effect<void, DatabaseError>;
+  readonly getLlmEndpoint: (id: string) => Effect.Effect<LlmEndpointRecord | null, DatabaseError>;
 }
 
 export class RegistryDb extends Context.Service<RegistryDb, RegistryDbService>()(
@@ -157,6 +158,16 @@ const makeService = (database: Database): RegistryDbService => ({
       },
       catch: (cause) => new DatabaseError({ message: "Failed to save LLM endpoint.", operation: "upsertLlmEndpoint", cause }),
     }).pipe(Effect.asVoid),
+  getLlmEndpoint: (id) =>
+    Effect.try({
+      try: () => database.prepare(`
+        SELECT id, name, base_url AS baseUrl, api_key_enc AS apiKeyEnc,
+          model_id AS modelId, api_mode AS apiMode, timeout_ms AS timeoutMs,
+          max_concurrency AS maxConcurrency
+        FROM llm_endpoints WHERE id = ?
+      `).get(id) as LlmEndpointRecord | null,
+      catch: (cause) => new DatabaseError({ message: "Failed to load LLM endpoint.", operation: "getLlmEndpoint", cause }),
+    }),
 });
 
 export const RegistryDbLive = (path = "./data/registry.sqlite"): Layer.Layer<RegistryDb, DatabaseError> =>

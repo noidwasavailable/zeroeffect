@@ -76,6 +76,7 @@ describe("Phase 2: Gmail sync, aliases and Pub/Sub", () => {
       },
       listSendAs: () => Effect.succeed([{ sendAsEmail: "alias@example.com", displayName: "Alias", isDefault: true, isPrimary: false, verificationStatus: "accepted" }]),
       watch: (topicName) => Effect.succeed({ historyId: `watch-${topicName}`, expiration: "1710000000000" }),
+      modifyMessage: () => Effect.void,
       sendRaw: () => Effect.succeed({ id: "sent", threadId: "thread-sent" }),
     };
     const gmailLayer = Layer.succeed(GmailClient, gmail);
@@ -126,6 +127,7 @@ describe("Phase 2: Gmail sync, aliases and Pub/Sub", () => {
       listHistory: () => Effect.succeed({ historyId: "initial-history", history: [] }),
       listSendAs: () => Effect.succeed([]),
       watch: () => Effect.succeed({ historyId: "initial-history", expiration: "1710000000000" }),
+      modifyMessage: () => Effect.void,
       sendRaw: () => Effect.succeed({ id: "sent", threadId: "sent" }),
     };
     const layer = Layer.provide(GmailSyncServiceLive, Layer.merge(accountLayer, Layer.succeed(GmailClient, gmail)));
@@ -189,6 +191,7 @@ describe("Phase 2: Gmail sync, aliases and Pub/Sub", () => {
       listHistory: () => Effect.fail({} as never),
       listSendAs: () => Effect.succeed([]),
       watch: () => Effect.succeed({ historyId: "initial-history", expiration: "1710000000000" }),
+      modifyMessage: () => Effect.void,
       sendRaw: () => Effect.succeed({ id: "sent", threadId: "sent" }),
     };
     const layer = Layer.provide(GmailSyncServiceLive, Layer.merge(accountLayer, Layer.succeed(GmailClient, gmail)));
@@ -244,6 +247,7 @@ describe("Phase 2: Gmail sync, aliases and Pub/Sub", () => {
       listHistory: () => Effect.succeed({ historyId: "initial-history", history: [] }),
       listSendAs: () => Effect.succeed([]),
       watch: () => Effect.succeed({ historyId: "initial-history", expiration: "1710000000000" }),
+      modifyMessage: () => Effect.void,
       sendRaw: () => Effect.succeed({ id: "sent", threadId: "sent" }),
     };
     const layer = Layer.provide(GmailSyncServiceLive, Layer.merge(accountLayer, Layer.succeed(GmailClient, gmail)));
@@ -275,6 +279,7 @@ describe("Phase 2: Gmail sync, aliases and Pub/Sub", () => {
       listHistory: () => Effect.fail(new GmailApiError({ message: "gone", status: 404, retryable: false })),
       listSendAs: () => Effect.succeed([]),
       watch: () => Effect.succeed({ historyId: "fresh", expiration: "1710000000000" }),
+      modifyMessage: () => Effect.void,
       sendRaw: () => Effect.succeed({ id: "sent", threadId: "sent" }),
     };
     const layer = Layer.provide(GmailSyncServiceLive, Layer.merge(accountLayer, Layer.succeed(GmailClient, gmail)));
@@ -437,6 +442,7 @@ describe("Phase 2: Gmail sync, aliases and Pub/Sub", () => {
       getMessage: () => Effect.fail({} as never), listThreads: () => Effect.fail({} as never),
       getThread: () => Effect.fail({} as never), listHistory: () => Effect.fail({} as never),
       listSendAs: () => Effect.succeed([]), watch: () => Effect.succeed({ historyId: "h1", expiration: "1710000000000" }),
+      modifyMessage: () => Effect.void,
       sendRaw: () => Effect.succeed({ id: "sent", threadId: "t1" }),
     } satisfies GmailClientService);
     const layer = Layer.provide(SendAsComposerServiceLive, Layer.merge(accountLayer, gmailLayer));

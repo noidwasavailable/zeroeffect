@@ -66,6 +66,7 @@ export interface GmailClientService {
   readonly listSendAs: () => Effect.Effect<ReadonlyArray<GmailSendAs>, GmailApiError>;
   readonly watch: (topicName: string) => Effect.Effect<GmailWatchResponse, GmailApiError>;
   readonly sendRaw: (raw: string) => Effect.Effect<{ readonly id: string; readonly threadId: string }, GmailApiError>;
+  readonly modifyMessage: (id: string, addLabelIds: ReadonlyArray<string>, removeLabelIds: ReadonlyArray<string>) => Effect.Effect<void, GmailApiError>;
 }
 
 export class GmailClient extends Context.Service<GmailClient, GmailClientService>()(
@@ -176,5 +177,10 @@ const makeClient = (config: GmailClientConfig): GmailClientService => {
     ),
     watch: (topicName) => request("/users/me/watch", {}, { topicName }),
     sendRaw: (raw) => request("/users/me/messages/send", {}, { raw }),
+    modifyMessage: (id, addLabelIds, removeLabelIds) => request(
+      `/users/me/messages/${encodeURIComponent(id)}/modify`,
+      {},
+      { addLabelIds, removeLabelIds },
+    ).pipe(Effect.asVoid),
   };
 };
