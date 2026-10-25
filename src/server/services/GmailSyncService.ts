@@ -194,7 +194,9 @@ export const GmailSyncServiceLive: Layer.Layer<GmailSyncService, never, AccountD
         yield* Effect.logInfo(`Gmail incremental sync completed for ${accountDb.accountId}: ${messagesUpserted} upserted, ${messagesDeleted} deleted`);
         return { mode: "incremental" as const, messagesUpserted, messagesDeleted };
       }).pipe(Effect.tapError((error) => Effect.logError(
-        `Gmail sync failed for ${accountDb.accountId}: ${error._tag}${error._tag === "GmailApiError" ? ` (HTTP ${error.status}, retryable=${error.retryable})` : ` (${error.operation})`}`,
+        error._tag === "GmailApiError"
+          ? `Gmail sync failed for ${accountDb.accountId}: HTTP ${error.status}${error.reason ? `, reason=${error.reason}` : ""}${error.apiStatus ? `, status=${error.apiStatus}` : ""}${error.operation ? `, operation=${error.operation}` : ""}, retryable=${error.retryable}`
+          : `Gmail sync failed for ${accountDb.accountId}: ${error._tag} (${error.operation})`,
       )));
 
       return { sync, syncAliases: () => syncAliases, watch: (topicName) => gmail.watch(topicName) };

@@ -15,6 +15,9 @@ export class GmailApiError extends Data.TaggedError("GmailApiError")<{
   readonly message: string;
   readonly status: number;
   readonly retryable: boolean;
+  readonly reason?: string;
+  readonly apiStatus?: string;
+  readonly operation?: string;
 }> {}
 
 export class LlmEndpointError extends Data.TaggedError("LlmEndpointError")<{

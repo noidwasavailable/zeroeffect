@@ -6,6 +6,7 @@ import { GmailSyncService, GmailSyncServiceLive } from "./services/GmailSyncServ
 import type { GoogleOAuth2Api, GoogleOAuthTokens } from "./services/GoogleOAuth2";
 import { OAuthTokenVault } from "./services/OAuthTokenVault";
 import { renderAccountBindingPage } from "../client/auth-page";
+import { GmailApiError } from "../shared/errors";
 
 const ACCOUNT_IDS = ["personal", "work"] as const;
 type AccountId = (typeof ACCOUNT_IDS)[number];
@@ -65,6 +66,30 @@ const escapeHtml = (value: string): string => value
 const isLoopback = (hostname: string): boolean =>
   hostname === "127.0.0.1" || hostname === "::1" || hostname === "localhost";
 
+const syncJobErrorMessage = (error: unknown, conversationsSaved: number): string => {
+  const saved = `${conversationsSaved} complete conversation${conversationsSaved === 1 ? "" : "s"} saved before the failure.`;
+  if (!(error instanceof GmailApiError) || error.status !== 403) {
+    return `Gmail sync failed. ${saved} Check the local server logs for details.`;
+  }
+  if (error.reason === "userRateLimitExceeded" || error.reason === "rateLimitExceeded") {
+    return `Google temporarily rate-limited this Gmail request. ${saved} Try again shortly.`;
+  }
+  if (error.reason === "insufficientPermissions") {
+    return `Google denied the Gmail permission. Reconnect this account to refresh its authorization. ${saved}`;
+  }
+  if (error.reason === "accessNotConfigured") {
+    return `The Gmail API is not enabled for this Google Cloud project. ${saved}`;
+  }
+  if (error.reason === "dailyLimitExceeded" || error.reason === "quotaExceeded") {
+    return `The Gmail API quota is exhausted. Wait for the quota to reset or review the project's Gmail API quota. ${saved}`;
+  }
+  if (error.reason === "domainPolicy") {
+    return `Your Google Workspace administrator blocks this Gmail request. ${saved}`;
+  }
+  const reason = error.reason ? ` (${error.reason})` : "";
+  return `Google rejected a Gmail request (HTTP 403${reason}). ${saved} Check the local server logs for the affected API operation.`;
+};
+
 const runSyncJob = async (
   job: SyncJob,
   work: () => Promise<SyncJob["result"]>,
@@ -82,9 +107,9 @@ const runSyncJob = async (
       conversationsTotal: result?.mode === "initial" ? job.progress.conversationsCompleted : 0,
       messagesUpserted: result?.messagesUpserted ?? 0,
     };
-  } catch {
+  } catch (error) {
     job.status = "failed";
-    job.error = "Gmail sync failed. Check the local server logs for details.";
+    job.error = syncJobErrorMessage(error, job.progress.conversationsCompleted);
   }
   job.updatedAt = Date.now();
 };

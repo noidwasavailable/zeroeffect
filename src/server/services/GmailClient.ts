@@ -83,6 +83,42 @@ export const GmailClientLive = (config: GmailClientConfig): Layer.Layer<GmailCli
 
 export const GmailClientTest = GmailClientLive;
 
+const safeIdentifier = (value: unknown): string | undefined =>
+  typeof value === "string" && /^[A-Za-z][A-Za-z0-9_.-]{0,79}$/.test(value) ? value : undefined;
+
+const parseGoogleErrorDetails = (body: string): { readonly reason?: string; readonly apiStatus?: string } => {
+  try {
+    const parsed: unknown = JSON.parse(body);
+    if (typeof parsed !== "object" || parsed === null || !("error" in parsed)) return {};
+    const error = parsed.error;
+    if (typeof error !== "object" || error === null) return {};
+    const errors = "errors" in error && Array.isArray(error.errors) ? error.errors : [];
+    const firstError = errors.find((item: unknown) => typeof item === "object" && item !== null && "reason" in item);
+    const reason = typeof firstError === "object" && firstError !== null && "reason" in firstError
+      ? safeIdentifier(firstError.reason)
+      : undefined;
+    const apiStatus = "status" in error ? safeIdentifier(error.status) : undefined;
+    return { ...(reason ? { reason } : {}), ...(apiStatus ? { apiStatus } : {}) };
+  } catch {
+    return {};
+  }
+};
+
+const describeOperation = (method: string, path: string): string =>
+  `${method} ${path.replace(/\/threads\/[^/]+/g, "/threads/{threadId}").replace(/\/messages\/[^/]+/g, "/messages/{messageId}")}`;
+
+const retryDelay = (retryAfter: string | null, attempt: number): number => {
+  if (retryAfter !== null) {
+    const seconds = Number(retryAfter);
+    const requestedDelay = Number.isFinite(seconds) ? seconds * 1000 : Date.parse(retryAfter) - Date.now();
+    if (Number.isFinite(requestedDelay) && requestedDelay >= 0) return Math.min(requestedDelay, 5_000);
+  }
+  return Math.min(250 * 2 ** attempt, 2_000);
+};
+
+const delay = (milliseconds: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, milliseconds));
+
 const makeClient = (config: GmailClientConfig): GmailClientService => {
   const apiBaseUrl = (config.apiBaseUrl ?? "https://gmail.googleapis.com/gmail/v1").replace(/\/$/, "");
   const fetcher = config.fetch ?? globalThis.fetch;
@@ -94,26 +130,43 @@ const makeClient = (config: GmailClientConfig): GmailClientService => {
           if (Array.isArray(value)) for (const item of value) url.searchParams.append(key, item);
           else if (value !== undefined) url.searchParams.set(key, String(value));
         }
-        const response = await fetcher(url, {
-          method: body === undefined ? "GET" : "POST",
-          headers: {
-            Authorization: `Bearer ${config.accessToken}`,
-            ...(body === undefined ? {} : { "Content-Type": "application/json" }),
-          },
-          ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-        });
-        const responseBody = await response.text();
-        if (!response.ok) {
-          throw new GmailApiError({
-            message: `Gmail API returned ${response.status}: ${responseBody.slice(0, 500)}`,
-            status: response.status,
-            retryable: response.status === 408 || response.status === 429 || response.status >= 500,
+        const method = body === undefined ? "GET" : "POST";
+        const operation = describeOperation(method, path);
+        for (let attempt = 0; ; attempt++) {
+          const response = await fetcher(url, {
+            method,
+            headers: {
+              Authorization: `Bearer ${config.accessToken}`,
+              ...(body === undefined ? {} : { "Content-Type": "application/json" }),
+            },
+            ...(body === undefined ? {} : { body: JSON.stringify(body) }),
           });
-        }
-        try {
-          return (responseBody ? JSON.parse(responseBody) : {}) as A;
-        } catch (cause) {
-          throw new GmailApiError({ message: `Gmail API returned invalid JSON: ${String(cause)}`, status: response.status, retryable: false });
+          const responseBody = await response.text();
+          if (!response.ok) {
+            const details = parseGoogleErrorDetails(responseBody);
+            const rateLimited = response.status === 403
+              && (details.reason === "rateLimitExceeded" || details.reason === "userRateLimitExceeded");
+            const error = new GmailApiError({
+              message: `Gmail API returned HTTP ${response.status}${details.reason ? ` (${details.reason})` : ""}.`,
+              status: response.status,
+              retryable: response.status === 408 || response.status === 429 || response.status >= 500 || rateLimited,
+              ...details,
+              operation,
+            });
+            // Gmail documents these 403 reasons as quota/rate-limit responses that
+            // should use exponential backoff. Other 403s need different fixes and
+            // must not be retried as though they were transient.
+            if (rateLimited && attempt < 3) {
+              await delay(retryDelay(response.headers.get("Retry-After"), attempt));
+              continue;
+            }
+            throw error;
+          }
+          try {
+            return (responseBody ? JSON.parse(responseBody) : {}) as A;
+          } catch {
+            throw new GmailApiError({ message: "Gmail API returned invalid JSON.", status: response.status, retryable: false, operation });
+          }
         }
       },
       catch: (cause) => cause instanceof GmailApiError

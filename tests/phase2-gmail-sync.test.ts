@@ -21,7 +21,7 @@ const makeAccountDb = () => {
   closeables.push(database);
   const layer = AccountDbTest("personal", database);
   const service = Effect.runSync(Effect.gen(function* () { return yield* AccountDb; }).pipe(Effect.provide(layer)));
-  return { layer, service };
+  return { layer, service, database };
 };
 
 const mockMessage = (id: string, threadId = `thread-${id}`, labels = ["INBOX", "UNREAD"]): GmailMessage => ({
@@ -150,6 +150,45 @@ describe("Phase 2: Gmail sync, aliases and Pub/Sub", () => {
     expect(await Effect.runPromise(accountDb.getThread("t3"))).toBeNull();
   });
 
+  test("keeps each successfully hydrated conversation when a later thread request fails", async () => {
+    const { layer: accountLayer, service: accountDb, database } = makeAccountDb();
+    const gmail: GmailClientService = {
+      getProfile: () => Effect.succeed({ emailAddress: "me@example.com", historyId: "initial-history" }),
+      listMessages: () => Effect.succeed({ messages: [] }),
+      getMessage: () => Effect.fail({} as never),
+      listThreads: () => Effect.succeed({ threads: [{ id: "t1" }, { id: "t2" }] }),
+      getThread: (id) => id === "t1"
+        ? Effect.succeed({ id, messages: [mockMessage("m1", id)] })
+        : Effect.fail(new GmailApiError({
+          message: "Gmail API returned HTTP 403 (userRateLimitExceeded).",
+          status: 403,
+          retryable: true,
+          reason: "userRateLimitExceeded",
+          apiStatus: "PERMISSION_DENIED",
+          operation: "GET /users/me/threads/{threadId}",
+        })),
+      listHistory: () => Effect.succeed({ historyId: "initial-history", history: [] }),
+      listSendAs: () => Effect.succeed([]),
+      watch: () => Effect.succeed({ historyId: "initial-history", expiration: "1710000000000" }),
+      sendRaw: () => Effect.succeed({ id: "sent", threadId: "sent" }),
+    };
+    const layer = Layer.provide(GmailSyncServiceLive, Layer.merge(accountLayer, Layer.succeed(GmailClient, gmail)));
+    const service = Effect.runSync(Effect.gen(function* () { return yield* GmailSyncService; }).pipe(Effect.provide(layer)));
+    const progress: Array<{ conversationsCompleted: number; messagesUpserted: number }> = [];
+
+    const exit = await Effect.runPromiseExit(service.sync({
+      initialConversationLimit: 2,
+      onProgress: ({ conversationsCompleted, messagesUpserted }) => progress.push({ conversationsCompleted, messagesUpserted }),
+    }));
+
+    expect(exit._tag).toBe("Failure");
+    expect(await Effect.runPromise(accountDb.getThread("t1"))).not.toBeNull();
+    expect(await Effect.runPromise(accountDb.getThread("t2"))).toBeNull();
+    expect(database.prepare("SELECT COUNT(*) AS count FROM messages").get()).toEqual({ count: 1 });
+    expect(await Effect.runPromise(accountDb.getHistoryId())).toBeNull();
+    expect(progress.at(-1)).toEqual({ conversationsCompleted: 1, messagesUpserted: 1 });
+  });
+
   test("recovers expired Gmail history cursors by rehydrating", async () => {
     const { layer: accountLayer, service: accountDb } = makeAccountDb();
     await Effect.runPromise(accountDb.setHistoryId("expired"));
@@ -222,6 +261,66 @@ describe("Phase 2: Gmail sync, aliases and Pub/Sub", () => {
     expect(requests[1]?.url).toContain("/users/me/watch");
     expect(requests[2]?.url).toContain("/users/me/threads?maxResults=25");
     expect(requests[3]?.url).toContain("/users/me/threads/t1?format=full");
+  });
+
+  test("parses safe Gmail 403 details and retries only rate-limited requests", async () => {
+    let rateLimitCalls = 0;
+    const rateLimitedClientLayer = GmailClientLive({
+      accessToken: "access-token",
+      apiBaseUrl: "http://gmail.test/gmail/v1",
+      fetch: async () => {
+        rateLimitCalls++;
+        if (rateLimitCalls === 1) {
+          return Response.json({
+            error: {
+              code: 403,
+              message: "private server detail that must not be surfaced",
+              status: "PERMISSION_DENIED",
+              errors: [{ reason: "userRateLimitExceeded" }],
+            },
+          }, { status: 403, headers: { "Retry-After": "0" } });
+        }
+        return Response.json({ id: "t1", messages: [] });
+      },
+    });
+    const rateLimitedClient = Effect.runSync(Effect.gen(function* () { return yield* GmailClient; }).pipe(Effect.provide(rateLimitedClientLayer)));
+    expect(await Effect.runPromise(rateLimitedClient.getThread("t1"))).toMatchObject({ id: "t1" });
+    expect(rateLimitCalls).toBe(2);
+
+    let forbiddenCalls = 0;
+    const forbiddenClientLayer = GmailClientLive({
+      accessToken: "access-token",
+      apiBaseUrl: "http://gmail.test/gmail/v1",
+      fetch: async () => {
+        forbiddenCalls++;
+        return Response.json({
+          error: {
+            code: 403,
+            message: "private server detail that must not be surfaced",
+            status: "PERMISSION_DENIED",
+            errors: [{ reason: "insufficientPermissions" }],
+          },
+        }, { status: 403 });
+      },
+    });
+    const forbiddenClient = Effect.runSync(Effect.gen(function* () { return yield* GmailClient; }).pipe(Effect.provide(forbiddenClientLayer)));
+    const result = await Effect.runPromise(forbiddenClient.getThread("sensitive-thread-id").pipe(
+      Effect.map((thread) => ({ _tag: "success" as const, thread })),
+      Effect.catchIf(() => true, (error) => Effect.succeed({ _tag: "error" as const, error })),
+    ));
+    expect(result._tag).toBe("error");
+    if (result._tag === "error") {
+      expect(result.error).toMatchObject({
+        status: 403,
+        retryable: false,
+        reason: "insufficientPermissions",
+        apiStatus: "PERMISSION_DENIED",
+        operation: "GET /users/me/threads/{threadId}",
+      });
+      expect(result.error.message).not.toContain("private server detail");
+      expect(result.error.operation).not.toContain("sensitive-thread-id");
+    }
+    expect(forbiddenCalls).toBe(1);
   });
 
   test("selects the matching Delivered-To alias and creates Gmail raw RFC 2822 data", async () => {
