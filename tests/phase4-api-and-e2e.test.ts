@@ -17,9 +17,11 @@ import {
   TOOLBAR_ACTION_IDS,
   type ActionContext,
 } from "../src/client/actions";
+import { appendChild, fromBuilder, newCondition, removeNode, toBuilder, updateNode } from "../src/client/filterBuilderModel";
 import { parseRoute, routePath } from "../src/client/router";
 import { LOCAL_REQUEST_HEADER, type AccountId, type ThreadDetail, type ThreadPage, type ThreadSummary } from "../src/shared/api";
 import { formatFilterExpr } from "../src/shared/filterDsl";
+import { parseFilterDsl } from "../src/shared/filterParser";
 import type { FilterExpr } from "../src/shared/schemas";
 import { applyThreadAction } from "../src/shared/threadActions";
 import { BUILT_IN_VIEWS } from "../src/shared/views";
@@ -66,6 +68,48 @@ describe("Phase 4: shared filter DSL formatting", () => {
   });
 });
 
+describe("Phase 4: shared parser and visual filter builder", () => {
+  test("the browser-side parser reports the same errors and offsets as BooleanFilter", () => {
+    for (const dsl of ["is:unread AND (", 'label:"open', "is:sleepy", "from:"]) {
+      const shared = parseFilterDsl(dsl);
+      const server = Effect.runSync(Effect.flip(booleanFilter.parse(dsl)));
+      expect(shared).toEqual({ ok: false, message: server.message, offset: server.offset });
+    }
+    expect(parseFilterDsl("label:A OR label:B")).toEqual({ ok: true, expression: parse("label:A OR label:B") });
+  });
+
+  const expressions = [
+    "is:unread",
+    'is:unread AND (label:"Label A" OR label:"Label B" OR label:"Label C") AND NOT from:"noreply@"',
+    "NOT (is:starred OR is:archived)",
+    "(label:a AND label:b) OR (label:c AND NOT label:d)",
+    'subject:"weekly (draft)" AND NOT (from:boss OR label:Later)',
+  ];
+  test.each(expressions)("builder tree for %p converts back to the same AST", (dsl) => {
+    expect(fromBuilder(toBuilder(parse(dsl)))).toEqual({ ok: true, expression: parse(dsl) });
+  });
+
+  test("double negation collapses and an empty builder means no filter", () => {
+    expect(fromBuilder(toBuilder(parse("NOT NOT label:x")))).toEqual({ ok: true, expression: parse("label:x") });
+    expect(fromBuilder(toBuilder(null))).toEqual({ ok: true, expression: null });
+  });
+
+  test("edits produce DSL, and incomplete conditions block conversion until filled in", () => {
+    let tree = toBuilder(parse("is:unread"));
+    const condition = newCondition("label");
+    tree = appendChild(tree, tree.id, condition);
+    expect(fromBuilder(tree)).toEqual({ ok: false, nodeId: condition.id, error: "Enter a value." });
+    tree = updateNode(tree, condition.id, (node) => ({ ...node, value: "Label A", negated: true }));
+    tree = updateNode(tree, tree.id, (node) => ({ ...node, operator: "Or" }));
+    const built = fromBuilder(tree);
+    expect(built.ok && built.expression && formatFilterExpr(built.expression)).toBe('is:unread OR NOT label:"Label A"');
+    tree = removeNode(tree, condition.id);
+    expect(fromBuilder(tree)).toEqual({ ok: true, expression: parse("is:unread") });
+    const emptyGroup = { ...toBuilder(null), id: "inner" };
+    expect(fromBuilder(appendChild(toBuilder(null), toBuilder(null).id, emptyGroup)).ok).toBe(true);
+  });
+});
+
 describe("Phase 4: label renames reach saved views and AI rules", () => {
   test("rewrites saved view ASTs and DSL, rule preconditions and rule actions", async () => {
     const database = new Database(":memory:");
@@ -84,7 +128,7 @@ describe("Phase 4: label renames reach saved views and AI rules", () => {
     await Effect.runPromise(db.replaceLabels([{ id: "Label_1", name: "Finance/Receipts", type: "user", colorBg: null, colorText: null }]));
 
     expect(await Effect.runPromise(db.listSavedViews())).toEqual([
-      { id: "v", name: "Money", dsl: 'label:Finance/Receipts OR is:unread AND label:Other', builtIn: false },
+      { id: "v", name: "Money", dsl: "label:Finance/Receipts OR (is:unread AND label:Other)", builtIn: false },
     ]);
     const rule = database.prepare("SELECT precondition_ast_json AS ast, actions_json AS actions FROM ai_rules").get() as { ast: string; actions: string };
     expect(JSON.parse(rule.ast)).toEqual(parse('NOT label:"Finance/Receipts"'));
@@ -111,6 +155,8 @@ describe("Phase 4: one action registry drives the palette, toolbar and Vim keys"
     canSelectNext: true,
     canSelectPrevious: false,
     syncing: false,
+    builderOpen: false,
+    savedViewPosition: null,
     moveSelection: (delta) => calls.push(`move:${delta}`),
     openSelectedThread: () => calls.push("open"),
     closeThread: () => calls.push("close"),
@@ -120,49 +166,65 @@ describe("Phase 4: one action registry drives the palette, toolbar and Vim keys"
     switchAccount: (id) => calls.push(`account:${id}`),
     goToView: (id) => calls.push(`view:${id}`),
     sync: () => calls.push("sync"),
+    toggleBuilder: () => calls.push("builder"),
+    saveView: () => calls.push("save-view"),
+    editView: () => calls.push("edit-view"),
+    deleteView: () => calls.push("delete-view"),
+    moveView: (delta) => calls.push(`move-view:${delta}`),
   };
   const actions = buildActions(context);
   const keyEvent = (key: string, extra: Partial<Pick<KeyboardEvent, "code" | "altKey" | "metaKey" | "ctrlKey">> = {}) =>
     ({ key, code: "", altKey: false, metaKey: false, ctrlKey: false, ...extra });
 
   test("every action has a unique shortcut and the toolbar only references registered actions", () => {
-    const shortcuts = actions.map((action) => `${action.shortcut.alt ? "alt+" : ""}${action.shortcut.key}`);
+    const shortcuts = actions.flatMap((action) => action.shortcut ? [`${action.shortcut.alt ? "alt+" : ""}${action.shortcut.key}`] : []);
     expect(new Set(shortcuts).size).toBe(shortcuts.length);
+    // Only rare or destructive view management is palette + button only.
+    expect(actions.filter((action) => !action.shortcut).map((action) => action.id).sort())
+      .toEqual(["views.delete", "views.edit", "views.moveDown", "views.moveUp"]);
     const ids = new Set(actions.map((action) => action.id));
     for (const id of TOOLBAR_ACTION_IDS) expect(ids.has(id)).toBe(true);
   });
 
   test("PRD keys map to the expected actions", () => {
     const byKey = (key: string, alt = false) =>
-      actions.find((action) => matchesShortcut(keyEvent(key, alt ? { altKey: true, code: `Digit${key}` } : {}), action.shortcut))?.id;
+      actions.find((action) => action.shortcut && matchesShortcut(keyEvent(key, alt ? { altKey: true, code: `Digit${key}` } : {}), action.shortcut))?.id;
     expect(byKey("j")).toBe("navigation.next");
     expect(byKey("k")).toBe("navigation.previous");
     expect(byKey("e")).toBe("thread.archive");
     expect(byKey("l")).toBe("thread.label");
     expect(byKey("u")).toBe("thread.toggleRead");
     expect(byKey("S")).toBe("account.sync");
-    expect(byKey("1")).toBe("views.inbox");
+    expect(byKey("1")).toBe("views.go.inbox");
+    expect(byKey("f")).toBe("filter.builder");
+    expect(byKey("v")).toBe("views.save");
     expect(byKey("2", true)).toBe("account.switch.work");
     expect(actions.find((action) => action.id === "thread.toggleRead")?.label).toBe("Mark as read");
   });
 
   test("shortcuts ignore Cmd/Ctrl chords and Alt shortcuts match the physical key", () => {
-    const archive = actions.find((action) => action.id === "thread.archive")!;
-    expect(matchesShortcut(keyEvent("e", { metaKey: true }), archive.shortcut)).toBe(false);
-    const work = actions.find((action) => action.id === "account.switch.work")!;
+    const archive = actions.find((action) => action.id === "thread.archive")!.shortcut!;
+    expect(matchesShortcut(keyEvent("e", { metaKey: true }), archive)).toBe(false);
+    const work = actions.find((action) => action.id === "account.switch.work")!.shortcut!;
     // Option+2 types "™" on a US Mac layout.
-    expect(matchesShortcut(keyEvent("™", { altKey: true, code: "Digit2" }), work.shortcut)).toBe(true);
-    expect(shortcutLabel(work.shortcut)).toBe("⌥2");
+    expect(matchesShortcut(keyEvent("™", { altKey: true, code: "Digit2" }), work)).toBe(true);
+    expect(shortcutLabel(work)).toBe("⌥2");
     expect(shortcutLabel({ key: "S" })).toBe("⇧S");
   });
 
   test("running actions calls the context with the selected thread's state", () => {
     calls.length = 0;
-    for (const id of ["thread.archive", "thread.toggleRead", "thread.toggleStar", "account.switch.work", "views.starred"]) {
+    for (const id of ["thread.archive", "thread.toggleRead", "thread.toggleStar", "account.switch.work", "views.go.starred", "filter.builder", "views.save"]) {
       actions.find((action) => action.id === id)!.run();
     }
-    expect(calls).toEqual(["action:archive", "action:markRead", "action:star", "account:work", "view:starred"]);
+    expect(calls).toEqual(["action:archive", "action:markRead", "action:star", "account:work", "view:starred", "builder", "save-view"]);
     expect(actions.find((action) => action.id === "account.switch.personal")?.enabled).toBe(false);
+    // Built-in views cannot be edited, deleted or moved.
+    for (const id of ["views.edit", "views.delete", "views.moveUp", "views.moveDown"]) {
+      expect(actions.find((action) => action.id === id)?.enabled).toBe(false);
+    }
+    const saved = buildActions({ ...context, savedViewPosition: { index: 0, count: 2 } });
+    expect(saved.filter((action) => action.id.startsWith("views.move") && action.enabled).map((action) => action.id)).toEqual(["views.moveDown"]);
   });
 
   test("routes round-trip through /a/:accountId/views/:viewId[/t/:threadId]", () => {
@@ -360,6 +422,52 @@ describe("Phase 4: account-scoped HTTP API", () => {
     expect(response.status).toBe(502);
     expect(await response.json()).toMatchObject({ retryable: false });
     expect(await Effect.runPromise(env.personal.getThread("p-new"))).toMatchObject({ isUnread: true, labels: ["INBOX", "UNREAD"] });
+  });
+
+  test("creates, edits, reorders and deletes saved split views per account", async () => {
+    const events: string[] = [];
+    env.events.subscribe("personal", (event) => events.push(event.type));
+    const send = (method: string, path: string, body?: unknown) => env.call(path, {
+      method,
+      headers: { "Content-Type": "application/json", [LOCAL_REQUEST_HEADER]: "1" },
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+    });
+
+    const created = await env.post("/api/a/personal/views", { name: " Receipts ", dsl: "label:receipts  AND   NOT is:archived" });
+    expect(created.status).toBe(201);
+    const { view } = await created.json() as { view: { id: string; name: string; dsl: string } };
+    expect(view).toMatchObject({ name: "Receipts", dsl: "label:receipts AND NOT is:archived", builtIn: false });
+    const listed = await (await env.call(`/api/a/personal/threads?view=${view.id}`)).json() as ThreadPage;
+    expect(listed.threads.map((thread) => thread.id)).toEqual(["p-old"]);
+
+    expect((await env.post("/api/a/personal/views", { name: "receipts", dsl: "is:unread" })).status).toBe(409);
+    expect((await env.post("/api/a/personal/views", { name: "inbox", dsl: "is:unread" })).status).toBe(409);
+    const invalid = await env.post("/api/a/personal/views", { name: "Broken", dsl: "is:unread AND (" });
+    expect(invalid.status).toBe(400);
+    expect(await invalid.json()).toMatchObject({ offset: expect.any(Number) });
+    expect((await env.post("/api/a/personal/views", { name: "", dsl: "is:unread" })).status).toBe(400);
+    expect((await env.post("/api/a/personal/views", { name: "No header", dsl: "is:unread" }, {})).status).toBe(403);
+
+    const second = await (await env.post("/api/a/personal/views", { name: "Needs reading", dsl: "is:unread" })).json() as { view: { id: string } };
+    const renamed = await send("PATCH", `/api/a/personal/views/${view.id}`, { name: "Money", dsl: "label:Receipts" });
+    expect(await renamed.json()).toMatchObject({ view: { id: view.id, name: "Money", dsl: "label:Receipts" } });
+    expect((await send("PATCH", "/api/a/personal/views/inbox", { name: "Mine" })).status).toBe(400);
+    expect((await send("PATCH", "/api/a/personal/views/v-missing", { name: "Ghost" })).status).toBe(404);
+
+    expect((await send("PUT", "/api/a/personal/views/order", { ids: [second.view.id] })).status).toBe(400);
+    const reordered = await (await send("PUT", "/api/a/personal/views/order", { ids: [second.view.id, view.id] })).json() as { views: Array<{ id: string }> };
+    expect(reordered.views.map((entry) => entry.id).slice(-2)).toEqual([second.view.id, view.id]);
+
+    // Saved views live in the account's own silo.
+    const workViews = await (await env.call("/api/a/work/views")).json() as { views: Array<{ builtIn: boolean }> };
+    expect(workViews.views.every((entry) => entry.builtIn)).toBe(true);
+
+    expect((await send("DELETE", "/api/a/personal/views/inbox")).status).toBe(400);
+    expect((await send("DELETE", `/api/a/personal/views/${view.id}`)).status).toBe(200);
+    expect((await send("DELETE", `/api/a/personal/views/${view.id}`)).status).toBe(404);
+    const { views } = await (await env.call("/api/a/personal/views")).json() as { views: Array<{ id: string }> };
+    expect(views.map((entry) => entry.id)).toEqual([...BUILT_IN_VIEWS.map((entry) => entry.id), second.view.id]);
+    expect(events.filter((type) => type === "views-changed")).toHaveLength(5);
   });
 
   test("streams account events over SSE", async () => {
