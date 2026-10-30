@@ -1,15 +1,15 @@
 import { Command } from "cmdk";
 import { useState } from "react";
 import type { ActionGroup, AppAction } from "../actions";
-import type { LabelSummary, ThreadSummary } from "../../shared/api";
+import type { LabelSummary, SendAsAliasSummary, ThreadSummary } from "../../shared/api";
 import { Keycap } from "./Keycap";
 
-export type PalettePage = "actions" | "labels";
+export type PalettePage = "actions" | "labels" | "aliases";
 
-const GROUP_ORDER: ReadonlyArray<ActionGroup> = ["Thread", "Navigation", "Filter & Views", "Account"];
+const GROUP_ORDER: ReadonlyArray<ActionGroup> = ["Thread", "AI", "Navigation", "Filter & Views", "Account"];
 
 /** Cmd+K: every registered action, plus a label picker page for the selected thread. */
-export function CommandPalette({ open, page, actions, labels, thread, onOpenChange, onPageChange, onToggleLabel }: {
+export function CommandPalette({ open, page, actions, labels, thread, aliases, currentAlias, onOpenChange, onPageChange, onToggleLabel, onChooseAlias }: {
   readonly open: boolean;
   readonly page: PalettePage;
   readonly actions: ReadonlyArray<AppAction>;
@@ -18,6 +18,10 @@ export function CommandPalette({ open, page, actions, labels, thread, onOpenChan
   readonly onOpenChange: (open: boolean) => void;
   readonly onPageChange: (page: PalettePage) => void;
   readonly onToggleLabel: (label: string, applied: boolean) => void;
+  /** Sender aliases for the open reply ("Change Sender Alias"). */
+  readonly aliases: ReadonlyArray<SendAsAliasSummary>;
+  readonly currentAlias: string | null;
+  readonly onChooseAlias: (sendAsEmail: string) => void;
 }) {
   const [search, setSearch] = useState("");
   const close = () => {
@@ -47,7 +51,7 @@ export function CommandPalette({ open, page, actions, labels, thread, onOpenChan
       <Command.Input
         value={search}
         onValueChange={setSearch}
-        placeholder={page === "labels" ? "Apply or remove a label…" : "Type a command…"}
+        placeholder={page === "labels" ? "Apply or remove a label…" : page === "aliases" ? "Send this reply as…" : "Type a command…"}
       />
       <Command.List>
         <Command.Empty>No matching commands.</Command.Empty>
@@ -91,6 +95,16 @@ export function CommandPalette({ open, page, actions, labels, thread, onOpenChan
                 <span className="text-xs text-zinc-500">New</span>
               </Command.Item>
             )}
+          </Command.Group>
+        )}
+        {page === "aliases" && (
+          <Command.Group heading="Send reply as">
+            {aliases.map((alias) => (
+              <Command.Item key={alias.sendAsEmail} value={`${alias.displayName} ${alias.sendAsEmail}`} onSelect={() => { close(); onChooseAlias(alias.sendAsEmail); }}>
+                <span>{alias.displayName ? `${alias.displayName} <${alias.sendAsEmail}>` : alias.sendAsEmail}</span>
+                <span className="text-xs text-zinc-500">{alias.sendAsEmail === currentAlias ? "✓ Current" : alias.isDefault ? "Default" : ""}</span>
+              </Command.Item>
+            ))}
           </Command.Group>
         )}
       </Command.List>

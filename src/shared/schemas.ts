@@ -1,4 +1,5 @@
 import * as Schema from "effect/Schema";
+import { CONVERSATION_STATUSES, type ConversationStatus } from "./aiRules";
 
 export type FilterExpr =
   | { readonly _tag: "And"; readonly expressions: ReadonlyArray<FilterExpr> }
@@ -67,20 +68,21 @@ export interface LlmEndpointRecord {
   readonly maxConcurrency?: number;
 }
 
-export interface LabellingDecision {
-  readonly matched: boolean;
-  readonly labelsToAdd: ReadonlyArray<string>;
-  readonly labelsToRemove: ReadonlyArray<string>;
-  readonly archive: boolean;
-  readonly confidence: number;
+/**
+ * The LLM's single answer for a thread: which of the offered rules apply and, when the
+ * "Conversations" option is chosen, where the conversation stands. Rule names are constrained
+ * to the offered names by the JSON schema sent with each request.
+ */
+export interface RuleSelection {
   readonly reasoning: string;
+  readonly matchedRules: ReadonlyArray<{ readonly ruleName: string; readonly isPrimary: boolean }>;
+  readonly noMatchFound: boolean;
+  readonly conversationStatus: ConversationStatus | null;
 }
 
-export const LabellingDecisionSchema: Schema.Codec<LabellingDecision> = Schema.Struct({
-  matched: Schema.Boolean,
-  labelsToAdd: Schema.Array(Schema.String),
-  labelsToRemove: Schema.Array(Schema.String),
-  archive: Schema.Boolean,
-  confidence: Schema.Number,
+export const RuleSelectionSchema: Schema.Codec<RuleSelection> = Schema.Struct({
   reasoning: Schema.String,
+  matchedRules: Schema.Array(Schema.Struct({ ruleName: Schema.String, isPrimary: Schema.Boolean })),
+  noMatchFound: Schema.Boolean,
+  conversationStatus: Schema.NullOr(Schema.Literals(CONVERSATION_STATUSES)),
 });

@@ -1,6 +1,9 @@
 import { useEffect, useRef } from "react";
+import type { AppAction } from "../actions";
 import type { LabelSummary, ThreadDetail, ThreadMessage } from "../../shared/api";
 import { formatFullDate } from "../format";
+import { toolbarButtonClass } from "./ActionToolbar";
+import { Keycap } from "./Keycap";
 import { LabelChips } from "./LabelChips";
 
 // Email HTML assumes a light page, so bodies render on white in both themes.
@@ -53,11 +56,31 @@ function Message({ message }: { readonly message: ThreadMessage }) {
   );
 }
 
-export function ThreadReader({ thread, loading, error, labelCatalog }: {
+/** Dry-run suggestions from AI rules, waiting for a one-key decision. */
+function SuggestionBar({ labels, actions }: { readonly labels: ReadonlyArray<string>; readonly actions: ReadonlyArray<AppAction> }) {
+  const decisions = ["ai.acceptGhost", "ai.rejectGhost"].flatMap((id) => actions.find((action) => action.id === id) ?? []);
+  return (
+    <div role="group" aria-label="Suggested labels" className="flex flex-wrap items-center gap-2 rounded-lg border border-dashed border-zinc-300 px-3 py-2 text-sm dark:border-zinc-700">
+      <span className="text-zinc-600 dark:text-zinc-400">AI suggests</span>
+      {labels.map((label) => <span key={label} className="rounded bg-zinc-100 px-1.5 text-xs leading-5 dark:bg-zinc-800">{label}</span>)}
+      <span className="ml-auto flex gap-1.5">
+        {decisions.map((action) => (
+          <button key={action.id} type="button" className={toolbarButtonClass} disabled={!action.enabled} onClick={action.run}>
+            {action.id === "ai.acceptGhost" ? "Accept" : "Reject"}
+            {action.shortcut && <Keycap shortcut={action.shortcut} />}
+          </button>
+        ))}
+      </span>
+    </div>
+  );
+}
+
+export function ThreadReader({ thread, loading, error, labelCatalog, actions }: {
   readonly thread: ThreadDetail | null;
   readonly loading: boolean;
   readonly error: string | null;
   readonly labelCatalog: ReadonlyMap<string, LabelSummary>;
+  readonly actions: ReadonlyArray<AppAction>;
 }) {
   if (error) return <p role="alert" className="p-6 text-sm text-red-600 dark:text-red-400">{error}</p>;
   if (!thread) return <p className="p-6 text-sm text-zinc-500">{loading ? "Loading conversation…" : "Select a conversation and press O to open it."}</p>;
@@ -65,8 +88,9 @@ export function ThreadReader({ thread, loading, error, labelCatalog }: {
     <section aria-label="Conversation" className="flex flex-col gap-3 p-4">
       <header className="flex flex-col gap-1">
         <h2 className="text-lg font-semibold">{thread.subject}</h2>
-        <LabelChips labels={thread.labels} ghost={thread.ghostLabels} catalog={labelCatalog} />
+        <LabelChips labels={thread.labels} catalog={labelCatalog} />
       </header>
+      {thread.ghostLabels.length > 0 && <SuggestionBar labels={thread.ghostLabels} actions={actions} />}
       {thread.messages.map((message) => <Message key={message.id} message={message} />)}
     </section>
   );

@@ -7,6 +7,8 @@ import { createDevServer } from "../src/server/dev-server";
 import { createApiHandler } from "../src/server/routes/api";
 import { createAccountEventBus } from "../src/server/routes/sse";
 import { AccountDb, AccountDbTest, type AccountDbService } from "../src/server/services/AccountDb";
+import { formatRulesFile, importInboxZeroRules } from "../src/server/services/AiRules";
+import { createAiRunner } from "../src/server/services/AiRunner";
 import { createGmailAccessTokenProvider } from "../src/server/services/GmailAccessTokens";
 import type { GoogleOAuth2Api } from "../src/server/services/GoogleOAuth2";
 import { OAuthTokenVault } from "../src/server/services/OAuthTokenVault";
@@ -25,6 +27,11 @@ const gmail = Bun.serve({
     console.log(`[mock gmail] ${request.method} ${url.pathname} ${body ? JSON.stringify(body) : ""}`);
     if (url.pathname.endsWith("/labels") && request.method === "POST") {
       return Response.json({ id: `Label_${nextLabel++}`, name: (body as { name: string }).name, type: "user" });
+    }
+    if (url.pathname.endsWith("/messages/send")) {
+      const { raw, threadId } = body as { raw: string; threadId?: string };
+      console.log(`[mock gmail] sent into thread ${threadId}:\n${Buffer.from(raw, "base64url").toString("utf8").split("\r\n\r\n")[0]}`);
+      return Response.json({ id: `sent-${Date.now()}`, threadId: threadId ?? "new-thread" });
     }
     return Response.json({});
   },
@@ -45,6 +52,11 @@ const seed = async (accountId: "personal" | "work", email: string, threads: Read
     createdAt: Date.now(),
   }));
   const db = silo(accountId);
+  const [local, domain] = email.split("@");
+  await Effect.runPromise(db.replaceSendAsAliases([
+    { sendAsEmail: email, displayName: accountId === "personal" ? "Me" : "Me (Work)", replyToAddress: null, signatureHtml: null, isPrimary: true, isDefault: true, verificationStatus: "unknown" },
+    { sendAsEmail: `${local}+hello@${domain}`, displayName: "Hello alias", replyToAddress: null, signatureHtml: "<p>— Sent from my alias</p>", isPrimary: false, isDefault: false, verificationStatus: "accepted" },
+  ]));
   await Effect.runPromise(db.replaceLabels([
     { id: "INBOX", name: "INBOX", type: "system", colorBg: null, colorText: null },
     { id: "Label_1", name: "Receipts", type: "user", colorBg: "#b9e4d0", colorText: "#094228" },
@@ -61,7 +73,8 @@ const seed = async (accountId: "personal" | "work", email: string, threads: Read
     }));
     await Effect.runPromise(db.upsertMessage({
       id: `${id}-m`, threadId: id, fromAddress: thread.from, toAddresses: [email], ccAddresses: [], deliveredTo: email,
-      dateTs: at, bodyMarkdown: thread.html.replace(/<[^>]+>/g, ""), bodyHtmlSanitized: thread.html, rawHeaders: {},
+      dateTs: at, bodyMarkdown: thread.html.replace(/<[^>]+>/g, ""), bodyHtmlSanitized: thread.html,
+      rawHeaders: { "message-id": `<${id}@demo.example>`, subject: thread.subject }, labels: thread.labels,
     }));
   }
 };
@@ -82,18 +95,63 @@ const receiptsAndTravel = parseFilterDsl('label:Receipts OR (label:Travel AND NO
 if (!receiptsAndTravel.ok) throw new Error(receiptsAndTravel.message);
 await Effect.runPromise(silo("personal").createSavedView({ id: "v-demo", name: "Receipts & Travel", filter: receiptsAndTravel.expression }));
 
+// A stand-in LLM: picks an offered rule whose name appears in the thread, else "Conversations: To reply".
+const llm = Bun.serve({
+  port: 0,
+  async fetch(request) {
+    const body = await request.json() as { messages?: Array<{ content: string }>; response_format?: { json_schema: { schema: DemoSchema } } };
+    const schema = body.response_format!.json_schema.schema;
+    const offered = schema.properties.matchedRules.items.properties.ruleName.enum;
+    const thread = (body.messages?.[1]?.content ?? "").toLowerCase();
+    const match = offered.find((name) => name !== "Conversations" && thread.includes(name.toLowerCase().split(" ")[0]!));
+    const statuses = schema.properties.conversationStatus.enum ?? [];
+    const conversation = !match && offered.includes("Conversations") && statuses.includes("TO_REPLY");
+    const reply = {
+      reasoning: match ? `The thread mentions "${match}" (demo LLM).` : conversation ? "A person is asking something (demo LLM)." : "Nothing fits (demo LLM).",
+      matchedRules: match ? [{ ruleName: match, isPrimary: true }] : conversation ? [{ ruleName: "Conversations", isPrimary: true }] : [],
+      noMatchFound: !match && !conversation,
+      conversationStatus: conversation ? "TO_REPLY" : null,
+    };
+    console.log(`[mock llm] offered ${offered.join(", ")} → ${reply.matchedRules.map((rule) => rule.ruleName).join(", ") || "no match"}`);
+    return Response.json({ choices: [{ message: { content: JSON.stringify(reply) } }] });
+  },
+});
+type DemoSchema = { properties: { matchedRules: { items: { properties: { ruleName: { enum: string[] } } } }; conversationStatus: { enum?: Array<string | null> } } };
+await Effect.runPromise(registry.upsertLlmEndpoint({
+  id: "demo", name: "Demo LLM", baseUrl: `${llm.url}v1`, apiKeyEnc: vault.encrypt("demo"), modelId: "demo-model", apiMode: "chat_completions",
+}));
+const demoRules = (systemType: string, name: string, extra: Record<string, unknown> = {}) => ({
+  name, instructions: `${name} emails`, enabled: true, automate: true, runOnThreads: false, systemType, conditionalOperator: "AND",
+  actions: [{ type: "LABEL", label: name }], ...extra,
+});
+const { file: rulesFile } = importInboxZeroRules([
+  demoRules("TO_REPLY", "To Reply", { runOnThreads: true }),
+  demoRules("AWAITING_REPLY", "Awaiting Reply", { runOnThreads: true }),
+  demoRules("FYI", "FYI", { runOnThreads: true }),
+  demoRules("ACTIONED", "Actioned", { runOnThreads: true }),
+  demoRules("NEWSLETTER", "Newsletter"),
+  demoRules("RECEIPT", "Order", { actions: [{ type: "LABEL", label: "Receipts" }, { type: "MARK_READ" }] }),
+  demoRules("CALENDAR", "Flight", { automate: false, actions: [{ type: "LABEL", label: "Trips" }] }),
+], "demo");
+for (const accountId of ["personal", "work"] as const) await Effect.runPromise(silo(accountId).writeRulesFile(formatRulesFile(rulesFile)));
+
 const events = createAccountEventBus();
 const unusedOAuth: GoogleOAuth2Api = {
   authorizationUrl: () => new URL("http://127.0.0.1/demo"),
   exchangeCode: () => Effect.die("OAuth is disabled in the UI demo."),
   refreshAccessToken: () => Effect.die("OAuth is disabled in the UI demo."),
 };
+const tokens = createGmailAccessTokenProvider({ registry, oauth: unusedOAuth, vault });
+const accountDbLayer = (accountId: string) => AccountDbTest(accountId, silos[accountId as "personal" | "work"]);
+const aiRunner = createAiRunner({ registry, tokens, vault, events, gmailApiBaseUrl: `${gmail.url}gmail/v1`, accountDbLayer });
 const api = createApiHandler({
   registry,
-  tokens: createGmailAccessTokenProvider({ registry, oauth: unusedOAuth, vault }),
+  tokens,
   events,
+  vault,
+  aiRunner,
   gmailApiBaseUrl: `${gmail.url}gmail/v1`,
-  accountDbLayer: (accountId) => AccountDbTest(accountId, silos[accountId]),
+  accountDbLayer,
 });
 const server = createDevServer({
   registry,
@@ -104,4 +162,6 @@ const server = createDevServer({
   redirectUri: `http://127.0.0.1:${port}/auth/google/callback`,
   port,
 });
-console.log(`ZeroEffect UI demo (seeded data, mock Gmail): http://${server.hostname}:${server.port}/`);
+console.log(`ZeroEffect UI demo (seeded data, mock Gmail and LLM): http://${server.hostname}:${server.port}/`);
+console.log("Try: A to run AI rules, W for the audit, Y / N on the flight email's suggestion, Z to undo, \",\" for the rules screen.");
+console.log("Replies: R reply, Shift+R pick the alias, Shift+A reply all; sent messages are printed here instead of being sent.");

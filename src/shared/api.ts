@@ -89,4 +89,84 @@ export type SyncJobStatus = "queued" | "running" | "completed" | "failed";
 export type AccountEvent =
   | { readonly type: "threads-changed"; readonly threadIds?: ReadonlyArray<string> }
   | { readonly type: "views-changed" }
+  | { readonly type: "rules-changed" }
   | { readonly type: "sync"; readonly status: SyncJobStatus; readonly error?: string };
+
+export interface LlmEndpointSummary {
+  readonly id: string;
+  readonly name: string;
+  readonly baseUrl: string;
+  readonly modelId: string;
+  readonly apiMode: "responses" | "chat_completions";
+  readonly timeoutMs?: number;
+}
+
+export interface RulesProblemSummary {
+  readonly rule: string | null;
+  readonly message: string;
+}
+
+export interface RulesResponse {
+  /** Settings plus the valid rules; invalid rules on disk are listed in `problems` instead. */
+  readonly rules: import("./aiRules").AiRulesFile;
+  readonly problems: ReadonlyArray<RulesProblemSummary>;
+}
+
+export interface AiRunSummary {
+  readonly status: "processed" | "skipped";
+  readonly llmCalled: boolean;
+  readonly appliedRules: ReadonlyArray<string>;
+  readonly conversationStatus: string | null;
+  readonly reason: string;
+}
+
+export interface AiAuditSummary {
+  readonly id: string;
+  readonly threadId: string;
+  readonly trigger: "auto" | "manual";
+  readonly ruleNames: ReadonlyArray<string>;
+  readonly conversationStatus: string | null;
+  readonly endpointId: string | null;
+  readonly apiModeUsed: "responses" | "chat_completions" | null;
+  readonly modelUsed: string | null;
+  readonly reasoning: string;
+  readonly changes: {
+    readonly labelsAdded: ReadonlyArray<string>;
+    readonly labelsRemoved: ReadonlyArray<string>;
+    readonly ghostLabelsAdded: ReadonlyArray<string>;
+  };
+  readonly reverted: boolean;
+  readonly latencyMs: number;
+  readonly createdAt: number;
+}
+
+export interface SendAsAliasSummary {
+  readonly sendAsEmail: string;
+  readonly displayName: string;
+  readonly isDefault: boolean;
+  readonly isPrimary: boolean;
+}
+
+/** A suggested reply to a thread's latest incoming message. */
+export interface ReplyDraft {
+  /** The Gmail message being answered. */
+  readonly messageId: string;
+  readonly to: ReadonlyArray<string>;
+  readonly cc: ReadonlyArray<string>;
+  /** Everyone else on the original message, added to Cc when replying to all. */
+  readonly replyAllCc: ReadonlyArray<string>;
+  readonly subject: string;
+  /** The alias matched from Delivered-To / To / Cc (or the default), or null when none can send. */
+  readonly fromAlias: string | null;
+  readonly aliasMatch: "recipient" | "default" | "primary" | "first" | null;
+  readonly aliases: ReadonlyArray<SendAsAliasSummary>;
+}
+
+export interface SendReplyRequest {
+  readonly messageId: string;
+  readonly to: ReadonlyArray<string>;
+  readonly cc: ReadonlyArray<string>;
+  readonly subject: string;
+  readonly body: string;
+  readonly fromAlias: string;
+}

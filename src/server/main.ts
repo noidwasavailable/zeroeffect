@@ -12,6 +12,7 @@ import { RedisQueueService, RedisQueueServiceLive } from "./services/RedisQueue"
 import type { RedisQueueServiceApi } from "./services/RedisQueue";
 import { RegistryDb, RegistryDbLive } from "./services/RegistryDb";
 import { createGmailAccessTokenProvider } from "./services/GmailAccessTokens";
+import { createAiRunner } from "./services/AiRunner";
 import { createApiHandler } from "./routes/api";
 import { createAccountEventBus } from "./routes/sse";
 import { createDevServer, devServerConfigFromEnvironment } from "./dev-server";
@@ -77,10 +78,29 @@ const main = async (): Promise<void> => {
   const redisUrl = process.env.REDIS_URL ?? "redis://127.0.0.1:6379";
   const tokens = createGmailAccessTokenProvider({ registry, oauth, vault });
   const events = createAccountEventBus();
+  const aiRunner = createAiRunner({
+    registry,
+    tokens,
+    vault,
+    events,
+    accountDataDirectory: config.accountDataDirectory,
+    gmailApiBaseUrl: config.gmailApiBaseUrl,
+  });
+  // New mail from any sync (Pub/Sub or manual) goes through the AI labeller in the background.
+  const classifyNewMail = (accountId: string, threadIds: ReadonlyArray<string> | undefined) => {
+    if (!threadIds?.length) return;
+    aiRunner.runNewMail(accountId, threadIds).catch((error) => console.error(`AI labelling failed for ${accountId}.`, error));
+  };
   const api = createApiHandler({
     registry,
     tokens,
     events,
+    aiRunner,
+    vault,
+    // Sync right after sending so the reply appears (and its conversation status updates) without waiting for Pub/Sub.
+    onReplySent: (accountId) => {
+      accountOperations.sync(accountId).catch((error) => console.error(`Sync after sending from ${accountId} failed.`, error));
+    },
     accountDataDirectory: config.accountDataDirectory,
     gmailApiBaseUrl: config.gmailApiBaseUrl,
   });
@@ -90,7 +110,10 @@ const main = async (): Promise<void> => {
     vault,
     tokens,
     // Pub/Sub-driven syncs refresh any open web clients for that account.
-    onSynced: (accountId) => events.publish(accountId, { type: "threads-changed" }),
+    onSynced: (accountId, result) => {
+      events.publish(accountId, { type: "threads-changed" });
+      classifyNewMail(accountId, result.threadsWithNewMessages);
+    },
     accountDataDirectory: config.accountDataDirectory,
     gmailApiBaseUrl: config.gmailApiBaseUrl,
   });
@@ -209,6 +232,7 @@ const main = async (): Promise<void> => {
     tokens,
     events,
     api,
+    onSyncCompleted: (accountId, result) => classifyNewMail(accountId, result.threadsWithNewMessages),
     pubsubOAuth: pubSubOAuth,
     onPubSubAuthorization: startPubSub,
     onGmailAccountConnected: async (accountId) => {

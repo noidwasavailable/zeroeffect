@@ -13,6 +13,7 @@ export interface GmailAccountSyncResult {
   readonly mode: "initial" | "incremental";
   readonly messagesUpserted: number;
   readonly messagesDeleted: number;
+  readonly threadsWithNewMessages?: ReadonlyArray<string>;
 }
 
 export interface GmailAccountOperationsConfig {

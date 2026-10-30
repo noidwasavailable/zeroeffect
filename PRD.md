@@ -98,14 +98,13 @@ Incoming emails are ingested in real time via outbound Google Cloud Pub/Sub stre
     - **`responses` (`POST /v1/responses`)**: Uses `instructions`, `input`, and `text.format` (`json_schema`) for structured output.
     - **`chat_completions` (`POST /v1/chat/completions`)**: Uses `messages` (`system` + `user`) and `response_format` (`json_schema`) for compatibility with Ollama, vLLM, LiteLLM, OpenRouter, and OpenAI.
 - **FR-LLM-02 (Rule Pipeline & Dry-Run Mode):**
-  - When a new or updated thread arrives:
-    1. Evaluate active rules ordered by `priority`.
-    2. Evaluate the rule's `FilterExpr` pre-condition in memory (zero LLM cost if it fails).
-    3. Assemble prompt using the rule's plain-English instructions + thread Markdown.
-    4. Parse structured output: `{ matched: boolean, labelsToAdd: string[], labelsToRemove: string[], archive: boolean, confidence: number, reasoning: string }`.
-    5. If `confidence >= rule.minConfidence`:
-       - If `rule.dryRun === true`: Store as **Suggested Ghost Labels** in SQLite for 1-key user approval (`y`/`n`).
-       - If `rule.dryRun === false`: Enqueue Gmail label mutations (`users.messages.modify`) and record in `ai_audit_logs`.
+  - Rules are stored per account as JSON (`data/accounts/<account_id>.rules.json`) in Inbox Zero's export shape: `name`, `instructions`, `enabled`, `automate`, `runOnThreads`, `systemType`, static `from`/`to`/`subject`/`body` conditions with `conditionalOperator`, an optional `precondition` (Boolean DSL), and `LABEL` / `ARCHIVE` / `MARK_READ` actions. Inbox Zero exports are imported per account with `scripts/import-rules.ts`.
+  - When new mail arrives in a thread (incremental sync), or on demand:
+    1. Filter enabled rules in memory: `precondition`, static conditions (AND gates the AI, OR matches without it), and `runOnThreads` (on follow-up messages, first-message-only rules are skipped, and re-applied for free if they matched earlier).
+    2. The four conversation status rules (`TO_REPLY`, `AWAITING_REPLY`, `FYI`, `ACTIONED`) are offered as one "Conversations" option; no-reply senders never get one.
+    3. Make **one** structured LLM call over the remaining rules and thread: `{ reasoning, matchedRules: [{ ruleName, isPrimary }], noMatchFound, conversationStatus }`. No call is made when nothing needs the AI.
+    4. Apply the matched rules' actions with one `users.threads.modify` call; a new conversation status removes the other status labels. Rules with `automate: false` store **Suggested Ghost Labels** instead, for 1-key approval (`y`/`n`).
+    5. Record the run in `ai_audit_logs` (one row per run; the latest run can be undone).
 
 ### 3.5 Web UI: `Cmd+K` Command Palette, Action Buttons & Vim Keys (`FR-UI`)
 
@@ -188,7 +187,8 @@ CREATE TABLE threads (
     delivered_to_alias TEXT,             -- Matched against send_as_aliases
     labels_json TEXT NOT NULL,           -- JSON array of label names: ["Label A", "AI/Urgent"]
     ghost_labels_json TEXT NOT NULL DEFAULT '[]', -- Pending dry-run AI suggestions
-    ai_status TEXT NOT NULL DEFAULT 'pending'     -- 'pending' | 'processed' | 'skipped' | 'error'
+    ai_status TEXT NOT NULL DEFAULT 'pending',    -- 'pending' | 'processed' | 'skipped' | 'error'
+    ai_evaluated_through INTEGER                  -- date_ts of the newest message the AI has classified
 );
 
 CREATE TABLE messages (
@@ -201,7 +201,8 @@ CREATE TABLE messages (
     date_ts INTEGER NOT NULL,
     body_markdown TEXT NOT NULL,
     body_html_sanitized TEXT NOT NULL,
-    raw_headers_json TEXT NOT NULL
+    raw_headers_json TEXT NOT NULL,
+    labels_json TEXT NOT NULL DEFAULT '[]' -- This message's labels; threads.labels_json is their union (Gmail semantics)
 );
 
 CREATE VIRTUAL TABLE messages_fts USING fts5(
@@ -219,30 +220,20 @@ CREATE TABLE saved_views (
     dsl_string TEXT NOT NULL             -- e.g., 'is:unread AND (label:"A" OR label:"B")'
 );
 
-CREATE TABLE ai_rules (
-    id TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    priority INTEGER NOT NULL DEFAULT 100,
-    enabled INTEGER NOT NULL DEFAULT 1,
-    dry_run INTEGER NOT NULL DEFAULT 0,
-    min_confidence REAL NOT NULL DEFAULT 0.8,
-    precondition_ast_json TEXT NOT NULL, -- Serialized FilterExpr evaluated BEFORE LLM call
-    system_prompt TEXT NOT NULL,
-    actions_json TEXT NOT NULL,          -- { addLabels: [], removeLabels: [], archive: bool }
-    llm_endpoint_id TEXT NOT NULL,
-    api_mode_override TEXT CHECK (api_mode_override IN ('responses', 'chat_completions'))
-);
+-- AI rules are not stored in SQLite: see data/accounts/<account_id>.rules.json (FR-LLM-02).
 
 CREATE TABLE ai_audit_logs (
     id TEXT PRIMARY KEY,
     thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
-    rule_id TEXT REFERENCES ai_rules(id) ON DELETE SET NULL,
-    endpoint_id TEXT NOT NULL,
-    api_mode_used TEXT NOT NULL,
-    model_used TEXT NOT NULL,
-    confidence REAL NOT NULL,
+    trigger TEXT NOT NULL,               -- 'auto' (new mail) | 'manual'
+    rule_names_json TEXT NOT NULL,       -- Rules applied in this run
+    conversation_status TEXT,            -- TO_REPLY | AWAITING_REPLY | FYI | ACTIONED
+    endpoint_id TEXT,                    -- NULL when no LLM call was needed
+    api_mode_used TEXT,
+    model_used TEXT,
     reasoning TEXT NOT NULL,
-    actions_applied_json TEXT NOT NULL,
+    actions_applied_json TEXT NOT NULL,  -- { labelsAdded, labelsRemoved, ghostLabelsAdded, ghostLabelsBefore }
+    undoable INTEGER NOT NULL,
     reverted INTEGER NOT NULL DEFAULT 0,
     latency_ms INTEGER NOT NULL,
     created_at INTEGER NOT NULL
@@ -278,7 +269,7 @@ CREATE TABLE ai_audit_logs (
 
 - **Scope:**
   - `LlmProviderService` supporting both `/v1/responses` and `/v1/chat/completions` with structured JSON schema outputs.
-  - `AiRuleWorkerService`: Evaluates rule `precondition_ast` -> calls LLM -> applies Gmail labels (or Ghost Labels in `dry_run` mode) -> writes `ai_audit_logs`.
+  - `AiRuleWorkerService`: Filters the account's JSON rules (preconditions, static conditions, `runOnThreads`) -> one structured LLM call per thread -> applies Gmail labels (or Ghost Labels when `automate` is false) -> writes `ai_audit_logs`.
   - One-step `undoAiAction` reversal service.
 - **🛑 HARD CHECKPOINT 3:**
   - Run `bun test tests/phase3-llm-labeller.test.ts`.

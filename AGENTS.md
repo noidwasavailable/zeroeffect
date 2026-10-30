@@ -69,8 +69,9 @@ Before writing Gmail API synchronization, MIME parsing, or LLM prompt constructi
 
 ### 2.4 Dual LLM API Requirement (`/v1/responses` AND `/v1/chat/completions`)
 
-- `LlmProviderService` must support switching between `apiMode: "responses"` and `apiMode: "chat_completions"` per endpoint or per rule.
-- Both modes must enforce structured JSON output matching the Effect Schema definition for `LabellingDecision` (`matched`, `labelsToAdd`, `labelsToRemove`, `archive`, `confidence`, `reasoning`).
+- `LlmProviderService` must support switching between `apiMode: "responses"` and `apiMode: "chat_completions"` per endpoint (overridable per account in its rules file).
+- AI rules are evaluated with **one structured call per thread** over the whole rule list (not one call per rule). Both modes must enforce structured JSON output matching the Effect Schema definition for `RuleSelection` (`reasoning`, `matchedRules[{ ruleName, isPrimary }]`, `noMatchFound`, `conversationStatus`), with rule names and statuses constrained by enums in the request schema.
+- Rules live per account in `data/accounts/<account_id>.rules.json` (Inbox Zero export shape; see `src/shared/aiRules.ts`). `runOnThreads: false` rules must never cost an LLM call on follow-up messages.
 
 ### 2.5 Hybrid UI Requirement (`Cmd+K` + Clickable Buttons + Vim Keys)
 

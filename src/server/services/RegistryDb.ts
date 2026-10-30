@@ -14,6 +14,8 @@ export interface RegistryDbService {
   readonly deleteServiceCredential: (id: string) => Effect.Effect<void, DatabaseError>;
   readonly upsertLlmEndpoint: (endpoint: LlmEndpointRecord) => Effect.Effect<void, DatabaseError>;
   readonly getLlmEndpoint: (id: string) => Effect.Effect<LlmEndpointRecord | null, DatabaseError>;
+  /** Endpoint settings without their encrypted API keys. */
+  readonly listLlmEndpoints: () => Effect.Effect<ReadonlyArray<Omit<LlmEndpointRecord, "apiKeyEnc">>, DatabaseError>;
 }
 
 export class RegistryDb extends Context.Service<RegistryDb, RegistryDbService>()(
@@ -167,6 +169,15 @@ const makeService = (database: Database): RegistryDbService => ({
         FROM llm_endpoints WHERE id = ?
       `).get(id) as LlmEndpointRecord | null,
       catch: (cause) => new DatabaseError({ message: "Failed to load LLM endpoint.", operation: "getLlmEndpoint", cause }),
+    }),
+  listLlmEndpoints: () =>
+    Effect.try({
+      try: () => database.prepare(`
+        SELECT id, name, base_url AS baseUrl, model_id AS modelId, api_mode AS apiMode,
+          timeout_ms AS timeoutMs, max_concurrency AS maxConcurrency
+        FROM llm_endpoints ORDER BY name, id
+      `).all() as Array<Omit<LlmEndpointRecord, "apiKeyEnc">>,
+      catch: (cause) => new DatabaseError({ message: "Failed to list LLM endpoints.", operation: "listLlmEndpoints", cause }),
     }),
 });
 

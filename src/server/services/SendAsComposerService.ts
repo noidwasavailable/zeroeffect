@@ -11,7 +11,15 @@ export interface ComposeReplyInput {
   readonly text: string;
   readonly html?: string;
   readonly deliveredTo?: string | null;
+  /** Addresses the replied-to message was sent to; used to pick the matching alias (defaults to to + cc). */
+  readonly matchAddresses?: ReadonlyArray<string>;
   readonly fromAlias?: string;
+  /** Threading: Gmail thread id plus the RFC 2822 headers that tie the reply to the original. */
+  readonly threadId?: string;
+  readonly inReplyTo?: string | null;
+  readonly references?: string | null;
+  /** The message being answered, quoted below the reply as Gmail does. */
+  readonly quote?: { readonly from: string; readonly dateTs: number; readonly text: string };
 }
 
 export interface ComposedMessage {
@@ -29,6 +37,12 @@ export class SendAsComposerService extends Context.Service<SendAsComposerService
   "zeroeffect/SendAsComposerService",
 ) {}
 
+export type AliasMatch = "requested" | "recipient" | "default" | "primary" | "first";
+
+/** Gmail reports no verificationStatus for the primary address; it can always send. */
+export const isSendableAlias = (alias: SendAsAliasRecord): boolean =>
+  alias.isPrimary || alias.verificationStatus.toLowerCase() === "accepted";
+
 export const SendAsComposerServiceLive: Layer.Layer<SendAsComposerService, never, AccountDb | GmailClient> =
   Layer.effect(SendAsComposerService, Effect.gen(function* () {
     const accountDb = yield* AccountDb;
@@ -36,7 +50,7 @@ export const SendAsComposerServiceLive: Layer.Layer<SendAsComposerService, never
 
     const compose = (input: ComposeReplyInput) => Effect.gen(function* () {
       const aliases = yield* accountDb.listSendAsAliases();
-      const alias = chooseAlias(aliases, input);
+      const alias = chooseAlias(aliases, input)?.alias;
       if (!alias) return yield* Effect.fail(new SendAsComposeError({ message: "No verified Send As alias is configured for this account." }));
       return yield* Effect.try({
         try: () => {
@@ -44,10 +58,19 @@ export const SendAsComposerServiceLive: Layer.Layer<SendAsComposerService, never
           const to = input.to.map((address) => safeHeader(address, "To address")).join(", ");
           const cc = input.cc?.map((address) => safeHeader(address, "Cc address")).join(", ");
           const subject = encodeHeader(safeHeader(input.subject, "Subject"));
-          const bodyText = [input.text.trim(), htmlToText(alias.signatureHtml ?? "")].filter(Boolean).join("\n\n");
-          const bodyHtml = input.html
+          const quoteHeader = input.quote
+            ? `On ${new Date(input.quote.dateTs).toUTCString()}, ${input.quote.from} wrote:`
+            : null;
+          const ownText = [input.text.trim(), htmlToText(alias.signatureHtml ?? "")].filter(Boolean).join("\n\n");
+          const bodyText = input.quote
+            ? `${ownText}\n\n${quoteHeader}\n${input.quote.text.trim().split("\n").map((line) => `> ${line}`).join("\n")}`
+            : ownText;
+          const ownHtml = input.html
             ? appendSignature(input.html, alias.signatureHtml ?? "")
-            : escapeHtml(bodyText).replace(/\n/g, "<br>\n");
+            : escapeHtml(ownText).replace(/\n/g, "<br>\n");
+          const bodyHtml = input.quote
+            ? `${ownHtml}<br><br><div>${escapeHtml(quoteHeader!)}</div><blockquote style="margin:0 0 0 .8ex;border-left:1px solid #ccc;padding-left:1ex">${escapeHtml(input.quote.text.trim()).replace(/\n/g, "<br>\n")}</blockquote>`
+            : ownHtml;
           const boundary = `zeroeffect_${crypto.randomUUID().replaceAll("-", "")}`;
           const headers = [
             `From: ${from}`,
@@ -55,6 +78,8 @@ export const SendAsComposerServiceLive: Layer.Layer<SendAsComposerService, never
             ...(cc ? [`Cc: ${cc}`] : []),
             ...(alias.replyToAddress ? [`Reply-To: ${safeHeader(alias.replyToAddress, "Reply-To")}`] : []),
             `Subject: ${subject}`,
+            ...(input.inReplyTo ? [`In-Reply-To: ${safeHeader(input.inReplyTo, "In-Reply-To")}`] : []),
+            ...(input.references ? [`References: ${safeHeader(input.references, "References")}`] : []),
             "MIME-Version: 1.0",
             `Content-Type: multipart/alternative; boundary="${boundary}"`,
           ];
@@ -82,23 +107,36 @@ export const SendAsComposerServiceLive: Layer.Layer<SendAsComposerService, never
 
     const send = (input: ComposeReplyInput) => Effect.gen(function* () {
       const message = yield* compose(input);
-      return yield* gmail.sendRaw(message.raw);
+      return yield* gmail.sendRaw(message.raw, input.threadId);
     });
     return { compose, send };
   }));
 
-const chooseAlias = (aliases: ReadonlyArray<SendAsAliasRecord>, input: ComposeReplyInput): SendAsAliasRecord | undefined => {
-  const verified = aliases.filter((alias) => alias.verificationStatus.toLowerCase() === "accepted");
+/**
+ * Picks the sending alias: an explicitly requested one, else the alias the original message was
+ * delivered to (Delivered-To, To, Cc), else the default, primary or first sendable alias.
+ */
+export const chooseAlias = (
+  aliases: ReadonlyArray<SendAsAliasRecord>,
+  input: Pick<ComposeReplyInput, "fromAlias" | "deliveredTo" | "matchAddresses" | "to" | "cc">,
+): { readonly alias: SendAsAliasRecord; readonly match: AliasMatch } | undefined => {
+  const sendable = aliases.filter(isSendableAlias);
   if (input.fromAlias) {
-    return verified.find((alias) => alias.sendAsEmail.toLowerCase() === input.fromAlias!.trim().toLowerCase());
+    const requested = sendable.find((alias) => alias.sendAsEmail.toLowerCase() === input.fromAlias!.trim().toLowerCase());
+    return requested ? { alias: requested, match: "requested" } : undefined;
   }
-  const recipientAddresses = [input.deliveredTo, ...input.to, ...(input.cc ?? [])]
+  const recipientAddresses = [input.deliveredTo, ...(input.matchAddresses ?? [...input.to, ...(input.cc ?? [])])]
     .filter((value): value is string => Boolean(value))
     .map((value) => extractAddress(value).toLowerCase());
   const matched = recipientAddresses
-    .map((address) => verified.find((alias) => alias.sendAsEmail.toLowerCase() === address))
+    .map((address) => sendable.find((alias) => alias.sendAsEmail.toLowerCase() === address))
     .find((alias): alias is SendAsAliasRecord => alias !== undefined);
-  return matched ?? verified.find((alias) => alias.isDefault) ?? verified.find((alias) => alias.isPrimary) ?? verified[0];
+  if (matched) return { alias: matched, match: "recipient" };
+  const fallback = sendable.find((alias) => alias.isDefault);
+  if (fallback) return { alias: fallback, match: "default" };
+  const primary = sendable.find((alias) => alias.isPrimary);
+  if (primary) return { alias: primary, match: "primary" };
+  return sendable[0] ? { alias: sendable[0], match: "first" } : undefined;
 };
 
 const safeHeader = (value: string, name: string): string => {

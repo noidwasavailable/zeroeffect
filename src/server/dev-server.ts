@@ -38,7 +38,7 @@ type SyncJob = {
   status: "queued" | "running" | "completed" | "failed";
   updatedAt: number;
   progress: SyncJobProgress;
-  result?: { readonly mode: "initial" | "incremental"; readonly messagesUpserted: number; readonly messagesDeleted: number };
+  result?: { readonly mode: "initial" | "incremental"; readonly messagesUpserted: number; readonly messagesDeleted: number; readonly threadsWithNewMessages?: ReadonlyArray<string> };
   error?: string;
 };
 
@@ -62,6 +62,8 @@ export interface DevServerConfig {
   readonly tokens?: GmailAccessTokenProvider;
   readonly events?: AccountEventBus;
   readonly api?: ApiHandler;
+  /** Called after a sync job succeeds, e.g. to run the AI labeller on new mail. */
+  readonly onSyncCompleted?: (accountId: AccountId, result: NonNullable<SyncJob["result"]>) => void;
 }
 
 const json = (value: unknown, status = 200): Response => Response.json(value, {
@@ -107,6 +109,7 @@ const runSyncJob = async (
   job: SyncJob,
   work: () => Promise<SyncJob["result"]>,
   events: AccountEventBus,
+  onCompleted?: (result: NonNullable<SyncJob["result"]>) => void,
 ): Promise<void> => {
   job.status = "running";
   job.updatedAt = Date.now();
@@ -115,6 +118,7 @@ const runSyncJob = async (
   try {
     const result = await work();
     job.result = result;
+    if (result) onCompleted?.(result);
     job.status = "completed";
     job.progress = {
       stage: "completed",
@@ -482,7 +486,7 @@ export const createDevServer = (config: DevServerConfig): Bun.Server<unknown> =>
           } finally {
             await runtime.dispose();
           }
-        }, events);
+        }, events, (result) => config.onSyncCompleted?.(accountId, result));
         return json({ job }, 202);
       }
 

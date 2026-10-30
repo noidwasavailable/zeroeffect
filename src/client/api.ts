@@ -1,6 +1,14 @@
+import type { AiRulesFile } from "../shared/aiRules";
 import {
   LOCAL_REQUEST_HEADER,
   type AccountSummary,
+  type AiAuditSummary,
+  type AiRunSummary,
+  type LlmEndpointSummary,
+  type ReplyDraft,
+  type SendReplyRequest,
+  type RulesProblemSummary,
+  type RulesResponse,
   type ApiErrorBody,
   type LabelSummary,
   type SyncJobStatus,
@@ -16,6 +24,8 @@ export class ApiRequestError extends Error {
     message: string,
     readonly status: number,
     readonly offset?: number,
+    /** Rule validation problems returned with a rejected rules save or import. */
+    readonly problems?: ReadonlyArray<RulesProblemSummary>,
   ) {
     super(message);
   }
@@ -36,8 +46,8 @@ const request = async <A>(path: string, init: { readonly method?: "GET" | "POST"
   } catch {
     throw new ApiRequestError("Could not reach the ZeroEffect server.", 0);
   }
-  const body = await response.json().catch(() => null) as (A & Partial<ApiErrorBody>) | null;
-  if (!response.ok) throw new ApiRequestError(body?.error ?? `Request failed with HTTP ${response.status}.`, response.status, body?.offset);
+  const body = await response.json().catch(() => null) as (A & Partial<ApiErrorBody> & { problems?: ReadonlyArray<RulesProblemSummary> }) | null;
+  if (!response.ok) throw new ApiRequestError(body?.error ?? `Request failed with HTTP ${response.status}.`, response.status, body?.offset, body?.problems);
   return body as A;
 };
 
@@ -72,4 +82,29 @@ export const api = {
       .then((body) => body.job),
   sync: (accountId: string) => request<unknown>(`/api/accounts/${encodeURIComponent(accountId)}/sync`, { method: "POST", body: {} }),
   eventsUrl: (accountId: string) => accountPath(accountId, "/events"),
+  runAi: (accountId: string, threadId: string) =>
+    request<{ result: AiRunSummary }>(accountPath(accountId, `/threads/${encodeURIComponent(threadId)}/ai`), { method: "POST", body: {} })
+      .then((body) => body.result),
+  aiAudits: (accountId: string, threadId: string) =>
+    request<{ audits: ReadonlyArray<AiAuditSummary> }>(accountPath(accountId, `/threads/${encodeURIComponent(threadId)}/ai`)).then((body) => body.audits),
+  undoAi: (accountId: string) =>
+    request<{ reverted: boolean; threadId?: string }>(accountPath(accountId, "/ai/undo"), { method: "POST", body: {} }),
+  decideGhostLabels: (accountId: string, threadId: string, decision: "accept" | "reject") =>
+    request<{ thread: ThreadDetail }>(accountPath(accountId, `/threads/${encodeURIComponent(threadId)}/ghost`), { method: "POST", body: { decision } })
+      .then((body) => body.thread),
+  replyDraft: (accountId: string, threadId: string) =>
+    request<{ draft: ReplyDraft }>(accountPath(accountId, `/threads/${encodeURIComponent(threadId)}/reply`)).then((body) => body.draft),
+  sendReply: (accountId: string, threadId: string, reply: SendReplyRequest) =>
+    request<{ sent: { id: string; threadId: string } }>(accountPath(accountId, `/threads/${encodeURIComponent(threadId)}/reply`), { method: "POST", body: reply })
+      .then((body) => body.sent),
+  rules: (accountId: string) => request<RulesResponse>(accountPath(accountId, "/rules")),
+  saveRules: (accountId: string, rules: AiRulesFile) =>
+    request<RulesResponse>(accountPath(accountId, "/rules"), { method: "PUT", body: { rules } }),
+  importRules: (accountId: string, exported: unknown, mode: "replace" | "append") =>
+    request<RulesResponse & { imported: ReadonlyArray<string>; skipped: ReadonlyArray<RulesProblemSummary> }>(
+      accountPath(accountId, "/rules/import"), { method: "POST", body: { export: exported, mode } },
+    ),
+  llmEndpoints: () => request<{ endpoints: ReadonlyArray<LlmEndpointSummary> }>("/api/llm-endpoints").then((body) => body.endpoints),
+  saveLlmEndpoint: (endpoint: Omit<LlmEndpointSummary, "timeoutMs"> & { readonly apiKey?: string }) =>
+    request<{ endpoints: ReadonlyArray<LlmEndpointSummary> }>("/api/llm-endpoints", { method: "POST", body: endpoint }).then((body) => body.endpoints),
 };

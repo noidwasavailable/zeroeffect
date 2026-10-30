@@ -1,24 +1,29 @@
-import { Effect, ManagedRuntime, type Layer } from "effect";
+import { Effect, Layer, ManagedRuntime } from "effect";
 import {
   isAccountId,
   MAX_VIEW_NAME_LENGTH,
   LOCAL_REQUEST_HEADER,
   type AccountId,
   type ApiErrorBody,
+  type ReplyDraft,
   type ThreadAction,
   type ThreadPage,
   type ViewSummary,
 } from "../../shared/api";
-import { DatabaseError, FilterParseError, GmailApiError } from "../../shared/errors";
+import { DatabaseError, FilterParseError, GmailApiError, LlmEndpointError, SendAsComposeError } from "../../shared/errors";
 import type { FilterExpr } from "../../shared/schemas";
-import { applyLabelChange, threadActionLabels } from "../../shared/threadActions";
+import { threadActionLabels } from "../../shared/threadActions";
 import { BUILT_IN_VIEWS } from "../../shared/views";
 import { AccountDb, AccountDbLive, type AccountDbService } from "../services/AccountDb";
+import { formatRulesFile, importInboxZeroRules, parseRulesFile } from "../services/AiRules";
+import type { OAuthTokenVault } from "../services/OAuthTokenVault";
+import type { AiRunner } from "../services/AiRunner";
 import { BooleanFilter, BooleanFilterLive } from "../services/BooleanFilter";
 import type { GmailAccessTokenProvider } from "../services/GmailAccessTokens";
 import { GmailClient, GmailClientLive, type GmailClientService } from "../services/GmailClient";
 import { resolveLabelIds } from "../services/GmailLabels";
 import type { RegistryDbService } from "../services/RegistryDb";
+import { chooseAlias, isSendableAlias, SendAsComposerService, SendAsComposerServiceLive } from "../services/SendAsComposerService";
 import { accountEventStream, type AccountEventBus } from "./sse";
 
 export interface ApiConfig {
@@ -29,6 +34,12 @@ export interface ApiConfig {
   readonly gmailApiBaseUrl?: string;
   /** Opens an account's silo; defaults to its SQLite file under accountDataDirectory (tests pass in-memory silos). */
   readonly accountDbLayer?: (accountId: AccountId) => Layer.Layer<AccountDb, unknown>;
+  /** Runs the AI labeller on demand; AI routes answer 503 without it. */
+  readonly aiRunner?: AiRunner;
+  /** Encrypts LLM API keys saved from the settings screen; endpoint creation answers 503 without it. */
+  readonly vault?: OAuthTokenVault;
+  /** Called after a reply is sent, e.g. to sync the sent message (and its conversation status) right away. */
+  readonly onReplySent?: (accountId: AccountId) => void;
 }
 
 export interface ApiHandler {
@@ -69,6 +80,11 @@ const failureResponse = (error: unknown): Response => {
   if (error instanceof GmailApiError) {
     console.error(`Gmail request failed: ${error.message}`, error);
     return apiError(502, { error: `Gmail rejected the change: ${error.message}`, retryable: error.retryable });
+  }
+  if (error instanceof SendAsComposeError) return apiError(400, { error: error.message });
+  if (error instanceof LlmEndpointError) {
+    console.error(`LLM request failed (${error.apiMode}): ${error.message}`);
+    return apiError(502, { error: `The AI labeller failed: ${error.message}` });
   }
   if (error instanceof DatabaseError) {
     console.error(`Account database error during ${error.operation}.`, error);
@@ -159,9 +175,9 @@ export const createApiHandler = (config: ApiConfig): ApiHandler => {
     await Effect.runPromise(Effect.gen(function* () {
       const addIds = yield* resolveLabelIds(db, gmail, add, { create: true });
       const removeIds = yield* resolveLabelIds(db, gmail, remove, { create: false });
-      for (const message of thread.messages) yield* gmail.modifyMessage(message.id, addIds, removeIds);
+      yield* gmail.modifyThread(threadId, addIds, removeIds);
     }));
-    const updated = await Effect.runPromise(db.setThreadLabels(threadId, applyLabelChange(thread.labels, add, remove)));
+    const updated = await Effect.runPromise(db.applyThreadLabelChange(threadId, add, remove));
     config.events.publish(accountId, { type: "threads-changed", threadIds: [threadId] });
     return json({ thread: updated });
   };
@@ -231,6 +247,171 @@ export const createApiHandler = (config: ApiConfig): ApiHandler => {
     return json({ views: await listViews(db) });
   };
 
+  const saveRules = async (accountId: AccountId, request: Request): Promise<Response> => {
+    const body = await readJson(request);
+    if (!body || typeof body.rules !== "object" || body.rules === null) return apiError(400, { error: "Send the rules file as { rules }." });
+    // Validate exactly what will be written; nothing is saved unless every rule is valid.
+    const loaded = parseRulesFile(JSON.stringify(body.rules));
+    if (loaded.problems.length > 0) {
+      return json({ error: "Some rules are invalid; nothing was saved.", problems: loaded.problems }, 400);
+    }
+    await Effect.runPromise((await accountDb(accountId)).writeRulesFile(formatRulesFile(loaded.file)));
+    config.events.publish(accountId, { type: "rules-changed" });
+    return json({ rules: loaded.file, problems: [] });
+  };
+
+  const importRules = async (accountId: AccountId, request: Request): Promise<Response> => {
+    const body = await readJson(request);
+    if (!body || !Array.isArray(body.export)) return apiError(400, { error: "Send an Inbox Zero export as { export: [...] }." });
+    const db = await accountDb(accountId);
+    const current = parseRulesFile(await Effect.runPromise(db.readRulesFile()));
+    if (body.mode === "append" && current.problems.length > 0) {
+      return json({ error: "The current rules file has invalid rules; fix them or import with replace.", problems: current.problems }, 409);
+    }
+    let result: ReturnType<typeof importInboxZeroRules>;
+    try {
+      result = importInboxZeroRules(body.export, current.file.llmEndpointId);
+    } catch (error) {
+      return apiError(400, { error: error instanceof Error ? error.message : "Invalid export." });
+    }
+    // "append" keeps existing rules and adds imported ones whose names are new.
+    const existingNames = new Set(current.rules.map((rule) => rule.name.toLowerCase()));
+    const rules = body.mode === "append"
+      ? [...current.rules, ...result.file.rules.filter((rule) => !existingNames.has(rule.name.toLowerCase()))]
+      : result.file.rules;
+    const file = { ...current.file, rules };
+    await Effect.runPromise(db.writeRulesFile(formatRulesFile(file)));
+    config.events.publish(accountId, { type: "rules-changed" });
+    return json({ rules: file, problems: [], imported: result.imported, skipped: result.skipped });
+  };
+
+  /** Accepting applies the AI's suggested labels (Gmail first); rejecting just clears them. */
+  const decideGhostLabels = async (accountId: AccountId, threadId: string, request: Request): Promise<Response> => {
+    const body = await readJson(request);
+    if (body?.decision !== "accept" && body?.decision !== "reject") return apiError(400, { error: "decision must be accept or reject." });
+    const db = await accountDb(accountId);
+    const thread = await Effect.runPromise(db.getThreadDetail(threadId));
+    if (!thread) return apiError(404, { error: "Thread not found." });
+    if (body.decision === "accept" && thread.ghostLabels.length > 0) {
+      const gmail = await gmailClient(accountId);
+      const labels = thread.ghostLabels;
+      await Effect.runPromise(Effect.gen(function* () {
+        yield* gmail.modifyThread(threadId, yield* resolveLabelIds(db, gmail, labels, { create: true }), []);
+      }));
+      await Effect.runPromise(db.applyThreadLabelChange(threadId, labels, []));
+    }
+    await Effect.runPromise(db.setGhostLabels(threadId, []));
+    config.events.publish(accountId, { type: "threads-changed", threadIds: [threadId] });
+    return json({ thread: await Effect.runPromise(db.getThreadDetail(threadId)) });
+  };
+
+  const saveLlmEndpoint = async (request: Request): Promise<Response> => {
+    if (!config.vault) return apiError(503, { error: "LLM endpoints cannot be saved from this server." });
+    const body = await readJson(request);
+    const text = (value: unknown) => typeof value === "string" && value.trim() ? value.trim() : null;
+    const id = text(body?.id);
+    const baseUrl = text(body?.baseUrl);
+    const modelId = text(body?.modelId);
+    const apiMode = body?.apiMode;
+    if (!id || !/^[A-Za-z0-9_-]{1,40}$/.test(id) || !baseUrl || !modelId || (apiMode !== "responses" && apiMode !== "chat_completions")) {
+      return apiError(400, { error: "An endpoint needs an id (letters, digits, - or _), a base URL, a model and an API mode." });
+    }
+    try {
+      if (!/^https?:$/.test(new URL(baseUrl).protocol)) throw new Error();
+    } catch {
+      return apiError(400, { error: "The base URL must be an http(s) URL." });
+    }
+    const existing = await Effect.runPromise(config.registry.getLlmEndpoint(id));
+    const apiKey = text(body?.apiKey);
+    // Keys are write-only: an update without a new key keeps the stored one.
+    if (!apiKey && !existing) return apiError(400, { error: "A new endpoint needs an API key." });
+    await Effect.runPromise(config.registry.upsertLlmEndpoint({
+      id,
+      name: text(body?.name) ?? id,
+      baseUrl,
+      modelId,
+      apiMode,
+      apiKeyEnc: apiKey ? config.vault.encrypt(apiKey) : existing!.apiKeyEnc,
+      timeoutMs: typeof body?.timeoutMs === "number" && body.timeoutMs > 0 ? body.timeoutMs : existing?.timeoutMs ?? 30_000,
+    }));
+    return json({ endpoints: await Effect.runPromise(config.registry.listLlmEndpoints()) });
+  };
+
+  const extractAddress = (value: string): string => (/<([^<>]+)>/.exec(value)?.[1] ?? value).trim().toLowerCase();
+
+  /** Works out who a reply goes to, its subject and alias, following Gmail's reply / reply-all rules. */
+  const replyTarget = async (accountId: AccountId, threadId: string) => {
+    const db = await accountDb(accountId);
+    const context = await Effect.runPromise(db.getAiThreadContext(threadId));
+    if (!context) return null;
+    const account = await Effect.runPromise(config.registry.getAccount(accountId));
+    const aliases = await Effect.runPromise(db.listSendAsAliases());
+    const own = new Set([account?.email, ...aliases.map((alias) => alias.sendAsEmail)].filter((value): value is string => Boolean(value)).map((value) => value.toLowerCase()));
+    const messages = context.messages.filter((message) => !message.labels.includes("DRAFT"));
+    const sentByUser = (message: (typeof messages)[number]) => message.labels.includes("SENT") || own.has(extractAddress(message.fromAddress));
+    const target = [...messages].reverse().find((message) => !sentByUser(message)) ?? messages.at(-1);
+    if (!target) return null;
+    const headers = await Effect.runPromise(db.getMessageHeaders(target.id)) ?? {};
+    // Replying to your own message (a follow-up) goes to its original recipients.
+    const to = sentByUser(target) ? [...target.toAddresses] : [headers["reply-to"] ?? target.fromAddress];
+    const toAddresses = new Set(to.map(extractAddress));
+    const replyAllCc = [...new Map([...target.toAddresses, ...target.ccAddresses]
+      .filter((address) => !own.has(extractAddress(address)) && !toAddresses.has(extractAddress(address)))
+      .map((address) => [extractAddress(address), address])).values()];
+    const choice = chooseAlias(aliases, { deliveredTo: target.deliveredTo, matchAddresses: [...target.toAddresses, ...target.ccAddresses], to: [], cc: [] });
+    return { db, context, target, headers, to, replyAllCc, aliases, choice };
+  };
+
+  const replyDraft = async (accountId: AccountId, threadId: string): Promise<Response> => {
+    const target = await replyTarget(accountId, threadId);
+    if (!target) return apiError(404, { error: "Thread not found." });
+    const subject = target.target.subject.trim() || target.context.thread.subject;
+    return json({
+      draft: {
+        messageId: target.target.id,
+        to: target.to,
+        cc: [],
+        replyAllCc: target.replyAllCc,
+        subject: /^re:/i.test(subject) ? subject : `Re: ${subject}`,
+        fromAlias: target.choice?.alias.sendAsEmail ?? null,
+        aliasMatch: target.choice && target.choice.match !== "requested" ? target.choice.match : null,
+        aliases: target.aliases.filter(isSendableAlias).map(({ sendAsEmail, displayName, isDefault, isPrimary }) => ({ sendAsEmail, displayName, isDefault, isPrimary })),
+      } satisfies ReplyDraft,
+    });
+  };
+
+  const sendReply = async (accountId: AccountId, threadId: string, request: Request): Promise<Response> => {
+    const body = await readJson(request);
+    const strings = (value: unknown) => Array.isArray(value) && value.every((item) => typeof item === "string") ? (value as string[]).map((item) => item.trim()).filter(Boolean) : null;
+    const to = strings(body?.to);
+    const cc = strings(body?.cc ?? []);
+    if (!body || !to || to.length === 0 || !cc || typeof body.body !== "string" || !body.body.trim() || typeof body.subject !== "string" || typeof body.fromAlias !== "string") {
+      return apiError(400, { error: "A reply needs recipients, a subject, a sender alias and a message." });
+    }
+    const target = await replyTarget(accountId, threadId);
+    if (!target) return apiError(404, { error: "Thread not found." });
+    const original = target.context.messages.find((message) => message.id === body.messageId) ?? target.target;
+    const headers = original.id === target.target.id ? target.headers : await Effect.runPromise(target.db.getMessageHeaders(original.id)) ?? {};
+    const messageIdHeader = headers["message-id"] ?? null;
+    const gmail = await gmailClient(accountId);
+    const composer = Effect.runSync(Effect.gen(function* () { return yield* SendAsComposerService; }).pipe(
+      Effect.provide(Layer.provide(SendAsComposerServiceLive, Layer.merge(Layer.succeed(AccountDb, target.db), Layer.succeed(GmailClient, gmail)))),
+    ));
+    const sent = await Effect.runPromise(composer.send({
+      to,
+      cc,
+      subject: body.subject,
+      text: body.body,
+      fromAlias: body.fromAlias,
+      threadId,
+      inReplyTo: messageIdHeader,
+      references: [headers.references, messageIdHeader].filter(Boolean).join(" ") || null,
+      quote: { from: original.fromAddress, dateTs: original.dateTs, text: original.bodyMarkdown },
+    }));
+    config.onReplySent?.(accountId);
+    return json({ sent });
+  };
+
   const route = async (request: Request, url: URL, accountId: AccountId, rest: string): Promise<Response> => {
     const account = await Effect.runPromise(config.registry.getAccount(accountId));
     if (!account) return apiError(404, { error: `The ${accountId} account is not connected. Connect it from /setup.` });
@@ -259,6 +440,35 @@ export const createApiHandler = (config: ApiConfig): ApiHandler => {
       }
     }
 
+    if (request.method === "GET" && rest === "/rules") {
+      const loaded = parseRulesFile(await Effect.runPromise((await accountDb(accountId)).readRulesFile()));
+      return json({ rules: loaded.file, problems: loaded.problems });
+    }
+    if (request.method === "PUT" && rest === "/rules") return saveRules(accountId, request);
+    if (request.method === "POST" && rest === "/rules/import") return importRules(accountId, request);
+    const replyMatch = /^\/threads\/([^/]+)\/reply$/.exec(rest);
+    if (replyMatch) {
+      const threadId = decodeURIComponent(replyMatch[1]!);
+      if (request.method === "GET") return replyDraft(accountId, threadId);
+      if (request.method === "POST") return sendReply(accountId, threadId, request);
+    }
+    const ghostMatch = /^\/threads\/([^/]+)\/ghost$/.exec(rest);
+    if (ghostMatch && request.method === "POST") return decideGhostLabels(accountId, decodeURIComponent(ghostMatch[1]!), request);
+    if (request.method === "POST" && rest === "/ai/undo") {
+      if (!config.aiRunner) return apiError(503, { error: "The AI labeller is not available." });
+      return json(await config.aiRunner.undo(accountId));
+    }
+    const aiMatch = /^\/threads\/([^/]+)\/ai$/.exec(rest);
+    if (aiMatch) {
+      const threadId = decodeURIComponent(aiMatch[1]!);
+      if (request.method === "GET") return json({ audits: await Effect.runPromise((await accountDb(accountId)).listAiAudits(threadId)) });
+      if (request.method === "POST") {
+        if (!config.aiRunner) return apiError(503, { error: "The AI labeller is not available." });
+        if (!await Effect.runPromise((await accountDb(accountId)).getThread(threadId))) return apiError(404, { error: "Thread not found." });
+        return json({ result: await config.aiRunner.runThread(accountId, threadId, "manual") });
+      }
+    }
+
     const threadMatch = /^\/threads\/([^/]+)(\/actions)?$/.exec(rest);
     if (threadMatch) {
       const threadId = decodeURIComponent(threadMatch[1]!);
@@ -273,6 +483,19 @@ export const createApiHandler = (config: ApiConfig): ApiHandler => {
 
   return {
     handle: async (request, url) => {
+      // LLM endpoints are shared by both accounts (each account's rules file picks one).
+      if (url.pathname === "/api/llm-endpoints") {
+        try {
+          if (request.method === "GET") return json({ endpoints: await Effect.runPromise(config.registry.listLlmEndpoints()) });
+          if (request.method === "POST") {
+            if (!isTrustedMutation(request)) return apiError(403, { error: "This request must come from the ZeroEffect web client." });
+            return await saveLlmEndpoint(request);
+          }
+          return apiError(405, { error: "Use GET or POST." });
+        } catch (error) {
+          return failureResponse(error);
+        }
+      }
       const match = /^\/api\/a\/([^/]+)(\/.*)?$/.exec(url.pathname);
       if (!match) return null;
       const accountId = match[1] ?? null;

@@ -4,6 +4,8 @@ import { Effect } from "effect";
 import { createDevServer } from "../src/server/dev-server";
 import { createApiHandler, type ApiHandler } from "../src/server/routes/api";
 import { createAccountEventBus } from "../src/server/routes/sse";
+import { formatRulesFile } from "../src/server/services/AiRules";
+import { createAiRunner } from "../src/server/services/AiRunner";
 import { AccountDb, AccountDbTest, type AccountDbService } from "../src/server/services/AccountDb";
 import { BooleanFilter, BooleanFilterLive } from "../src/server/services/BooleanFilter";
 import { createGmailAccessTokenProvider, type StoredTokens } from "../src/server/services/GmailAccessTokens";
@@ -111,7 +113,7 @@ describe("Phase 4: shared parser and visual filter builder", () => {
 });
 
 describe("Phase 4: label renames reach saved views and AI rules", () => {
-  test("rewrites saved view ASTs and DSL, rule preconditions and rule actions", async () => {
+  test("rewrites saved view ASTs and DSL (rule files: see Phase 3)", async () => {
     const database = new Database(":memory:");
     closeables.push(database);
     const db = serviceOf(database, "personal");
@@ -119,20 +121,45 @@ describe("Phase 4: label renames reach saved views and AI rules", () => {
     const viewAst = parse('label:receipts OR (is:unread AND label:"Other")');
     database.prepare("INSERT INTO saved_views (id, name, sort_order, filter_ast_json, dsl_string) VALUES ('v', 'Money', 1, ?, ?)")
       .run(JSON.stringify(viewAst), formatFilterExpr(viewAst));
-    database.prepare(`INSERT INTO ai_rules (id, name, precondition_ast_json, system_prompt, actions_json, llm_endpoint_id)
-      VALUES ('r', 'Receipts', ?, '', ?, 'e')`).run(
-      JSON.stringify(parse("NOT label:Receipts")),
-      JSON.stringify({ addLabels: ["Receipts"], removeLabels: ["Other"], archive: true }),
-    );
 
     await Effect.runPromise(db.replaceLabels([{ id: "Label_1", name: "Finance/Receipts", type: "user", colorBg: null, colorText: null }]));
 
     expect(await Effect.runPromise(db.listSavedViews())).toEqual([
       { id: "v", name: "Money", dsl: "label:Finance/Receipts OR (is:unread AND label:Other)", builtIn: false },
     ]);
-    const rule = database.prepare("SELECT precondition_ast_json AS ast, actions_json AS actions FROM ai_rules").get() as { ast: string; actions: string };
-    expect(JSON.parse(rule.ast)).toEqual(parse('NOT label:"Finance/Receipts"'));
-    expect(JSON.parse(rule.actions)).toEqual({ addLabels: ["Finance/Receipts"], removeLabels: ["Other"], archive: true });
+  });
+
+  test("sync keeps AI state, never rolls a thread back to an older message, and unions message labels", async () => {
+    const database = new Database(":memory:");
+    closeables.push(database);
+    const db = serviceOf(database, "personal");
+    const upsert = (labels: string[], at: number, subject: string) => Effect.runPromise(db.upsertThread({
+      id: "t", subject, senderSummary: "a@example.com", labels, snippet: subject, lastMessageAt: at,
+      isUnread: false, isStarred: false, isArchived: false,
+    }));
+    const message = (id: string, labels: string[], at: number) => Effect.runPromise(db.upsertMessage({
+      id, threadId: "t", fromAddress: "a@example.com", toAddresses: [], ccAddresses: [], deliveredTo: null, dateTs: at,
+      bodyMarkdown: "", bodyHtmlSanitized: "", rawHeaders: {}, labels,
+    }));
+    await upsert(["INBOX", "Receipts"], 100, "First");
+    await message("m1", ["INBOX", "Receipts"], 100);
+    await Effect.runPromise(db.setGhostLabels("t", ["Travel"]));
+    await upsert(["INBOX", "UNREAD"], 200, "Reply");
+    await message("m2", ["INBOX", "UNREAD"], 200);
+    await Effect.runPromise(db.refreshThreadLabelsFromMessages("t"));
+    // A label change on the older message arrives later in history.
+    await upsert(["INBOX", "Receipts", "STARRED"], 100, "First");
+    await message("m1", ["INBOX", "Receipts", "STARRED"], 100);
+    await Effect.runPromise(db.refreshThreadLabelsFromMessages("t"));
+    const thread = (await Effect.runPromise(db.getAiThreadContext("t")))!;
+    expect(thread.thread).toMatchObject({
+      subject: "Reply", lastMessageAt: 200, ghostLabels: ["Travel"], isUnread: true, isStarred: true,
+      labels: ["INBOX", "Receipts", "STARRED", "UNREAD"],
+    });
+    await Effect.runPromise(db.applyThreadLabelChange("t", ["Done"], ["INBOX", "UNREAD"]));
+    expect((await Effect.runPromise(db.getAiThreadContext("t")))!.messages.map((entry) => entry.labels)).toEqual([
+      ["Receipts", "STARRED", "Done"], ["Done"],
+    ]);
   });
 });
 
@@ -156,6 +183,10 @@ describe("Phase 4: one action registry drives the palette, toolbar and Vim keys"
     canSelectPrevious: false,
     syncing: false,
     builderOpen: false,
+    auditOpen: false,
+    composerOpen: false,
+    aiBusy: false,
+    rules: [{ name: "Newsletter", automate: true }],
     savedViewPosition: null,
     moveSelection: (delta) => calls.push(`move:${delta}`),
     openSelectedThread: () => calls.push("open"),
@@ -171,6 +202,16 @@ describe("Phase 4: one action registry drives the palette, toolbar and Vim keys"
     editView: () => calls.push("edit-view"),
     deleteView: () => calls.push("delete-view"),
     moveView: (delta) => calls.push(`move-view:${delta}`),
+    runAi: () => calls.push("ai-run"),
+    decideGhostLabels: (decision) => calls.push(`ghost:${decision}`),
+    toggleAudit: () => calls.push("audit"),
+    undoAi: () => calls.push("ai-undo"),
+    openRules: (options) => calls.push(options?.newRule ? "rules:new" : "rules"),
+    toggleRuleDryRun: (name) => calls.push(`dry-run:${name}`),
+    openComposer: (options) => calls.push(`reply:${options.replyAll ? "all" : "one"}:${options.pickAlias ? "alias" : "auto"}`),
+    changeAlias: () => calls.push("alias"),
+    sendReply: () => calls.push("send"),
+    discardReply: () => calls.push("discard"),
   };
   const actions = buildActions(context);
   const keyEvent = (key: string, extra: Partial<Pick<KeyboardEvent, "code" | "altKey" | "metaKey" | "ctrlKey">> = {}) =>
@@ -181,9 +222,18 @@ describe("Phase 4: one action registry drives the palette, toolbar and Vim keys"
     expect(new Set(shortcuts).size).toBe(shortcuts.length);
     // Only rare or destructive view management is palette + button only.
     expect(actions.filter((action) => !action.shortcut).map((action) => action.id).sort())
-      .toEqual(["views.delete", "views.edit", "views.moveDown", "views.moveUp"]);
+      .toEqual([
+        "ai.createRule", "ai.dryRun.Newsletter", "composer.changeAlias", "composer.discard", "composer.send",
+        "views.delete", "views.edit", "views.moveDown", "views.moveUp",
+      ]);
     const ids = new Set(actions.map((action) => action.id));
     for (const id of TOOLBAR_ACTION_IDS) expect(ids.has(id)).toBe(true);
+  });
+
+  test("the toolbar carries the PRD's buttons: Archive, Label, Reply, Run AI and AI Audit", () => {
+    for (const id of ["thread.archive", "thread.label", "thread.reply", "ai.run", "ai.audit"]) {
+      expect(TOOLBAR_ACTION_IDS).toContain(id as (typeof TOOLBAR_ACTION_IDS)[number]);
+    }
   });
 
   test("PRD keys map to the expected actions", () => {
@@ -198,6 +248,15 @@ describe("Phase 4: one action registry drives the palette, toolbar and Vim keys"
     expect(byKey("1")).toBe("views.go.inbox");
     expect(byKey("f")).toBe("filter.builder");
     expect(byKey("v")).toBe("views.save");
+    expect(byKey("a")).toBe("ai.run");
+    expect(byKey("y")).toBe("ai.acceptGhost");
+    expect(byKey("n")).toBe("ai.rejectGhost");
+    expect(byKey("w")).toBe("ai.audit");
+    expect(byKey("z")).toBe("ai.undo");
+    expect(byKey(",")).toBe("ai.rules");
+    expect(byKey("r")).toBe("thread.reply");
+    expect(byKey("R")).toBe("thread.replyAlias");
+    expect(byKey("A")).toBe("thread.replyAll");
     expect(byKey("2", true)).toBe("account.switch.work");
     expect(actions.find((action) => action.id === "thread.toggleRead")?.label).toBe("Mark as read");
   });
@@ -218,6 +277,23 @@ describe("Phase 4: one action registry drives the palette, toolbar and Vim keys"
       actions.find((action) => action.id === id)!.run();
     }
     expect(calls).toEqual(["action:archive", "action:markRead", "action:star", "account:work", "view:starred", "builder", "save-view"]);
+    calls.length = 0;
+    for (const id of ["ai.run", "ai.audit", "ai.undo", "ai.rules", "ai.createRule", "ai.dryRun.Newsletter"]) actions.find((action) => action.id === id)!.run();
+    expect(calls).toEqual(["ai-run", "audit", "ai-undo", "rules", "rules:new", "dry-run:Newsletter"]);
+    expect(actions.find((action) => action.id === "ai.dryRun.Newsletter")?.label).toBe("Turn on dry-run: Newsletter");
+    // Suggestions can only be decided when the thread has some.
+    expect(actions.find((action) => action.id === "ai.acceptGhost")?.enabled).toBe(false);
+    const withGhosts = buildActions({ ...context, selectedThread: { ...thread, ghostLabels: ["Travel"] } });
+    withGhosts.find((action) => action.id === "ai.acceptGhost")!.run();
+    expect(calls.at(-1)).toBe("ghost:accept");
+    calls.length = 0;
+    for (const id of ["thread.reply", "thread.replyAlias", "thread.replyAll"]) actions.find((action) => action.id === id)!.run();
+    expect(calls).toEqual(["reply:one:auto", "reply:one:alias", "reply:all:auto"]);
+    // Composer actions only work while a reply is open; replying again is disabled then.
+    expect(actions.find((action) => action.id === "composer.send")?.enabled).toBe(false);
+    const composing = buildActions({ ...context, composerOpen: true });
+    expect(composing.find((action) => action.id === "composer.send")?.enabled).toBe(true);
+    expect(composing.find((action) => action.id === "thread.reply")?.enabled).toBe(false);
     expect(actions.find((action) => action.id === "account.switch.personal")?.enabled).toBe(false);
     // Built-in views cannot be edited, deleted or moved.
     for (const id of ["views.edit", "views.delete", "views.moveUp", "views.moveDown"]) {
@@ -256,7 +332,7 @@ const unusedOAuth: GoogleOAuth2Api = {
 };
 
 /** A mock Gmail API, an in-memory registry with both accounts connected, and isolated in-memory silos. */
-const makeEnvironment = async (options: { readonly connectWork?: boolean } = {}) => {
+const makeEnvironment = async (options: { readonly connectWork?: boolean; readonly withAi?: boolean } = {}) => {
   const gmailCalls: GmailCall[] = [];
   let failModify = false;
   const gmail = Bun.serve({
@@ -269,6 +345,9 @@ const makeEnvironment = async (options: { readonly connectWork?: boolean } = {})
         return failModify
           ? Response.json({ error: { code: 400, message: "Invalid label", errors: [{ reason: "invalidArgument" }] } }, { status: 400 })
           : Response.json({});
+      }
+      if (url.pathname === "/gmail/v1/users/me/messages/send") {
+        return Response.json({ id: "sent-1", threadId: (body as { threadId?: string }).threadId ?? "new-thread" });
       }
       if (url.pathname === "/gmail/v1/users/me/labels" && request.method === "POST") {
         return Response.json({ id: "Label_new", name: (body as { name: string }).name, type: "user" });
@@ -314,13 +393,45 @@ const makeEnvironment = async (options: { readonly connectWork?: boolean } = {})
   await seed(personal, "p-archived", ["Receipts"], 100, ["p-archived-1"]);
   await seed(work, "w-1", ["INBOX"], 50, ["w-1-1"]);
 
+  // A mock LLM that files everything under "Receipts", for the AI routes.
+  const llmCalls: unknown[] = [];
+  const llm = Bun.serve({
+    port: 0,
+    async fetch(request) {
+      llmCalls.push(await request.json());
+      return Response.json({ choices: [{ message: { content: JSON.stringify({
+        reasoning: "An order receipt.", matchedRules: [{ ruleName: "Receipts", isPrimary: true }], noMatchFound: false, conversationStatus: null,
+      }) } }] });
+    },
+  });
+  servers.push(llm);
+  await Effect.runPromise(registry.upsertLlmEndpoint({
+    id: "mock", name: "Mock", baseUrl: `${llm.url}v1`, apiKeyEnc: vault.encrypt("key"), modelId: "mock-model", apiMode: "chat_completions",
+  }));
+  await Effect.runPromise(personal.writeRulesFile(formatRulesFile({
+    version: 1, llmEndpointId: "mock",
+    rules: [{
+      name: "Receipts", instructions: "Purchase receipts", enabled: true, automate: true, runOnThreads: false, systemType: "RECEIPT",
+      conditionalOperator: "AND", from: null, to: null, subject: null, body: null, actions: [{ type: "LABEL", label: "Receipts" }, { type: "ARCHIVE" }],
+    }],
+  })));
+
+  const repliesSent: string[] = [];
   const events = createAccountEventBus();
+  const tokens = createGmailAccessTokenProvider({ registry, oauth: unusedOAuth, vault });
+  const accountDbLayer = (accountId: AccountId) => AccountDbTest(accountId, silos[accountId]);
+  const aiRunner = options.withAi === false ? undefined : createAiRunner({
+    registry, tokens, vault, events, gmailApiBaseUrl: `${gmail.url}gmail/v1`, accountDbLayer: (accountId) => accountDbLayer(accountId as AccountId),
+  });
   const api = createApiHandler({
     registry,
-    tokens: createGmailAccessTokenProvider({ registry, oauth: unusedOAuth, vault }),
+    tokens,
     events,
     gmailApiBaseUrl: `${gmail.url}gmail/v1`,
-    accountDbLayer: (accountId) => AccountDbTest(accountId, silos[accountId]),
+    accountDbLayer,
+    vault,
+    onReplySent: (accountId) => repliesSent.push(accountId),
+    ...(aiRunner ? { aiRunner } : {}),
   });
   const server = Bun.serve({
     port: 0,
@@ -330,7 +441,7 @@ const makeEnvironment = async (options: { readonly connectWork?: boolean } = {})
   const call = (path: string, init: RequestInit = {}) => fetch(new URL(path, server.url), init);
   const post = (path: string, body: unknown, headers: Record<string, string> = { [LOCAL_REQUEST_HEADER]: "1" }) =>
     call(path, { method: "POST", headers: { "Content-Type": "application/json", ...headers }, body: JSON.stringify(body) });
-  return { api, events, registry, personal, work, gmailCalls, setFailModify: (value: boolean) => { failModify = value; }, call, post, server };
+  return { api, events, registry, personal, work, gmailCalls, llmCalls, repliesSent, setFailModify: (value: boolean) => { failModify = value; }, call, post, server };
 };
 
 describe("Phase 4: account-scoped HTTP API", () => {
@@ -393,9 +504,9 @@ describe("Phase 4: account-scoped HTTP API", () => {
     const response = await env.post("/api/a/personal/threads/p-new/actions", { type: "archive" });
     expect(response.status).toBe(200);
     expect(await response.json()).toMatchObject({ thread: { id: "p-new", isArchived: true, labels: ["UNREAD"] } });
+    // One threads.modify call covers every message in the thread.
     expect(env.gmailCalls.map((call) => [call.path, call.token, call.body])).toEqual([
-      ["/gmail/v1/users/me/messages/p-new-1/modify", "Bearer token-personal", { addLabelIds: [], removeLabelIds: ["INBOX"] }],
-      ["/gmail/v1/users/me/messages/p-new-2/modify", "Bearer token-personal", { addLabelIds: [], removeLabelIds: ["INBOX"] }],
+      ["/gmail/v1/users/me/threads/p-new/modify", "Bearer token-personal", { addLabelIds: [], removeLabelIds: ["INBOX"] }],
     ]);
     const inbox = await (await env.call("/api/a/personal/threads?view=inbox")).json() as ThreadPage;
     expect(inbox.threads.map((thread) => thread.id)).toEqual(["p-old"]);
@@ -411,7 +522,7 @@ describe("Phase 4: account-scoped HTTP API", () => {
     expect(await response.json()).toMatchObject({ thread: { labels: ["INBOX", "Travel"] } });
     expect(env.gmailCalls.map((call) => [call.method, call.path, call.body])).toEqual([
       ["POST", "/gmail/v1/users/me/labels", { name: "Travel", labelListVisibility: "labelShow", messageListVisibility: "show" }],
-      ["POST", "/gmail/v1/users/me/messages/p-old-1/modify", { addLabelIds: ["Label_new"], removeLabelIds: ["Label_1"] }],
+      ["POST", "/gmail/v1/users/me/threads/p-old/modify", { addLabelIds: ["Label_new"], removeLabelIds: ["Label_1"] }],
     ]);
     expect((await Effect.runPromise(env.personal.listLabels())).map((label) => label.name)).toContain("Travel");
   });
@@ -470,6 +581,168 @@ describe("Phase 4: account-scoped HTTP API", () => {
     expect(events.filter((type) => type === "views-changed")).toHaveLength(5);
   });
 
+  test("runs the AI labeller on demand, lists its audit trail and undoes it", async () => {
+    const rules = await (await env.call("/api/a/personal/rules")).json() as { rules: { llmEndpointId: string; rules: Array<{ name: string }> }; problems: unknown[] };
+    expect(rules).toMatchObject({ rules: { llmEndpointId: "mock", rules: [{ name: "Receipts" }] }, problems: [] });
+    expect(await (await env.call("/api/a/work/rules")).json()).toMatchObject({ rules: { rules: [] } });
+
+    const run = await env.post("/api/a/personal/threads/p-new/ai", {});
+    expect(run.status).toBe(200);
+    expect(await run.json()).toMatchObject({ result: { status: "processed", llmCalled: true, appliedRules: ["Receipts"] } });
+    expect(env.llmCalls).toHaveLength(1);
+    expect(env.gmailCalls.map((call) => [call.path, call.body])).toEqual([
+      ["/gmail/v1/users/me/threads/p-new/modify", { addLabelIds: ["Label_1"], removeLabelIds: ["INBOX"] }],
+    ]);
+    const { audits } = await (await env.call("/api/a/personal/threads/p-new/ai")).json() as { audits: Array<Record<string, unknown>> };
+    expect(audits).toMatchObject([{ trigger: "manual", ruleNames: ["Receipts"], reasoning: "An order receipt.", modelUsed: "mock-model", reverted: false }]);
+
+    expect(await (await env.post("/api/a/personal/ai/undo", {})).json()).toMatchObject({ reverted: true, threadId: "p-new" });
+    expect([...(await Effect.runPromise(env.personal.getThread("p-new")))!.labels].sort()).toEqual(["INBOX", "UNREAD"]);
+    expect((await env.post("/api/a/personal/threads/nope/ai", {})).status).toBe(404);
+    expect((await env.post("/api/a/personal/threads/p-new/ai", {}, {})).status).toBe(403);
+  });
+
+  test("accepting suggested labels applies them in Gmail; rejecting just clears them", async () => {
+    await Effect.runPromise(env.personal.setGhostLabels("p-new", ["Receipts"]));
+    const accepted = await env.post("/api/a/personal/threads/p-new/ghost", { decision: "accept" });
+    expect(await accepted.json()).toMatchObject({ thread: { ghostLabels: [], labels: expect.arrayContaining(["Receipts", "INBOX"]) } });
+    expect(env.gmailCalls.map((call) => [call.path, call.body])).toEqual([
+      ["/gmail/v1/users/me/threads/p-new/modify", { addLabelIds: ["Label_1"], removeLabelIds: [] }],
+    ]);
+    await Effect.runPromise(env.personal.setGhostLabels("p-old", ["Travel"]));
+    expect(await (await env.post("/api/a/personal/threads/p-old/ghost", { decision: "reject" })).json())
+      .toMatchObject({ thread: { ghostLabels: [], labels: ["INBOX", "Receipts"] } });
+    expect(env.gmailCalls).toHaveLength(1);
+    expect((await env.post("/api/a/personal/threads/p-old/ghost", { decision: "maybe" })).status).toBe(400);
+  });
+
+  test("saves rules only when every rule is valid, and imports Inbox Zero exports", async () => {
+    const send = (method: string, path: string, body: unknown) => env.call(path, {
+      method, headers: { "Content-Type": "application/json", [LOCAL_REQUEST_HEADER]: "1" }, body: JSON.stringify(body),
+    });
+    const { rules } = await (await env.call("/api/a/personal/rules")).json() as { rules: { rules: Array<Record<string, unknown>> } };
+    const invalid = await send("PUT", "/api/a/personal/rules", { rules: { ...rules, rules: [...rules.rules, { ...rules.rules[0], actions: [] }] } });
+    expect(invalid.status).toBe(400);
+    expect(await invalid.json()).toMatchObject({ problems: [
+      { rule: "Receipts", message: "Rule has no actions." },
+      { rule: "Receipts", message: "Another rule already uses this name." },
+    ] });
+
+    const events: string[] = [];
+    env.events.subscribe("personal", (event) => events.push(event.type));
+    const valid = await send("PUT", "/api/a/personal/rules", { rules: { ...rules, rules: [{ ...rules.rules[0], automate: false }] } });
+    expect(await valid.json()).toMatchObject({ rules: { rules: [{ name: "Receipts", automate: false }] }, problems: [] });
+    expect(events).toEqual(["rules-changed"]);
+
+    const exported = [
+      { name: "Newsletter", instructions: "Newsletters", enabled: true, automate: true, runOnThreads: false, systemType: "NEWSLETTER", conditionalOperator: "AND", actions: [{ type: "LABEL", label: "Newsletter" }] },
+      { name: "Receipts", instructions: "Duplicate of an existing rule", enabled: true, automate: true, runOnThreads: false, systemType: null, conditionalOperator: "AND", actions: [{ type: "ARCHIVE" }] },
+      { name: "Webhook", instructions: "x", actions: [{ type: "CALL_WEBHOOK", url: "https://example.com" }] },
+    ];
+    const appended = await (await env.post("/api/a/personal/rules/import", { export: exported, mode: "append" })).json() as Record<string, unknown>;
+    expect(appended).toMatchObject({ imported: ["Newsletter", "Receipts"], skipped: [{ rule: "Webhook" }, { rule: "Webhook" }] });
+    expect((appended.rules as { rules: Array<{ name: string }>; llmEndpointId: string }).rules.map((rule) => rule.name)).toEqual(["Receipts", "Newsletter"]);
+    expect((appended.rules as { llmEndpointId: string }).llmEndpointId).toBe("mock");
+    const replaced = await (await env.post("/api/a/work/rules/import", { export: exported, mode: "replace" })).json() as { rules: { rules: Array<{ name: string }> } };
+    expect(replaced.rules.rules.map((rule) => rule.name)).toEqual(["Newsletter", "Receipts"]);
+    // Each account keeps its own copy.
+    expect((await (await env.call("/api/a/personal/rules")).json() as { rules: { rules: unknown[] } }).rules.rules).toHaveLength(2);
+
+    await Effect.runPromise(env.personal.writeRulesFile('{"version":1,"llmEndpointId":null,"rules":[{"name":"Broken"}]}'));
+    expect((await env.post("/api/a/personal/rules/import", { export: exported, mode: "append" })).status).toBe(409);
+    expect((await env.post("/api/a/personal/rules/import", { export: { not: "an array" } })).status).toBe(400);
+  });
+
+  test("LLM endpoints are shared, and API keys are write-only", async () => {
+    const send = (body: unknown, headers: Record<string, string> = { [LOCAL_REQUEST_HEADER]: "1" }) =>
+      env.call("/api/llm-endpoints", { method: "POST", headers: { "Content-Type": "application/json", ...headers }, body: JSON.stringify(body) });
+    expect((await send({ id: "x", baseUrl: "https://api.example.com/v1", modelId: "m", apiMode: "responses", apiKey: "k" }, {})).status).toBe(403);
+    expect((await send({ id: "new", baseUrl: "https://api.example.com/v1", modelId: "m", apiMode: "responses" })).status).toBe(400);
+    expect((await send({ id: "bad id!", baseUrl: "https://api.example.com/v1", modelId: "m", apiMode: "responses", apiKey: "k" })).status).toBe(400);
+    expect((await send({ id: "x", baseUrl: "file:///etc", modelId: "m", apiMode: "responses", apiKey: "k" })).status).toBe(400);
+
+    const created = await send({ id: "openai", name: "OpenAI", baseUrl: "https://api.openai.com/v1", modelId: "gpt-x", apiMode: "responses", apiKey: "sk-secret" });
+    const body = await created.text();
+    expect(created.status).toBe(200);
+    expect(body).not.toContain("sk-secret");
+    expect(body).not.toContain("apiKey");
+    expect(JSON.parse(body).endpoints.map((endpoint: { id: string }) => endpoint.id).sort()).toEqual(["mock", "openai"]);
+    // Updating without a key keeps the stored one.
+    await send({ id: "openai", baseUrl: "https://api.openai.com/v1", modelId: "gpt-y", apiMode: "chat_completions" });
+    const stored = await Effect.runPromise(env.registry.getLlmEndpoint("openai"));
+    expect(stored).toMatchObject({ modelId: "gpt-y", apiMode: "chat_completions" });
+    expect(vault.decrypt<string>(stored!.apiKeyEnc)).toBe("sk-secret");
+  });
+
+  test("suggests replies with Gmail's reply / reply-all rules and the alias the mail was sent to", async () => {
+    await Effect.runPromise(env.personal.replaceSendAsAliases([
+      // Gmail reports no verification status for the primary address.
+      { sendAsEmail: "me@example.com", displayName: "Me", replyToAddress: null, signatureHtml: null, isPrimary: true, isDefault: true, verificationStatus: "unknown" },
+      { sendAsEmail: "support@example.com", displayName: "Support", replyToAddress: null, signatureHtml: "<p>-- The team</p>", isPrimary: false, isDefault: false, verificationStatus: "accepted" },
+      { sendAsEmail: "pending@example.com", displayName: "Pending", replyToAddress: null, signatureHtml: null, isPrimary: false, isDefault: false, verificationStatus: "pending" },
+    ]));
+    await Effect.runPromise(env.personal.upsertThread({
+      id: "t-help", subject: "Need help", senderSummary: "Ann <ann@client.example>", labels: ["INBOX"], lastMessageAt: 10,
+      isUnread: false, isStarred: false, isArchived: false,
+    }));
+    await Effect.runPromise(env.personal.upsertMessage({
+      id: "help-1", threadId: "t-help", fromAddress: "Ann <ann@client.example>", toAddresses: ["support@example.com"],
+      ccAddresses: ["Bob <bob@client.example>", "me@example.com"], deliveredTo: "support@example.com", dateTs: 10,
+      bodyMarkdown: "Can you help?\nThanks", bodyHtmlSanitized: "", labels: ["INBOX"],
+      rawHeaders: { "message-id": "<help-1@client.example>", references: "<earlier@client.example>", subject: "Need help" },
+    }));
+
+    const { draft } = await (await env.call("/api/a/personal/threads/t-help/reply")).json() as { draft: Record<string, unknown> };
+    expect(draft).toEqual({
+      messageId: "help-1",
+      to: ["Ann <ann@client.example>"],
+      cc: [],
+      // Your own addresses (primary and aliases) never end up on reply-all.
+      replyAllCc: ["Bob <bob@client.example>"],
+      subject: "Re: Need help",
+      fromAlias: "support@example.com",
+      aliasMatch: "recipient",
+      aliases: [
+        { sendAsEmail: "me@example.com", displayName: "Me", isDefault: true, isPrimary: true },
+        { sendAsEmail: "support@example.com", displayName: "Support", isDefault: false, isPrimary: false },
+      ],
+    });
+
+    const send = (body: unknown) => env.post("/api/a/personal/threads/t-help/reply", body);
+    expect((await send({ messageId: "help-1", to: [], cc: [], subject: "Re: Need help", body: "Hi", fromAlias: "support@example.com" })).status).toBe(400);
+    expect((await send({ messageId: "help-1", to: ["ann@client.example"], cc: [], subject: "Re: Need help", body: "Hi", fromAlias: "pending@example.com" })).status).toBe(400);
+    expect(env.repliesSent).toEqual([]);
+
+    const sent = await send({ messageId: "help-1", to: ["Ann <ann@client.example>"], cc: ["Bob <bob@client.example>"], subject: "Re: Need help", body: "Sure, call me.", fromAlias: "support@example.com" });
+    expect(await sent.json()).toEqual({ sent: { id: "sent-1", threadId: "t-help" } });
+    expect(env.repliesSent).toEqual(["personal"]);
+    const call = env.gmailCalls.find((entry) => entry.path === "/gmail/v1/users/me/messages/send")!;
+    expect((call.body as { threadId: string }).threadId).toBe("t-help");
+    const raw = Buffer.from((call.body as { raw: string }).raw, "base64url").toString("utf8");
+    expect(raw).toContain("From: Support <support@example.com>");
+    expect(raw).toContain("To: Ann <ann@client.example>");
+    expect(raw).toContain("Cc: Bob <bob@client.example>");
+    expect(raw).toContain("In-Reply-To: <help-1@client.example>");
+    expect(raw).toContain("References: <earlier@client.example> <help-1@client.example>");
+    const plain = [...raw.matchAll(/text\/plain; charset="UTF-8"\r\nContent-Transfer-Encoding: base64\r\n\r\n([\s\S]*?)\r\n--/g)]
+      .map((match) => Buffer.from(match[1]!.replace(/\r\n/g, ""), "base64").toString("utf8"))[0]!;
+    expect(plain).toContain("Sure, call me.\n\n-- The team");
+    expect(plain).toContain("Ann <ann@client.example> wrote:\n> Can you help?\n> Thanks");
+  });
+
+  test("a follow-up to your own message goes back to its recipients", async () => {
+    await Effect.runPromise(env.personal.upsertThread({
+      id: "t-mine", subject: "Re: Plans", senderSummary: "me@example.com", labels: ["SENT"], lastMessageAt: 10,
+      isUnread: false, isStarred: false, isArchived: true,
+    }));
+    await Effect.runPromise(env.personal.upsertMessage({
+      id: "mine-1", threadId: "t-mine", fromAddress: "me@example.com", toAddresses: ["Kim <kim@example.org>"], ccAddresses: [],
+      deliveredTo: null, dateTs: 10, bodyMarkdown: "Still on?", bodyHtmlSanitized: "", labels: ["SENT"], rawHeaders: {},
+    }));
+    const { draft } = await (await env.call("/api/a/personal/threads/t-mine/reply")).json() as { draft: { to: string[]; subject: string } };
+    expect(draft).toMatchObject({ to: ["Kim <kim@example.org>"], subject: "Re: Plans" });
+  });
+
   test("streams account events over SSE", async () => {
     const controller = new AbortController();
     const response = await env.call("/api/a/personal/events", { signal: controller.signal });
@@ -486,6 +759,13 @@ describe("Phase 4: account-scoped HTTP API", () => {
 });
 
 describe("Phase 4: web client hosting", () => {
+  test("AI routes answer 503 when the labeller is not configured", async () => {
+    const env = await makeEnvironment({ withAi: false });
+    expect((await env.post("/api/a/personal/threads/p-new/ai", {})).status).toBe(503);
+    expect((await env.post("/api/a/personal/ai/undo", {})).status).toBe(503);
+    await env.api.close();
+  });
+
   test("reports accounts that are not connected", async () => {
     const env = await makeEnvironment({ connectWork: false });
     const response = await env.call("/api/a/work/threads");

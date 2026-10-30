@@ -6,7 +6,8 @@
 	"scripts": {
 		"dev": "bun run src/server/main.ts",
 		"test": "bun test",
-		"typecheck": "bun check"
+		"typecheck": "bun check",
+		"demo": "bun run scripts/ui-demo.ts"
 	},
 	"devDependencies": {
 		"@types/bun": "latest",

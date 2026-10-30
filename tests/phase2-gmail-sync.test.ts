@@ -77,6 +77,7 @@ describe("Phase 2: Gmail sync, aliases and Pub/Sub", () => {
       listSendAs: () => Effect.succeed([{ sendAsEmail: "alias@example.com", displayName: "Alias", isDefault: true, isPrimary: false, verificationStatus: "accepted" }]),
       watch: (topicName) => Effect.succeed({ historyId: `watch-${topicName}`, expiration: "1710000000000" }),
       modifyMessage: () => Effect.void,
+      modifyThread: () => Effect.void,
       listLabels: () => Effect.succeed([]),
       createLabel: (name) => Effect.succeed({ id: name, name, type: "user" }),
       sendRaw: () => Effect.succeed({ id: "sent", threadId: "thread-sent" }),
@@ -89,7 +90,7 @@ describe("Phase 2: Gmail sync, aliases and Pub/Sub", () => {
       historyId: "watch-projects/demo/topics/gmail", expiration: "1710000000000",
     });
     const initial = await Effect.runPromise(sync.sync());
-    expect(initial).toEqual({ mode: "initial", messagesUpserted: 1, messagesDeleted: 0 });
+    expect(initial).toEqual({ mode: "initial", messagesUpserted: 1, messagesDeleted: 0, threadsWithNewMessages: [] });
     expect(await Effect.runPromise(accountDb.getHistoryId())).toBe("h-2");
     expect(await Effect.runPromise(accountDb.getThread("thread-m1"))).toMatchObject({
       subject: "Message m1", labels: ["INBOX", "UNREAD"], isUnread: true,
@@ -97,7 +98,7 @@ describe("Phase 2: Gmail sync, aliases and Pub/Sub", () => {
     expect(await Effect.runPromise(accountDb.listSendAsAliases())).toHaveLength(1);
 
     const incremental = await Effect.runPromise(sync.sync());
-    expect(incremental).toEqual({ mode: "incremental", messagesUpserted: 1, messagesDeleted: 0 });
+    expect(incremental).toEqual({ mode: "incremental", messagesUpserted: 1, messagesDeleted: 0, threadsWithNewMessages: ["thread-m2"] });
     expect(await Effect.runPromise(accountDb.getHistoryId())).toBe("h-3");
     expect(await Effect.runPromise(accountDb.getThread("thread-m2"))).not.toBeNull();
     expect(historyCalls).toBe(1);
@@ -130,6 +131,7 @@ describe("Phase 2: Gmail sync, aliases and Pub/Sub", () => {
       listSendAs: () => Effect.succeed([]),
       watch: () => Effect.succeed({ historyId: "initial-history", expiration: "1710000000000" }),
       modifyMessage: () => Effect.void,
+      modifyThread: () => Effect.void,
       listLabels: () => Effect.succeed([]),
       createLabel: (name) => Effect.succeed({ id: name, name, type: "user" }),
       sendRaw: () => Effect.succeed({ id: "sent", threadId: "sent" }),
@@ -143,7 +145,7 @@ describe("Phase 2: Gmail sync, aliases and Pub/Sub", () => {
       onProgress: (update) => progress.push({ conversationsCompleted: update.conversationsCompleted, messagesUpserted: update.messagesUpserted }),
     }));
 
-    expect(result).toEqual({ mode: "initial", messagesUpserted: 3, messagesDeleted: 0 });
+    expect(result).toEqual({ mode: "initial", messagesUpserted: 3, messagesDeleted: 0, threadsWithNewMessages: [] });
     expect(pages).toEqual([{}, { pageToken: "next" }]);
     expect(requestedThreads).toEqual(["t1", "t2"]);
     expect(progress).toEqual([
@@ -196,6 +198,7 @@ describe("Phase 2: Gmail sync, aliases and Pub/Sub", () => {
       listSendAs: () => Effect.succeed([]),
       watch: () => Effect.succeed({ historyId: "initial-history", expiration: "1710000000000" }),
       modifyMessage: () => Effect.void,
+      modifyThread: () => Effect.void,
       listLabels: () => Effect.succeed([]),
       createLabel: (name) => Effect.succeed({ id: name, name, type: "user" }),
       sendRaw: () => Effect.succeed({ id: "sent", threadId: "sent" }),
@@ -209,7 +212,7 @@ describe("Phase 2: Gmail sync, aliases and Pub/Sub", () => {
       onProgress: ({ conversationsCompleted }) => progress.push(conversationsCompleted),
     }));
 
-    expect(result).toEqual({ mode: "initial", messagesUpserted: 1, messagesDeleted: 0 });
+    expect(result).toEqual({ mode: "initial", messagesUpserted: 1, messagesDeleted: 0, threadsWithNewMessages: [] });
     expect(requestedThreads).toEqual(["third-missing"]);
     expect(progress).toEqual([0, 1, 2, 3]);
     expect(await Effect.runPromise(accountDb.listPersistedThreadIds())).toEqual(expect.arrayContaining([
@@ -254,6 +257,7 @@ describe("Phase 2: Gmail sync, aliases and Pub/Sub", () => {
       listSendAs: () => Effect.succeed([]),
       watch: () => Effect.succeed({ historyId: "initial-history", expiration: "1710000000000" }),
       modifyMessage: () => Effect.void,
+      modifyThread: () => Effect.void,
       listLabels: () => Effect.succeed([]),
       createLabel: (name) => Effect.succeed({ id: name, name, type: "user" }),
       sendRaw: () => Effect.succeed({ id: "sent", threadId: "sent" }),
@@ -299,6 +303,7 @@ describe("Phase 2: Gmail sync, aliases and Pub/Sub", () => {
       listSendAs: () => Effect.succeed([]),
       watch: () => Effect.succeed({ historyId: "h-1", expiration: "1710000000000" }),
       modifyMessage: () => Effect.void,
+      modifyThread: () => Effect.void,
       listLabels: () => Effect.sync(() => {
         labelListCalls++;
         return catalogs.length > 1 ? catalogs.shift()! : catalogs[0]!;
@@ -365,6 +370,7 @@ describe("Phase 2: Gmail sync, aliases and Pub/Sub", () => {
       listSendAs: () => Effect.succeed([]),
       watch: () => Effect.succeed({ historyId: "h-2", expiration: "1710000000000" }),
       modifyMessage: () => Effect.void,
+      modifyThread: () => Effect.void,
       listLabels: () => Effect.succeed([]),
       createLabel: (name) => Effect.succeed({ id: name, name, type: "user" }),
       sendRaw: () => Effect.succeed({ id: "sent", threadId: "sent" }),
@@ -372,7 +378,7 @@ describe("Phase 2: Gmail sync, aliases and Pub/Sub", () => {
     const layer = Layer.provide(GmailSyncServiceLive, Layer.merge(accountLayer, Layer.succeed(GmailClient, gmail)));
     const service = Effect.runSync(Effect.gen(function* () { return yield* GmailSyncService; }).pipe(Effect.provide(layer)));
 
-    expect(await Effect.runPromise(service.sync())).toEqual({ mode: "incremental", messagesUpserted: 1, messagesDeleted: 2 });
+    expect(await Effect.runPromise(service.sync())).toEqual({ mode: "incremental", messagesUpserted: 1, messagesDeleted: 2, threadsWithNewMessages: ["thread-kept"] });
     expect(await Effect.runPromise(accountDb.getHistoryId())).toBe("h-2");
     // A thread whose last message is gone is removed; one with remaining messages stays.
     expect(await Effect.runPromise(accountDb.getThread("thread-gone"))).toBeNull();
@@ -394,6 +400,7 @@ describe("Phase 2: Gmail sync, aliases and Pub/Sub", () => {
       listSendAs: () => Effect.succeed([]),
       watch: () => Effect.succeed({ historyId: "fresh", expiration: "1710000000000" }),
       modifyMessage: () => Effect.void,
+      modifyThread: () => Effect.void,
       listLabels: () => Effect.succeed([]),
       createLabel: (name) => Effect.succeed({ id: name, name, type: "user" }),
       sendRaw: () => Effect.succeed({ id: "sent", threadId: "sent" }),
@@ -559,6 +566,7 @@ describe("Phase 2: Gmail sync, aliases and Pub/Sub", () => {
       getThread: () => Effect.fail({} as never), listHistory: () => Effect.fail({} as never),
       listSendAs: () => Effect.succeed([]), watch: () => Effect.succeed({ historyId: "h1", expiration: "1710000000000" }),
       modifyMessage: () => Effect.void,
+      modifyThread: () => Effect.void,
       listLabels: () => Effect.succeed([]),
       createLabel: (name) => Effect.succeed({ id: name, name, type: "user" }),
       sendRaw: () => Effect.succeed({ id: "sent", threadId: "t1" }),

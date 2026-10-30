@@ -1,11 +1,15 @@
+import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { Context, Effect, Layer } from "effect";
 import { Database } from "bun:sqlite";
 import { AccountIsolationError, DatabaseError } from "../../shared/errors";
+import type { ConversationStatus } from "../../shared/aiRules";
 import { formatFilterExpr, renameFilterLabels } from "../../shared/filterDsl";
+import { applyLabelChange } from "../../shared/threadActions";
 import type { FilterExpr, FilterThread } from "../../shared/schemas";
 import type { ThreadDetail, ThreadSummary, ViewSummary } from "../../shared/api";
+import { renameLabelsInRulesFile } from "./AiRules";
 import type { CompiledFilter } from "./BooleanFilter";
 
 export interface ThreadRecord extends FilterThread {
@@ -45,51 +49,53 @@ export interface MessageRecord {
   readonly bodyMarkdown: string;
   readonly bodyHtmlSanitized: string;
   readonly rawHeaders: Readonly<Record<string, string>>;
+  /** This message's Gmail label names; a thread's labels are the union over its messages. */
+  readonly labels?: ReadonlyArray<string>;
 }
 
-export interface AiRuleRecord {
+export interface AiThreadMessage {
   readonly id: string;
-  readonly name: string;
-  readonly priority: number;
-  readonly dryRun: boolean;
-  readonly minConfidence: number;
-  readonly precondition: FilterExpr;
-  readonly systemPrompt: string;
-  readonly actions: unknown;
-  readonly llmEndpointId: string;
-  readonly apiModeOverride: "responses" | "chat_completions" | null;
+  readonly fromAddress: string;
+  readonly toAddresses: ReadonlyArray<string>;
+  readonly ccAddresses: ReadonlyArray<string>;
+  readonly deliveredTo: string | null;
+  readonly dateTs: number;
+  readonly subject: string;
+  readonly bodyMarkdown: string;
+  readonly labels: ReadonlyArray<string>;
+  readonly listUnsubscribe: boolean;
 }
 
 export interface AiThreadContext {
-  readonly thread: FilterThread;
-  readonly subject: string;
-  readonly snippet: string;
-  readonly ghostLabels: ReadonlyArray<string>;
-  readonly messages: ReadonlyArray<Pick<MessageRecord, "id" | "fromAddress" | "bodyMarkdown">>;
+  readonly thread: ThreadSummary;
+  /** Date of the newest message the AI has already classified (null: never evaluated). */
+  readonly aiEvaluatedThrough: number | null;
+  /** Chronological, oldest first. */
+  readonly messages: ReadonlyArray<AiThreadMessage>;
 }
 
-export interface AiAppliedAction {
-  readonly labelsBefore: ReadonlyArray<string>;
+/** What one AI run changed, so it can be undone exactly. */
+export interface AiRunChanges {
   readonly labelsAdded: ReadonlyArray<string>;
   readonly labelsRemoved: ReadonlyArray<string>;
-  readonly archivedBefore: boolean;
-  readonly archivedAfter: boolean;
+  readonly ghostLabelsAdded: ReadonlyArray<string>;
   readonly ghostLabelsBefore: ReadonlyArray<string>;
-  readonly ghostLabelsAfter: ReadonlyArray<string>;
-  readonly dryRun: boolean;
-  readonly gmailMessageIds: ReadonlyArray<string>;
 }
 
 export interface AiAuditRecord {
   readonly id: string;
   readonly threadId: string;
-  readonly ruleId: string | null;
-  readonly endpointId: string;
-  readonly apiModeUsed: "responses" | "chat_completions";
-  readonly modelUsed: string;
-  readonly confidence: number;
+  readonly trigger: "auto" | "manual";
+  /** Rules applied in this run, including a resolved conversation status rule. */
+  readonly ruleNames: ReadonlyArray<string>;
+  readonly conversationStatus: ConversationStatus | null;
+  /** Null when the run needed no LLM call (static or inherited matches only). */
+  readonly endpointId: string | null;
+  readonly apiModeUsed: "responses" | "chat_completions" | null;
+  readonly modelUsed: string | null;
   readonly reasoning: string;
-  readonly actionsApplied: AiAppliedAction;
+  readonly changes: AiRunChanges;
+  readonly reverted: boolean;
   readonly latencyMs: number;
   readonly createdAt: number;
 }
@@ -104,8 +110,10 @@ export interface AccountDbService {
   /** One page of matching threads, newest first, as shown in the thread list. */
   readonly listThreadSummaries: (filter: CompiledFilter, page: { readonly limit: number; readonly offset: number }) => Effect.Effect<ReadonlyArray<ThreadSummary>, DatabaseError>;
   readonly getThreadDetail: (id: string) => Effect.Effect<ThreadDetail | null, DatabaseError>;
-  /** Stores a thread's label names and derives its unread/starred/archived flags from them. */
-  readonly setThreadLabels: (id: string, labels: ReadonlyArray<string>) => Effect.Effect<ThreadSummary | null, DatabaseError>;
+  /** Adds/removes label names on every message of a thread (as Gmail's threads.modify does) and on the thread. */
+  readonly applyThreadLabelChange: (id: string, add: ReadonlyArray<string>, remove: ReadonlyArray<string>) => Effect.Effect<ThreadSummary | null, DatabaseError>;
+  /** Recomputes a thread's labels and flags as the union of its messages' labels (Gmail's thread semantics). */
+  readonly refreshThreadLabelsFromMessages: (id: string) => Effect.Effect<void, DatabaseError>;
   readonly listSavedViews: () => Effect.Effect<ReadonlyArray<ViewSummary>, DatabaseError>;
   /** Appends a saved view; its DSL is always the canonical formatting of `filter`. */
   readonly createSavedView: (view: { readonly id: string; readonly name: string; readonly filter: FilterExpr }) => Effect.Effect<ViewSummary, DatabaseError>;
@@ -123,12 +131,20 @@ export interface AccountDbService {
   readonly listSendAsAliases: () => Effect.Effect<ReadonlyArray<SendAsAliasRecord>, DatabaseError>;
   readonly getHistoryId: () => Effect.Effect<string | null, DatabaseError>;
   readonly setHistoryId: (historyId: string) => Effect.Effect<void, DatabaseError>;
-  readonly listEnabledAiRules: () => Effect.Effect<ReadonlyArray<AiRuleRecord>, DatabaseError>;
   readonly getAiThreadContext: (id: string) => Effect.Effect<AiThreadContext | null, DatabaseError>;
-  readonly updateAiThread: (id: string, update: { readonly labels: ReadonlyArray<string>; readonly ghostLabels: ReadonlyArray<string>; readonly isArchived: boolean; readonly aiStatus: "processed" | "skipped" | "error" }) => Effect.Effect<void, DatabaseError>;
+  /** A message's stored headers (lower-cased names), e.g. message-id and references for replies. */
+  readonly getMessageHeaders: (messageId: string) => Effect.Effect<Readonly<Record<string, string>> | null, DatabaseError>;
+  readonly setGhostLabels: (id: string, ghostLabels: ReadonlyArray<string>) => Effect.Effect<void, DatabaseError>;
+  readonly markAiEvaluated: (id: string, update: { readonly through: number | null; readonly status: "processed" | "skipped" | "error" }) => Effect.Effect<void, DatabaseError>;
   readonly insertAiAudit: (audit: AiAuditRecord) => Effect.Effect<void, DatabaseError>;
+  readonly listAiAudits: (threadId: string) => Effect.Effect<ReadonlyArray<AiAuditRecord>, DatabaseError>;
+  /** Names of rules applied to a thread by runs that were not undone. */
+  readonly appliedRuleNames: (threadId: string) => Effect.Effect<ReadonlySet<string>, DatabaseError>;
   readonly getLatestUndoableAiAudit: () => Effect.Effect<AiAuditRecord | null, DatabaseError>;
   readonly markAiAuditReverted: (id: string) => Effect.Effect<void, DatabaseError>;
+  /** The account's AI rules file (JSON text), stored next to its database; null when absent. */
+  readonly readRulesFile: () => Effect.Effect<string | null, DatabaseError>;
+  readonly writeRulesFile: (text: string) => Effect.Effect<void, DatabaseError>;
 }
 
 export class AccountDb extends Context.Service<AccountDb, AccountDbService>()(
@@ -148,9 +164,113 @@ interface ThreadRow {
   labels_json: string;
   ghost_labels_json: string;
   ai_status: "pending" | "processed" | "skipped" | "error";
+  ai_evaluated_through: number | null;
 }
 
+interface AuditRow {
+  id: string;
+  thread_id: string;
+  trigger: "auto" | "manual";
+  rule_names_json: string;
+  conversation_status: ConversationStatus | null;
+  endpoint_id: string | null;
+  api_mode_used: "responses" | "chat_completions" | null;
+  model_used: string | null;
+  reasoning: string;
+  actions_applied_json: string;
+  reverted: number;
+  latency_ms: number;
+  created_at: number;
+}
+
+const toAuditRecord = (row: AuditRow): AiAuditRecord => ({
+  id: row.id,
+  threadId: row.thread_id,
+  trigger: row.trigger,
+  ruleNames: JSON.parse(row.rule_names_json) as string[],
+  conversationStatus: row.conversation_status,
+  endpointId: row.endpoint_id,
+  apiModeUsed: row.api_mode_used,
+  modelUsed: row.model_used,
+  reasoning: row.reasoning,
+  changes: JSON.parse(row.actions_applied_json) as AiRunChanges,
+  reverted: row.reverted === 1,
+  latencyMs: row.latency_ms,
+  createdAt: row.created_at,
+});
+
+/** Where an account's rules JSON lives: a file beside its database, or memory in tests. */
+interface RulesStore {
+  readonly read: () => string | null;
+  readonly write: (text: string) => void;
+}
+
+const fileRulesStore = (path: string): RulesStore => ({
+  read: () => existsSync(path) ? readFileSync(path, "utf8") : null,
+  write: (text) => {
+    // Write-then-rename so a crash never leaves a half-written rules file.
+    const temporary = `${path}.${process.pid}.tmp`;
+    writeFileSync(temporary, text);
+    renameSync(temporary, path);
+  },
+});
+
+const memoryRulesStores = new WeakMap<Database, { text: string | null }>();
+const memoryRulesStore = (database: Database): RulesStore => {
+  const slot = memoryRulesStores.get(database) ?? { text: null };
+  memoryRulesStores.set(database, slot);
+  return { read: () => slot.text, write: (text) => { slot.text = text; } };
+};
+
+const AUDIT_LOG_TABLE = `
+  CREATE TABLE IF NOT EXISTS ai_audit_logs (
+    id TEXT PRIMARY KEY,
+    thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+    trigger TEXT NOT NULL CHECK (trigger IN ('auto', 'manual')),
+    rule_names_json TEXT NOT NULL,
+    conversation_status TEXT,
+    endpoint_id TEXT,
+    api_mode_used TEXT,
+    model_used TEXT,
+    reasoning TEXT NOT NULL,
+    actions_applied_json TEXT NOT NULL,
+    undoable INTEGER NOT NULL,
+    reverted INTEGER NOT NULL DEFAULT 0,
+    latency_ms INTEGER NOT NULL,
+    created_at INTEGER NOT NULL
+  );
+`;
+
 const LABEL_NAMES_MIGRATION_ID = "thread-label-names-v1";
+
+const columnNames = (database: Database, table: string): string[] =>
+  (database.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map((column) => column.name);
+
+/**
+ * Moves databases created before AI rules lived in JSON files to the current layout:
+ * per-message labels, an AI evaluation marker per thread, and run-level audit logs.
+ * Old AI tables are kept (renamed legacy_*) if they hold rows, and dropped when empty.
+ */
+const migrateAiStorage = (database: Database): void => {
+  database.transaction(() => {
+    if (!columnNames(database, "threads").includes("ai_evaluated_through")) {
+      database.exec("ALTER TABLE threads ADD COLUMN ai_evaluated_through INTEGER");
+    }
+    if (!columnNames(database, "messages").includes("labels_json")) {
+      database.exec("ALTER TABLE messages ADD COLUMN labels_json TEXT NOT NULL DEFAULT '[]'");
+      // Best available history: each message gets its thread's labels as of this migration.
+      database.exec("UPDATE messages SET labels_json = (SELECT labels_json FROM threads WHERE threads.id = messages.thread_id)");
+    }
+    const keepOrDrop = (table: string) => {
+      const rows = (database.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get() as { count: number }).count;
+      database.exec(rows > 0 ? `ALTER TABLE ${table} RENAME TO legacy_${table}` : `DROP TABLE ${table}`);
+    };
+    const auditColumns = columnNames(database, "ai_audit_logs");
+    if (auditColumns.length > 0 && !auditColumns.includes("rule_names_json")) keepOrDrop("ai_audit_logs");
+    if (columnNames(database, "ai_rules").length > 0) keepOrDrop("ai_rules");
+    database.exec(AUDIT_LOG_TABLE);
+  })();
+};
 
 const initialize = (database: Database): void => {
   database.exec("PRAGMA journal_mode = WAL;");
@@ -189,7 +309,8 @@ const initialize = (database: Database): void => {
       labels_json TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(labels_json)),
       ghost_labels_json TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(ghost_labels_json)),
       ai_status TEXT NOT NULL DEFAULT 'pending'
-        CHECK (ai_status IN ('pending', 'processed', 'skipped', 'error'))
+        CHECK (ai_status IN ('pending', 'processed', 'skipped', 'error')),
+      ai_evaluated_through INTEGER
     );
     CREATE TABLE IF NOT EXISTS messages (
       id TEXT PRIMARY KEY,
@@ -201,7 +322,8 @@ const initialize = (database: Database): void => {
       date_ts INTEGER NOT NULL,
       body_markdown TEXT NOT NULL,
       body_html_sanitized TEXT NOT NULL,
-      raw_headers_json TEXT NOT NULL
+      raw_headers_json TEXT NOT NULL,
+      labels_json TEXT NOT NULL DEFAULT '[]'
     );
     CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
       thread_id UNINDEXED, subject, from_address, body_markdown
@@ -219,34 +341,9 @@ const initialize = (database: Database): void => {
       filter_ast_json TEXT NOT NULL,
       dsl_string TEXT NOT NULL
     );
-    CREATE TABLE IF NOT EXISTS ai_rules (
-      id TEXT PRIMARY KEY,
-      name TEXT NOT NULL,
-      priority INTEGER NOT NULL DEFAULT 100,
-      enabled INTEGER NOT NULL DEFAULT 1,
-      dry_run INTEGER NOT NULL DEFAULT 0,
-      min_confidence REAL NOT NULL DEFAULT 0.8,
-      precondition_ast_json TEXT NOT NULL,
-      system_prompt TEXT NOT NULL,
-      actions_json TEXT NOT NULL,
-      llm_endpoint_id TEXT NOT NULL,
-      api_mode_override TEXT CHECK (api_mode_override IN ('responses', 'chat_completions'))
-    );
-    CREATE TABLE IF NOT EXISTS ai_audit_logs (
-      id TEXT PRIMARY KEY,
-      thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
-      rule_id TEXT REFERENCES ai_rules(id) ON DELETE SET NULL,
-      endpoint_id TEXT NOT NULL,
-      api_mode_used TEXT NOT NULL,
-      model_used TEXT NOT NULL,
-      confidence REAL NOT NULL,
-      reasoning TEXT NOT NULL,
-      actions_applied_json TEXT NOT NULL,
-      reverted INTEGER NOT NULL DEFAULT 0,
-      latency_ms INTEGER NOT NULL,
-      created_at INTEGER NOT NULL
-    );
   `);
+
+  migrateAiStorage(database);
 
   const migrationId = "gmail-hydrated-threads-v1";
   const migrationExists = database.prepare("SELECT 1 FROM schema_migrations WHERE id = ?").get(migrationId);
@@ -274,6 +371,21 @@ const toFilterThread = (row: Pick<ThreadRow, "id" | "subject" | "sender_summary"
   isArchived: row.is_archived === 1,
 });
 
+/** Stores a thread's label names and derives its unread/starred/archived flags from them. */
+const writeThreadLabels = (database: Database, id: string, labels: ReadonlyArray<string>): ThreadSummary | null => {
+  const row = database.prepare(`
+    UPDATE threads SET labels_json = ?, is_unread = ?, is_starred = ?, is_archived = ?
+    WHERE id = ? RETURNING *
+  `).get(
+    JSON.stringify(labels),
+    Number(labels.includes("UNREAD")),
+    Number(labels.includes("STARRED")),
+    Number(!labels.includes("INBOX")),
+    id,
+  ) as ThreadRow | null;
+  return row ? toThreadSummary(row) : null;
+};
+
 const toThreadSummary = (row: ThreadRow): ThreadSummary => ({
   ...toFilterThread(row),
   snippet: row.snippet,
@@ -282,7 +394,7 @@ const toThreadSummary = (row: ThreadRow): ThreadSummary => ({
   aiStatus: row.ai_status,
 });
 
-const makeService = (accountId: string, database: Database): AccountDbService => ({
+const makeService = (accountId: string, database: Database, rulesStore: RulesStore): AccountDbService => ({
   accountId,
   upsertThread: (thread) =>
     Effect.try({
@@ -291,19 +403,21 @@ const makeService = (accountId: string, database: Database): AccountDbService =>
           INSERT INTO threads (
             id, subject, snippet, last_message_at, is_unread, is_starred, is_archived,
             sender_summary, delivered_to_alias, labels_json, ghost_labels_json, ai_status
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, COALESCE(?11, '[]'), COALESCE(?12, 'pending'))
           ON CONFLICT(id) DO UPDATE SET
-            subject = excluded.subject,
-            snippet = excluded.snippet,
-            last_message_at = excluded.last_message_at,
+            -- Display fields follow the newest message; updating an older message must not roll them back.
+            subject = CASE WHEN excluded.last_message_at >= threads.last_message_at THEN excluded.subject ELSE threads.subject END,
+            snippet = CASE WHEN excluded.last_message_at >= threads.last_message_at THEN excluded.snippet ELSE threads.snippet END,
+            sender_summary = CASE WHEN excluded.last_message_at >= threads.last_message_at THEN excluded.sender_summary ELSE threads.sender_summary END,
+            delivered_to_alias = CASE WHEN excluded.last_message_at >= threads.last_message_at THEN excluded.delivered_to_alias ELSE threads.delivered_to_alias END,
+            last_message_at = MAX(threads.last_message_at, excluded.last_message_at),
             is_unread = excluded.is_unread,
             is_starred = excluded.is_starred,
             is_archived = excluded.is_archived,
-            sender_summary = excluded.sender_summary,
-            delivered_to_alias = excluded.delivered_to_alias,
             labels_json = excluded.labels_json,
-            ghost_labels_json = excluded.ghost_labels_json,
-            ai_status = excluded.ai_status
+            -- AI state is owned by the AI worker; sync only sets it when explicitly given.
+            ghost_labels_json = COALESCE(?11, threads.ghost_labels_json),
+            ai_status = COALESCE(?12, threads.ai_status)
         `).run(
           thread.id,
           thread.subject,
@@ -315,8 +429,8 @@ const makeService = (accountId: string, database: Database): AccountDbService =>
           thread.senderSummary,
           thread.deliveredToAlias ?? null,
           JSON.stringify(thread.labels),
-          JSON.stringify(thread.ghostLabels ?? []),
-          thread.aiStatus ?? "pending",
+          thread.ghostLabels ? JSON.stringify(thread.ghostLabels) : null,
+          thread.aiStatus ?? null,
         );
       },
       catch: (cause) => new DatabaseError({ message: "Failed to upsert thread.", operation: "upsertThread", cause }),
@@ -386,23 +500,29 @@ const makeService = (accountId: string, database: Database): AccountDbService =>
       },
       catch: (cause) => new DatabaseError({ message: "Failed to load thread.", operation: "getThreadDetail", cause }),
     }),
-  setThreadLabels: (id, labels) =>
+  applyThreadLabelChange: (id, add, remove) =>
+    Effect.try({
+      try: () => database.transaction(() => {
+        const thread = database.prepare("SELECT labels_json FROM threads WHERE id = ?").get(id) as { labels_json: string } | null;
+        if (!thread) return null;
+        const messages = database.prepare("SELECT id, labels_json FROM messages WHERE thread_id = ?").all(id) as Array<{ id: string; labels_json: string }>;
+        const updateMessage = database.prepare("UPDATE messages SET labels_json = ? WHERE id = ?");
+        for (const message of messages) {
+          updateMessage.run(JSON.stringify(applyLabelChange(JSON.parse(message.labels_json) as string[], add, remove)), message.id);
+        }
+        return writeThreadLabels(database, id, applyLabelChange(JSON.parse(thread.labels_json) as string[], add, remove));
+      })(),
+      catch: (cause) => new DatabaseError({ message: "Failed to update thread labels.", operation: "applyThreadLabelChange", cause }),
+    }),
+  refreshThreadLabelsFromMessages: (id) =>
     Effect.try({
       try: () => {
-        const row = database.prepare(`
-          UPDATE threads SET labels_json = ?, is_unread = ?, is_starred = ?, is_archived = ?
-          WHERE id = ? RETURNING *
-        `).get(
-          JSON.stringify(labels),
-          Number(labels.includes("UNREAD")),
-          Number(labels.includes("STARRED")),
-          Number(!labels.includes("INBOX")),
-          id,
-        ) as ThreadRow | null;
-        return row ? toThreadSummary(row) : null;
+        const messages = database.prepare("SELECT labels_json FROM messages WHERE thread_id = ? ORDER BY date_ts, id").all(id) as Array<{ labels_json: string }>;
+        if (messages.length === 0) return;
+        writeThreadLabels(database, id, [...new Set(messages.flatMap((message) => JSON.parse(message.labels_json) as string[]))]);
       },
-      catch: (cause) => new DatabaseError({ message: "Failed to update thread labels.", operation: "setThreadLabels", cause }),
-    }),
+      catch: (cause) => new DatabaseError({ message: "Failed to refresh thread labels.", operation: "refreshThreadLabelsFromMessages", cause }),
+    }).pipe(Effect.asVoid),
   listSavedViews: () =>
     Effect.try({
       try: () => (database.prepare("SELECT id, name, dsl_string FROM saved_views ORDER BY sort_order, name").all() as Array<{
@@ -463,8 +583,8 @@ const makeService = (accountId: string, database: Database): AccountDbService =>
           database.prepare(`
             INSERT INTO messages (
               id, thread_id, from_address, to_addresses_json, cc_addresses_json,
-              delivered_to, date_ts, body_markdown, body_html_sanitized, raw_headers_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              delivered_to, date_ts, body_markdown, body_html_sanitized, raw_headers_json, labels_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
               thread_id = excluded.thread_id,
               from_address = excluded.from_address,
@@ -474,7 +594,8 @@ const makeService = (accountId: string, database: Database): AccountDbService =>
               date_ts = excluded.date_ts,
               body_markdown = excluded.body_markdown,
               body_html_sanitized = excluded.body_html_sanitized,
-              raw_headers_json = excluded.raw_headers_json
+              raw_headers_json = excluded.raw_headers_json,
+              labels_json = excluded.labels_json
           `).run(
             message.id,
             message.threadId,
@@ -486,6 +607,7 @@ const makeService = (accountId: string, database: Database): AccountDbService =>
             message.bodyMarkdown,
             message.bodyHtmlSanitized,
             JSON.stringify(message.rawHeaders),
+            JSON.stringify(message.labels ?? []),
           );
           database.prepare("DELETE FROM messages_fts WHERE thread_id = ?").run(message.threadId);
           database.prepare(`
@@ -524,14 +646,14 @@ const makeService = (accountId: string, database: Database): AccountDbService =>
   replaceLabels: (labels) =>
     Effect.try({
       try: () => {
+        // Saved views and AI rules are written by the user with names, so only real renames apply to them.
+        const userRenames = new Map<string, string>();
         database.transaction(() => {
           const previousNames = new Map((database.prepare("SELECT id, name FROM labels").all() as Array<{ id: string; name: string }>)
             .map((row) => [row.id, row.name]));
           // Threads store label names. Map renamed labels, and (once) the label IDs written by earlier importers.
           const legacyIdsPending = !database.prepare("SELECT 1 FROM schema_migrations WHERE id = ?").get(LABEL_NAMES_MIGRATION_ID);
           const renames = new Map<string, string>();
-          // Saved views and AI rules are written by the user with names, so only real renames apply to them.
-          const userRenames = new Map<string, string>();
           for (const label of labels) {
             const previousName = previousNames.get(label.id);
             if (previousName !== undefined && previousName !== label.name) {
@@ -561,22 +683,14 @@ const makeService = (accountId: string, database: Database): AccountDbService =>
               const renamedJson = JSON.stringify(renamed);
               if (renamedJson !== view.filter_ast_json) updateView.run(renamedJson, formatFilterExpr(renamed), view.id);
             }
-            const renameAll = (values: unknown): unknown => Array.isArray(values)
-              ? values.map((value) => typeof value === "string" ? userRenames.get(value.toLowerCase()) ?? value : value)
-              : values;
-            const rules = database.prepare("SELECT id, precondition_ast_json, actions_json FROM ai_rules").all() as Array<{ id: string; precondition_ast_json: string; actions_json: string }>;
-            const updateRule = database.prepare("UPDATE ai_rules SET precondition_ast_json = ?, actions_json = ? WHERE id = ?");
-            for (const rule of rules) {
-              const precondition = JSON.stringify(renameFilterLabels(JSON.parse(rule.precondition_ast_json) as FilterExpr, userRenames));
-              const actions = JSON.parse(rule.actions_json) as unknown;
-              const renamedActions = JSON.stringify(typeof actions === "object" && actions !== null && !Array.isArray(actions)
-                ? { ...actions, ...("addLabels" in actions ? { addLabels: renameAll(actions.addLabels) } : {}), ...("removeLabels" in actions ? { removeLabels: renameAll(actions.removeLabels) } : {}) }
-                : actions);
-              if (precondition !== rule.precondition_ast_json || renamedActions !== rule.actions_json) updateRule.run(precondition, renamedActions, rule.id);
-            }
           }
           if (legacyIdsPending) database.prepare("INSERT OR IGNORE INTO schema_migrations (id) VALUES (?)").run(LABEL_NAMES_MIGRATION_ID);
         })();
+        if (userRenames.size > 0) {
+          const rulesText = rulesStore.read();
+          const renamed = rulesText === null ? null : renameLabelsInRulesFile(rulesText, userRenames);
+          if (renamed !== null) rulesStore.write(renamed);
+        }
       },
       catch: (cause) => new DatabaseError({ message: "Failed to replace Gmail labels.", operation: "replaceLabels", cause }),
     }).pipe(Effect.asVoid),
@@ -651,100 +765,91 @@ const makeService = (accountId: string, database: Database): AccountDbService =>
       `).run(historyId),
       catch: (cause) => new DatabaseError({ message: "Failed to save Gmail history cursor.", operation: "setHistoryId", cause }),
     }).pipe(Effect.asVoid),
-  listEnabledAiRules: () =>
-    Effect.try({
-      try: () => (database.prepare(`
-        SELECT id, name, priority, dry_run AS dryRun, min_confidence AS minConfidence,
-          precondition_ast_json AS preconditionJson, system_prompt AS systemPrompt,
-          actions_json AS actionsJson, llm_endpoint_id AS llmEndpointId,
-          api_mode_override AS apiModeOverride
-        FROM ai_rules WHERE enabled = 1 ORDER BY priority ASC, id ASC
-      `).all() as Array<{
-        id: string; name: string; priority: number; dryRun: number; minConfidence: number;
-        preconditionJson: string; systemPrompt: string; actionsJson: string;
-        llmEndpointId: string; apiModeOverride: "responses" | "chat_completions" | null;
-      }>).map((row) => ({
-        id: row.id,
-        name: row.name,
-        priority: row.priority,
-        dryRun: row.dryRun === 1,
-        minConfidence: row.minConfidence,
-        precondition: JSON.parse(row.preconditionJson) as FilterExpr,
-        systemPrompt: row.systemPrompt,
-        actions: JSON.parse(row.actionsJson) as unknown,
-        llmEndpointId: row.llmEndpointId,
-        apiModeOverride: row.apiModeOverride,
-      })),
-      catch: (cause) => new DatabaseError({ message: "Failed to load AI rules.", operation: "listEnabledAiRules", cause }),
-    }),
   getAiThreadContext: (id) =>
     Effect.try({
       try: () => {
         const row = database.prepare("SELECT * FROM threads WHERE id = ?").get(id) as ThreadRow | null;
         if (!row) return null;
-        const messages = database.prepare(`
-          SELECT id, from_address AS fromAddress, body_markdown AS bodyMarkdown
+        const messages = (database.prepare(`
+          SELECT id, from_address, to_addresses_json, cc_addresses_json, delivered_to, date_ts,
+            body_markdown, raw_headers_json, labels_json
           FROM messages WHERE thread_id = ? ORDER BY date_ts ASC, id ASC
-        `).all(id) as Array<{ id: string; fromAddress: string; bodyMarkdown: string }>;
-        return {
-          thread: toFilterThread(row),
-          subject: row.subject,
-          snippet: row.snippet,
-          ghostLabels: JSON.parse(row.ghost_labels_json) as string[],
-          messages,
-        };
+        `).all(id) as Array<{
+          id: string; from_address: string; to_addresses_json: string; cc_addresses_json: string; delivered_to: string | null;
+          date_ts: number; body_markdown: string; raw_headers_json: string; labels_json: string;
+        }>).map((message) => {
+          const headers = JSON.parse(message.raw_headers_json) as Record<string, string>;
+          return {
+            id: message.id,
+            fromAddress: message.from_address,
+            toAddresses: JSON.parse(message.to_addresses_json) as string[],
+            ccAddresses: JSON.parse(message.cc_addresses_json) as string[],
+            deliveredTo: message.delivered_to,
+            dateTs: message.date_ts,
+            subject: headers.subject ?? row.subject,
+            bodyMarkdown: message.body_markdown,
+            labels: JSON.parse(message.labels_json) as string[],
+            listUnsubscribe: Boolean(headers["list-unsubscribe"]),
+          };
+        });
+        return { thread: toThreadSummary(row), aiEvaluatedThrough: row.ai_evaluated_through, messages };
       },
       catch: (cause) => new DatabaseError({ message: "Failed to load AI thread context.", operation: "getAiThreadContext", cause }),
     }),
-  updateAiThread: (id, update) =>
+  getMessageHeaders: (messageId) =>
+    Effect.try({
+      try: () => {
+        const row = database.prepare("SELECT raw_headers_json FROM messages WHERE id = ?").get(messageId) as { raw_headers_json: string } | null;
+        return row ? JSON.parse(row.raw_headers_json) as Record<string, string> : null;
+      },
+      catch: (cause) => new DatabaseError({ message: "Failed to load message headers.", operation: "getMessageHeaders", cause }),
+    }),
+  setGhostLabels: (id, ghostLabels) =>
+    Effect.try({
+      try: () => database.prepare("UPDATE threads SET ghost_labels_json = ? WHERE id = ?").run(JSON.stringify(ghostLabels), id),
+      catch: (cause) => new DatabaseError({ message: "Failed to update ghost labels.", operation: "setGhostLabels", cause }),
+    }).pipe(Effect.asVoid),
+  markAiEvaluated: (id, update) =>
     Effect.try({
       try: () => database.prepare(`
-        UPDATE threads SET labels_json = ?, ghost_labels_json = ?, is_archived = ?, ai_status = ?
-        WHERE id = ?
-      `).run(JSON.stringify(update.labels), JSON.stringify(update.ghostLabels), Number(update.isArchived), update.aiStatus, id),
-      catch: (cause) => new DatabaseError({ message: "Failed to update AI thread state.", operation: "updateAiThread", cause }),
+        UPDATE threads SET ai_status = ?, ai_evaluated_through = COALESCE(?, ai_evaluated_through) WHERE id = ?
+      `).run(update.status, update.through, id),
+      catch: (cause) => new DatabaseError({ message: "Failed to record AI evaluation.", operation: "markAiEvaluated", cause }),
     }).pipe(Effect.asVoid),
   insertAiAudit: (audit) =>
     Effect.try({
       try: () => database.prepare(`
         INSERT INTO ai_audit_logs (
-          id, thread_id, rule_id, endpoint_id, api_mode_used, model_used, confidence,
-          reasoning, actions_applied_json, reverted, latency_ms, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+          id, thread_id, trigger, rule_names_json, conversation_status, endpoint_id, api_mode_used, model_used,
+          reasoning, actions_applied_json, undoable, reverted, latency_ms, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
-        audit.id, audit.threadId, audit.ruleId, audit.endpointId, audit.apiModeUsed,
-        audit.modelUsed, audit.confidence, audit.reasoning, JSON.stringify(audit.actionsApplied),
-        audit.latencyMs, audit.createdAt,
+        audit.id, audit.threadId, audit.trigger, JSON.stringify(audit.ruleNames), audit.conversationStatus,
+        audit.endpointId, audit.apiModeUsed, audit.modelUsed, audit.reasoning, JSON.stringify(audit.changes),
+        Number(audit.changes.labelsAdded.length + audit.changes.labelsRemoved.length + audit.changes.ghostLabelsAdded.length > 0),
+        Number(audit.reverted), audit.latencyMs, audit.createdAt,
       ),
       catch: (cause) => new DatabaseError({ message: "Failed to write AI audit log.", operation: "insertAiAudit", cause }),
     }).pipe(Effect.asVoid),
+  listAiAudits: (threadId) =>
+    Effect.try({
+      try: () => (database.prepare("SELECT * FROM ai_audit_logs WHERE thread_id = ? ORDER BY created_at DESC, rowid DESC")
+        .all(threadId) as AuditRow[]).map(toAuditRecord),
+      catch: (cause) => new DatabaseError({ message: "Failed to load AI audit logs.", operation: "listAiAudits", cause }),
+    }),
+  appliedRuleNames: (threadId) =>
+    Effect.try({
+      try: () => new Set((database.prepare("SELECT rule_names_json FROM ai_audit_logs WHERE thread_id = ? AND reverted = 0")
+        .all(threadId) as Array<{ rule_names_json: string }>).flatMap((row) => JSON.parse(row.rule_names_json) as string[])),
+      catch: (cause) => new DatabaseError({ message: "Failed to load applied AI rules.", operation: "appliedRuleNames", cause }),
+    }),
   getLatestUndoableAiAudit: () =>
     Effect.try({
       try: () => {
         const row = database.prepare(`
-          SELECT id, thread_id AS threadId, rule_id AS ruleId, endpoint_id AS endpointId,
-            api_mode_used AS apiModeUsed, model_used AS modelUsed, confidence, reasoning,
-            actions_applied_json AS actionsJson, latency_ms AS latencyMs, created_at AS createdAt
-          FROM ai_audit_logs WHERE reverted = 0 ORDER BY created_at DESC, rowid DESC LIMIT 1
-        `).get() as {
-          id: string; threadId: string; ruleId: string | null; endpointId: string;
-          apiModeUsed: "responses" | "chat_completions"; modelUsed: string; confidence: number;
-          reasoning: string; actionsJson: string; latencyMs: number; createdAt: number;
-        } | null;
-        if (!row) return null;
-        return {
-          id: row.id,
-          threadId: row.threadId,
-          ruleId: row.ruleId,
-          endpointId: row.endpointId,
-          apiModeUsed: row.apiModeUsed,
-          modelUsed: row.modelUsed,
-          confidence: row.confidence,
-          reasoning: row.reasoning,
-          actionsApplied: JSON.parse(row.actionsJson) as AiAppliedAction,
-          latencyMs: row.latencyMs,
-          createdAt: row.createdAt,
-        };
+          SELECT * FROM ai_audit_logs WHERE reverted = 0 AND undoable = 1 ORDER BY created_at DESC, rowid DESC LIMIT 1
+        `).get() as AuditRow | null;
+        return row ? toAuditRecord(row) : null;
       },
       catch: (cause) => new DatabaseError({ message: "Failed to load undoable AI audit log.", operation: "getLatestUndoableAiAudit", cause }),
     }),
@@ -753,6 +858,16 @@ const makeService = (accountId: string, database: Database): AccountDbService =>
       try: () => database.prepare("UPDATE ai_audit_logs SET reverted = 1 WHERE id = ? AND reverted = 0").run(id),
       catch: (cause) => new DatabaseError({ message: "Failed to mark AI audit log as reverted.", operation: "markAiAuditReverted", cause }),
     }).pipe(Effect.asVoid),
+  readRulesFile: () =>
+    Effect.try({
+      try: () => rulesStore.read(),
+      catch: (cause) => new DatabaseError({ message: "Failed to read the AI rules file.", operation: "readRulesFile", cause }),
+    }),
+  writeRulesFile: (text) =>
+    Effect.try({
+      try: () => rulesStore.write(text),
+      catch: (cause) => new DatabaseError({ message: "Failed to write the AI rules file.", operation: "writeRulesFile", cause }),
+    }),
 });
 
 const validateAccountId = (accountId: string): Effect.Effect<void, AccountIsolationError> =>
@@ -783,11 +898,11 @@ export const AccountDbLive = (
         try: () => initialize(database),
         catch: (cause) => new DatabaseError({ message: "Failed to initialize account database.", operation: "initializeAccountDatabase", cause }),
       });
-      return makeService(accountId, database);
+      return makeService(accountId, database, fileRulesStore(join(dataDirectory, `${accountId}.rules.json`)));
     }),
   );
 
-/** Test layer accepts its own in-memory handle so tests never touch disk. */
+/** Test layer accepts its own in-memory handle so tests never touch disk (rules live in memory per handle). */
 export const AccountDbTest = (
   accountId: string,
   database: Database,
@@ -800,6 +915,6 @@ export const AccountDbTest = (
         try: () => initialize(database),
         catch: (cause) => new DatabaseError({ message: "Failed to initialize test account database.", operation: "initializeTestAccountDatabase", cause }),
       });
-      return makeService(accountId, database);
+      return makeService(accountId, database, memoryRulesStore(database));
     }),
   );

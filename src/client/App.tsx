@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } fro
 import {
   isAccountId,
   type AccountEvent,
+  type AiAuditSummary,
   type AccountSummary,
   type LabelSummary,
   type ThreadAction,
@@ -16,7 +17,11 @@ import { BUILT_IN_VIEWS } from "../shared/views";
 import { buildActions } from "./actions";
 import { api, ApiRequestError } from "./api";
 import { AccountSwitcher } from "./components/AccountSwitcher";
-import { ActionToolbar } from "./components/ActionToolbar";
+import { ActionToolbar, toolbarButtonClass } from "./components/ActionToolbar";
+import { AiAuditDrawer } from "./components/AiAuditDrawer";
+import { Keycap } from "./components/Keycap";
+import { ReplyComposer, splitAddressList, type ComposerState } from "./components/ReplyComposer";
+import { RulesPanel } from "./components/RulesPanel";
 import { CommandPalette, type PalettePage } from "./components/CommandPalette";
 import { FilterBar } from "./components/FilterBar";
 import { FilterBuilder } from "./components/FilterBuilder";
@@ -112,6 +117,12 @@ function Inbox({ accounts, route, navigate }: {
   const [palettePage, setPalettePage] = useState<PalettePage>("actions");
   const [syncing, setSyncing] = useState(false);
   const [notice, setNotice] = useState<{ readonly text: string; readonly tone: "info" | "error" } | null>(null);
+  const [aiBusy, setAiBusy] = useState(false);
+  const [auditOpen, setAuditOpen] = useState(false);
+  const [audits, setAudits] = useState<{ readonly threadId: string | null; readonly entries: ReadonlyArray<AiAuditSummary>; readonly loading: boolean; readonly error: string | null }>({ threadId: null, entries: [], loading: false, error: null });
+  const [rulesPanel, setRulesPanel] = useState<{ readonly newRule: boolean } | null>(null);
+  const [composer, setComposer] = useState<ComposerState | null>(null);
+  const [ruleSummaries, setRuleSummaries] = useState<ReadonlyArray<{ readonly name: string; readonly automate: boolean }>>([]);
   const searchRef = useRef<HTMLInputElement>(null);
 
   const threadsRef = useRef(threads);
@@ -138,13 +149,21 @@ function Inbox({ accounts, route, navigate }: {
     api.labels(accountId).then(setLabels, (error) => setNotice({ text: `Could not load labels: ${errorMessage(error)}`, tone: "error" }));
   }, [accountId]);
 
+  const loadRuleSummaries = useCallback(() => {
+    api.rules(accountId).then(
+      (loaded) => setRuleSummaries(loaded.rules.rules.map(({ name, automate }) => ({ name, automate }))),
+      () => setRuleSummaries([]),
+    );
+  }, [accountId]);
+
   useEffect(() => {
     loadMeta();
+    loadRuleSummaries();
     api.syncStatus(accountId).then(
       (job) => setSyncing(job?.status === "queued" || job?.status === "running"),
       () => undefined,
     );
-  }, [accountId, loadMeta]);
+  }, [accountId, loadMeta, loadRuleSummaries]);
 
   // Only the latest list request may update state; older responses are dropped.
   const listRequest = useRef(0);
@@ -233,6 +252,155 @@ function Inbox({ accounts, route, navigate }: {
     void runThreadAction({ type: "markRead" }, detail);
   }, [detail, runThreadAction]);
 
+  // The audit drawer follows the selected (or open) conversation.
+  const auditThreadId = auditOpen ? selectedThread?.id ?? null : null;
+  const loadAudits = useCallback(async (threadId: string) => {
+    setAudits((previous) => ({ ...previous, threadId, loading: true, entries: previous.threadId === threadId ? previous.entries : [] }));
+    try {
+      const entries = await api.aiAudits(accountId, threadId);
+      setAudits((previous) => previous.threadId === threadId ? { threadId, entries, loading: false, error: null } : previous);
+    } catch (error) {
+      setAudits((previous) => previous.threadId === threadId ? { ...previous, loading: false, error: errorMessage(error) } : previous);
+    }
+  }, [accountId]);
+  useEffect(() => {
+    if (auditThreadId) void loadAudits(auditThreadId);
+  }, [auditThreadId, loadAudits]);
+
+  const runAi = useCallback(async () => {
+    const target = selectedThread;
+    if (!target) return;
+    setAiBusy(true);
+    setNotice({ text: "Running AI rules…", tone: "info" });
+    try {
+      const result = await api.runAi(accountId, target.id);
+      setNotice({
+        text: result.appliedRules.length > 0
+          ? `AI applied: ${result.appliedRules.join(", ")}${result.llmCalled ? "" : " (no LLM call needed)"}`
+          : `No rule applied. ${result.reason}`,
+        tone: "info",
+      });
+      void loadThreads("refresh");
+      if (openThreadId === target.id) void loadDetail(target.id);
+      if (auditOpen) void loadAudits(target.id);
+    } catch (error) {
+      setNotice({ text: errorMessage(error), tone: "error" });
+    } finally {
+      setAiBusy(false);
+    }
+  }, [selectedThread, accountId, openThreadId, auditOpen, loadThreads, loadDetail, loadAudits]);
+
+  const decideGhostLabels = useCallback(async (decision: "accept" | "reject") => {
+    const target = selectedThread;
+    if (!target || target.ghostLabels.length === 0) return;
+    try {
+      const updated = await api.decideGhostLabels(accountId, target.id, decision);
+      setThreads((previous) => previous.map((thread) => thread.id === updated.id ? updated : thread));
+      setDetail((previous) => previous?.id === updated.id ? updated : previous);
+      setNotice({ text: decision === "accept" ? `Applied ${target.ghostLabels.join(", ")}.` : "Suggestion dismissed.", tone: "info" });
+      if (decision === "accept") loadMeta();
+      void loadThreads("refresh");
+    } catch (error) {
+      setNotice({ text: errorMessage(error), tone: "error" });
+    }
+  }, [selectedThread, accountId, loadMeta, loadThreads]);
+
+  const undoAi = useCallback(async () => {
+    setAiBusy(true);
+    try {
+      const result = await api.undoAi(accountId);
+      setNotice({ text: result.reverted ? "Undid the last AI action." : "There is no AI action to undo.", tone: "info" });
+      if (result.threadId) {
+        void loadThreads("refresh");
+        if (openThreadId === result.threadId) void loadDetail(result.threadId);
+        if (auditThreadId === result.threadId) void loadAudits(result.threadId);
+      }
+    } catch (error) {
+      setNotice({ text: errorMessage(error), tone: "error" });
+    } finally {
+      setAiBusy(false);
+    }
+  }, [accountId, openThreadId, auditThreadId, loadThreads, loadDetail, loadAudits]);
+
+  const toggleRuleDryRun = useCallback(async (ruleName: string) => {
+    try {
+      const loaded = await api.rules(accountId);
+      // Saving from here would rewrite the file without invalid rules, so leave that to the rules screen.
+      if (loaded.problems.length > 0) {
+        setNotice({ text: "The rules file has invalid rules; open AI rules (,) to fix them first.", tone: "error" });
+        return;
+      }
+      const rules = loaded.rules.rules.map((rule) => rule.name === ruleName ? { ...rule, automate: !rule.automate } : rule);
+      const saved = await api.saveRules(accountId, { ...loaded.rules, rules });
+      setRuleSummaries(saved.rules.rules.map(({ name, automate }) => ({ name, automate })));
+      const automate = saved.rules.rules.find((rule) => rule.name === ruleName)?.automate;
+      setNotice({ text: `${ruleName}: ${automate ? "applies automatically" : "dry run (suggestions only)"}.`, tone: "info" });
+    } catch (error) {
+      setNotice({ text: errorMessage(error), tone: "error" });
+    }
+  }, [accountId]);
+
+  // The composer belongs to one thread; it is only shown (and "open") while that thread is open.
+  const composerVisible = composer !== null && composer.threadId === openThreadId;
+
+  const openComposer = useCallback(async (options: { readonly replyAll: boolean; readonly pickAlias: boolean }) => {
+    const target = selectedThread;
+    if (!target) return;
+    if (openThreadId !== target.id) goTo({ threadId: target.id });
+    const choosePalette = () => {
+      if (!options.pickAlias) return;
+      setPalettePage("aliases");
+      setPaletteOpen(true);
+    };
+    if (composer?.threadId === target.id) {
+      if (options.replyAll) setComposer({ ...composer, cc: composer.draft.replyAllCc.join(", ") });
+      choosePalette();
+      return;
+    }
+    try {
+      const draft = await api.replyDraft(accountId, target.id);
+      setComposer({
+        threadId: target.id,
+        draft,
+        to: draft.to.join(", "),
+        cc: options.replyAll ? draft.replyAllCc.join(", ") : "",
+        subject: draft.subject,
+        body: "",
+        fromAlias: draft.fromAlias ?? draft.aliases[0]?.sendAsEmail ?? "",
+        sending: false,
+        error: null,
+      });
+      choosePalette();
+    } catch (error) {
+      setNotice({ text: errorMessage(error), tone: "error" });
+    }
+  }, [selectedThread, openThreadId, composer, accountId, goTo]);
+
+  const sendReply = useCallback(async () => {
+    if (!composer || composer.sending) return;
+    const sending = composer;
+    setComposer({ ...sending, sending: true, error: null });
+    try {
+      await api.sendReply(accountId, sending.threadId, {
+        messageId: sending.draft.messageId,
+        to: splitAddressList(sending.to),
+        cc: splitAddressList(sending.cc),
+        subject: sending.subject,
+        body: sending.body,
+        fromAlias: sending.fromAlias,
+      });
+      setComposer((current) => current?.threadId === sending.threadId ? null : current);
+      setNotice({ text: `Reply sent as ${sending.fromAlias}.`, tone: "info" });
+    } catch (error) {
+      setComposer((current) => current?.threadId === sending.threadId ? { ...current, sending: false, error: errorMessage(error) } : current);
+    }
+  }, [composer, accountId]);
+
+  const discardReply = useCallback(() => {
+    if (composer?.body.trim() && !confirm("Discard this reply?")) return;
+    setComposer(null);
+  }, [composer]);
+
   const refreshTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   useAccountEvents(accountId, (event: AccountEvent) => {
     if (event.type === "threads-changed") {
@@ -241,11 +409,16 @@ function Inbox({ accounts, route, navigate }: {
       refreshTimer.current = setTimeout(() => {
         void loadThreads("refresh");
         if (openThreadId && (!event.threadIds || event.threadIds.includes(openThreadId))) void loadDetail(openThreadId);
+        if (auditThreadId && (!event.threadIds || event.threadIds.includes(auditThreadId))) void loadAudits(auditThreadId);
       }, 300);
       return;
     }
     if (event.type === "views-changed") {
       api.views(accountId).then(setViews, () => undefined);
+      return;
+    }
+    if (event.type === "rules-changed") {
+      loadRuleSummaries();
       return;
     }
     setSyncing(event.status === "queued" || event.status === "running");
@@ -305,6 +478,10 @@ function Inbox({ accounts, route, navigate }: {
     canSelectPrevious: selectedIndex > 0,
     syncing,
     builderOpen,
+    auditOpen,
+    composerOpen: composerVisible,
+    aiBusy,
+    rules: ruleSummaries,
     savedViewPosition: savedIndex >= 0 ? { index: savedIndex, count: savedViews.length } : null,
     moveSelection: (delta) => {
       const index = Math.max(0, Math.min(threads.length - 1, selectedIndex + delta));
@@ -365,9 +542,23 @@ function Inbox({ accounts, route, navigate }: {
       [ids[savedIndex], ids[target]] = [ids[target]!, ids[savedIndex]!];
       api.reorderViews(accountId, ids).then(setViews, (error) => setNotice({ text: errorMessage(error), tone: "error" }));
     },
-  }), [accounts, accountId, views, view, viewId, savedViews, savedIndex, selectedThread, openThreadId, selectedIndex, threads, syncing, builderOpen, draft, query, goTo, closeThread, runThreadAction, navigate, sync]);
+    runAi: () => void runAi(),
+    decideGhostLabels: (decision) => void decideGhostLabels(decision),
+    toggleAudit: () => setAuditOpen((open) => !open),
+    undoAi: () => void undoAi(),
+    openRules: (options) => setRulesPanel({ newRule: options?.newRule ?? false }),
+    toggleRuleDryRun: (ruleName) => void toggleRuleDryRun(ruleName),
+    openComposer: (options) => void openComposer(options),
+    changeAlias: () => {
+      setPalettePage("aliases");
+      setPaletteOpen(true);
+    },
+    sendReply: () => void sendReply(),
+    discardReply,
+  }), [composerVisible, openComposer, sendReply, discardReply, accounts, accountId, views, view, viewId, savedViews, savedIndex, selectedThread, openThreadId, selectedIndex, threads, syncing, builderOpen, auditOpen, aiBusy, ruleSummaries, draft, query, goTo, closeThread, runThreadAction, navigate, sync, runAi, decideGhostLabels, undoAi, toggleRuleDryRun]);
 
-  useVimShortcuts(actions, !paletteOpen && viewDialog === null);
+  useVimShortcuts(actions, !paletteOpen && viewDialog === null && rulesPanel === null);
+  const rulesAction = actions.find((action) => action.id === "ai.rules");
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -387,6 +578,12 @@ function Inbox({ accounts, route, navigate }: {
         <span className="font-semibold tracking-tight">ZeroEffect</span>
         <AccountSwitcher accounts={accounts} activeAccountId={accountId} actions={actions} />
         <FilterBar ref={searchRef} draft={draft} appliedError={queryError} onDraftChange={setDraft} onApply={applyQuery} />
+        {rulesAction && (
+          <button type="button" className={toolbarButtonClass} onClick={rulesAction.run}>
+            AI rules
+            {rulesAction.shortcut && <Keycap shortcut={rulesAction.shortcut} />}
+          </button>
+        )}
       </header>
       {builderOpen && (
         <FilterBuilder
@@ -420,8 +617,25 @@ function Inbox({ accounts, route, navigate }: {
         </div>
         {openThreadId && (
           <div className="min-h-0 flex-1 overflow-y-auto">
-            <ThreadReader thread={detail} loading={detailLoading} error={detailError} labelCatalog={labelCatalog} />
+            <ThreadReader thread={detail} loading={detailLoading} error={detailError} labelCatalog={labelCatalog} actions={actions} />
+            {composerVisible && composer && (
+              <ReplyComposer
+                state={composer}
+                onChange={(update) => setComposer((current) => current ? { ...current, ...update, error: null } : current)}
+                onSend={() => void sendReply()}
+                onDiscard={discardReply}
+              />
+            )}
           </div>
+        )}
+        {auditOpen && (
+          <AiAuditDrawer
+            subject={selectedThread?.subject ?? null}
+            audits={audits.threadId === auditThreadId ? audits.entries : []}
+            loading={audits.loading}
+            error={audits.threadId === auditThreadId ? audits.error : null}
+            actions={actions}
+          />
         )}
       </div>
       {notice && (
@@ -442,6 +656,15 @@ function Inbox({ accounts, route, navigate }: {
           onClose={() => setViewDialog(null)}
         />
       )}
+      {rulesPanel && (
+        <RulesPanel
+          accountId={accountId}
+          accountName={account.displayName}
+          startWithNewRule={rulesPanel.newRule}
+          onClose={() => setRulesPanel(null)}
+          onSaved={(file) => setRuleSummaries(file.rules.map(({ name, automate }) => ({ name, automate })))}
+        />
+      )}
       <CommandPalette
         open={paletteOpen}
         page={palettePage}
@@ -450,6 +673,9 @@ function Inbox({ accounts, route, navigate }: {
         thread={selectedThread}
         onOpenChange={setPaletteOpen}
         onPageChange={setPalettePage}
+        aliases={composer?.draft.aliases ?? []}
+        currentAlias={composer?.fromAlias ?? null}
+        onChooseAlias={(sendAsEmail) => setComposer((current) => current ? { ...current, fromAlias: sendAsEmail } : current)}
         onToggleLabel={(label, applied) => {
           void runThreadAction({ type: "setLabels", add: applied ? [] : [label], remove: applied ? [label] : [] }).then(loadMeta);
         }}

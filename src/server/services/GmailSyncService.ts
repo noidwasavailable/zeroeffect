@@ -6,11 +6,17 @@ import { GmailClient } from "./GmailClient";
 import type { GmailMessage } from "./GmailClient";
 import { syncLabels } from "./GmailLabels";
 import { parseMimeBody } from "./MimeParser";
+import { isSendableAlias } from "./SendAsComposerService";
 
 export interface GmailSyncResult {
   readonly mode: "initial" | "incremental";
   readonly messagesUpserted: number;
   readonly messagesDeleted: number;
+  /**
+   * Threads that received new (non-draft) messages in an incremental sync: the AI labeller's work.
+   * Always empty for initial imports, which backfill history and are not auto-classified.
+   */
+  readonly threadsWithNewMessages: ReadonlyArray<string>;
 }
 
 export interface GmailSyncProgress {
@@ -85,7 +91,7 @@ export const GmailSyncServiceLive: Layer.Layer<GmailSyncService, never, AccountD
           .flatMap((value) => splitAddresses(value))
           .map((address) => extractAddress(address).toLowerCase())
           .map((address) => aliasRecords.find((alias) =>
-            alias.verificationStatus.toLowerCase() === "accepted" && alias.sendAsEmail.toLowerCase() === address,
+            isSendableAlias(alias) && alias.sendAsEmail.toLowerCase() === address,
           )?.sendAsEmail)
           .find((address): address is string => address !== undefined) ?? null;
         const dateTs = Number(message.internalDate ?? 0);
@@ -100,6 +106,7 @@ export const GmailSyncServiceLive: Layer.Layer<GmailSyncService, never, AccountD
           bodyMarkdown: parsedBody.bodyMarkdown,
           bodyHtmlSanitized: parsedBody.bodyHtmlSanitized,
           rawHeaders: headers,
+          labels,
         };
         const threadRecord: ThreadRecord = {
           id: message.threadId,
@@ -115,6 +122,8 @@ export const GmailSyncServiceLive: Layer.Layer<GmailSyncService, never, AccountD
         };
         yield* accountDb.upsertThread(threadRecord);
         yield* accountDb.upsertMessage(msgRecord);
+        // Like Gmail, a thread carries every label any of its messages has.
+        yield* accountDb.refreshThreadLabelsFromMessages(message.threadId);
         return true;
       });
 
@@ -182,9 +191,10 @@ export const GmailSyncServiceLive: Layer.Layer<GmailSyncService, never, AccountD
           const { messagesUpserted, conversationsImported } = yield* hydrateLatest(initialConversationLimit, options.onProgress);
           yield* accountDb.setHistoryId(profile.historyId);
           yield* Effect.logInfo(`Gmail initial sync completed for ${accountDb.accountId}: ${conversationsImported} conversations, ${messagesUpserted} messages upserted`);
-          return { mode: "initial" as const, messagesUpserted, messagesDeleted: 0 };
+          return { mode: "initial" as const, messagesUpserted, messagesDeleted: 0, threadsWithNewMessages: [] };
         }
 
+        const added = new Set<string>();
         const changed = new Map<string, "upsert" | "delete">();
         let pageToken: string | undefined;
         let latestHistoryId: string | undefined;
@@ -204,7 +214,11 @@ export const GmailSyncServiceLive: Layer.Layer<GmailSyncService, never, AccountD
           const page = result.page;
           latestHistoryId = page.historyId ?? latestHistoryId;
           for (const event of page.history ?? []) {
-            for (const item of event.messagesAdded ?? []) if (item.message?.id) changed.set(item.message.id, "upsert");
+            for (const item of event.messagesAdded ?? []) {
+              if (!item.message?.id) continue;
+              changed.set(item.message.id, "upsert");
+              added.add(item.message.id);
+            }
             for (const item of event.labelsAdded ?? []) if (item.message?.id) changed.set(item.message.id, "upsert");
             for (const item of event.labelsRemoved ?? []) if (item.message?.id) changed.set(item.message.id, "upsert");
             for (const item of event.messagesDeleted ?? []) if (item.message?.id) changed.set(item.message.id, "delete");
@@ -217,12 +231,13 @@ export const GmailSyncServiceLive: Layer.Layer<GmailSyncService, never, AccountD
           const { messagesUpserted, conversationsImported } = yield* hydrateLatest(initialConversationLimit, options.onProgress);
           yield* accountDb.setHistoryId(profile.historyId);
           yield* Effect.logInfo(`Gmail re-import completed for ${accountDb.accountId}: ${conversationsImported} conversations, ${messagesUpserted} messages upserted`);
-          return { mode: "initial" as const, messagesUpserted, messagesDeleted: 0 };
+          return { mode: "initial" as const, messagesUpserted, messagesDeleted: 0, threadsWithNewMessages: [] };
         }
 
         yield* Effect.logInfo(`Gmail history scan for ${accountDb.accountId}: ${changed.size} changed messages`);
         let messagesUpserted = 0;
         let messagesDeleted = 0;
+        const threadsWithNewMessages = new Set<string>();
         for (const [id, action] of changed) {
           // History can reference messages deleted since (e.g. superseded drafts, purged trash);
           // Gmail then 404s on fetch, which means the message is gone and should be removed locally.
@@ -237,11 +252,12 @@ export const GmailSyncServiceLive: Layer.Layer<GmailSyncService, never, AccountD
             messagesDeleted++;
           } else if (yield* upsert(message)) {
             messagesUpserted++;
+            if (added.has(id) && !(message.labelIds ?? []).includes("DRAFT")) threadsWithNewMessages.add(message.threadId);
           }
         }
         yield* accountDb.setHistoryId(latestHistoryId ?? profile.historyId);
         yield* Effect.logInfo(`Gmail incremental sync completed for ${accountDb.accountId}: ${messagesUpserted} upserted, ${messagesDeleted} deleted`);
-        return { mode: "incremental" as const, messagesUpserted, messagesDeleted };
+        return { mode: "incremental" as const, messagesUpserted, messagesDeleted, threadsWithNewMessages: [...threadsWithNewMessages] };
       }).pipe(Effect.tapError((error) => Effect.logError(
         error._tag === "GmailApiError"
           ? `Gmail sync failed for ${accountDb.accountId}: HTTP ${error.status}${error.reason ? `, reason=${error.reason}` : ""}${error.apiStatus ? `, status=${error.apiStatus}` : ""}${error.operation ? `, operation=${error.operation}` : ""}, retryable=${error.retryable}`
