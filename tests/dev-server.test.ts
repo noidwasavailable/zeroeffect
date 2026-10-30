@@ -183,7 +183,17 @@ describe("local account setup", () => {
 
     const page = await fetch(new URL("/setup", app.url));
     expect(page.status).toBe(200);
+    expect(page.headers.get("content-security-policy")).toContain("script-src 'self'");
     expect(await page.text()).toContain("Connect Gmail accounts");
+    for (const [path, contentType, marker] of [
+      ["/setup/setup.css", "text/css", ".account"],
+      ["/setup/setup.js", "text/javascript", "refreshAccounts"],
+    ]) {
+      const asset = await fetch(new URL(path!, app.url));
+      expect(asset.status).toBe(200);
+      expect(asset.headers.get("content-type")).toStartWith(contentType!);
+      expect(await asset.text()).toContain(marker!);
+    }
 
     const aliasStart = await fetch(`http://localhost:${app.port}/auth/google/start?accountId=personal`, { redirect: "manual" });
     expect(aliasStart.status).toBe(302);

@@ -1,0 +1,34 @@
+:root { color-scheme: light dark; font: 16px/1.5 ui-sans-serif, system-ui, sans-serif; background: #f5f6f8; color: #20242c; }
+* { box-sizing: border-box; }
+body { margin: 0; min-height: 100vh; }
+.shell { max-width: 920px; margin: 0 auto; padding: 24px; }
+.topbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 12px 0 28px; border-bottom: 1px solid #d8dce3; }
+.brand { margin: 0; font-size: 1.25rem; letter-spacing: -.03em; }
+.environment { color: #596273; font-size: .875rem; }
+h2 { margin: 32px 0 8px; font-size: 1.5rem; letter-spacing: -.03em; }
+.intro { max-width: 62ch; color: #596273; margin: 0 0 24px; }
+.accounts { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr)); gap: 16px; }
+.account { display: flex; flex-direction: column; min-height: 220px; padding: 22px; border: 1px solid #d8dce3; border-radius: 14px; background: #fff; box-shadow: 0 2px 8px #16223a0a; }
+.account h3 { margin: 0; font-size: 1.1rem; }
+.email { min-height: 28px; margin: 10px 0 16px; color: #596273; overflow-wrap: anywhere; }
+.state { min-height: 24px; margin: 0 0 16px; font-size: .9rem; color: #596273; }
+.sync-options { display: grid; gap: 6px; margin: 0 0 14px; color: #596273; font-size: .9rem; }
+.sync-options input { width: 9rem; min-height: 38px; padding: 6px 9px; border: 1px solid #aeb6c4; border-radius: 7px; background: transparent; color: inherit; font: inherit; }
+.actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: auto; }
+button, .button { display: inline-flex; align-items: center; justify-content: center; min-height: 42px; padding: 8px 14px; border: 1px solid #263d7a; border-radius: 8px; background: #263d7a; color: #fff; font: inherit; font-weight: 600; text-decoration: none; cursor: pointer; }
+button.secondary { background: transparent; color: #263d7a; }
+button:disabled { opacity: .6; cursor: wait; }
+.notice { padding: 12px 14px; border-radius: 8px; background: #eaf0ff; color: #263d7a; }
+.notice.error { background: #ffeded; color: #8b2020; }
+.footnote { margin: 28px 0 0; color: #687184; font-size: .85rem; }
+@media (prefers-color-scheme: dark) {
+  :root { background: #14171d; color: #edf0f5; }
+  .topbar, .account { border-color: #343a46; }
+  .account { background: #1c2028; box-shadow: none; }
+  .environment, .intro, .email, .state, .sync-options, .footnote { color: #aab2c1; }
+  .sync-options input { border-color: #596273; }
+  button, .button { border-color: #a8baff; background: #a8baff; color: #171c2a; }
+  button.secondary { background: transparent; color: #c5d0ff; }
+  .notice { background: #202b46; color: #c5d0ff; }
+  .notice.error { background: #432323; color: #ffd0d0; }
+}

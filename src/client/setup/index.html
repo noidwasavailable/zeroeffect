@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>ZeroEffect · Connect accounts</title>
+  <link rel="stylesheet" href="/setup/setup.css">
+</head>
+<body>
+  <div id="app" class="shell">
+    <header class="topbar">
+      <h1 class="brand">ZeroEffect</h1>
+      <span class="environment">Local development · loopback only · <a href="/">Open inbox</a></span>
+    </header>
+    <main>
+      <h2>Connect Gmail accounts</h2>
+      <p class="intro">Bind Personal and Work separately. Each account is stored in its own database silo. Sync imports the latest conversations up to your chosen limit as a background job and shows progress here.</p>
+      <p id="notice" class="notice" role="status" aria-live="polite" hidden></p>
+      <section id="accounts" class="accounts" aria-label="Gmail account bindings"></section>
+      <h2>Google Cloud Pub/Sub</h2>
+      <p class="intro">Authorize a Google account in this browser for the local Pub/Sub listener. Create the topic and subscription and grant that account Pub/Sub Subscriber access in Google Cloud Console.</p>
+      <section id="pubsub" class="account" aria-label="Pub/Sub authorization"></section>
+      <p class="footnote">Google only accepts OAuth callbacks on localhost, so connect accounts from this machine. Keep the server bound to localhost and never commit your OAuth credentials.</p>
+    </main>
+  </div>
+  <script src="/setup/setup.js"></script>
+</body>
+</html>

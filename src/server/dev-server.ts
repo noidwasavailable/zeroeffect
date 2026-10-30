@@ -1,3 +1,4 @@
+import { join } from "node:path";
 import { Effect, Layer, ManagedRuntime } from "effect";
 import type { RegistryDbService } from "./services/RegistryDb";
 import { AccountDbLive } from "./services/AccountDb";
@@ -8,10 +9,17 @@ import { OAuthTokenVault } from "./services/OAuthTokenVault";
 import { createGmailAccessTokenProvider, type GmailAccessTokenProvider, type StoredTokens } from "./services/GmailAccessTokens";
 import { createApiHandler, isTrustedMutation, type ApiHandler } from "./routes/api";
 import { createAccountEventBus, type AccountEventBus } from "./routes/sse";
-import { renderAccountBindingPage } from "../client/auth-page";
 import appHtml from "../client/index.html";
 import { isAccountId, type AccountId } from "../shared/api";
 import { GmailApiError } from "../shared/errors";
+
+// The account setup page is static HTML/CSS/JS, read from disk per request (no bundling needed).
+const SETUP_DIRECTORY = join(import.meta.dir, "../client/setup");
+const SETUP_FILES: Readonly<Record<string, { readonly file: string; readonly contentType: string }>> = {
+  "/setup": { file: "index.html", contentType: "text/html; charset=utf-8" },
+  "/setup/setup.css": { file: "setup.css", contentType: "text/css; charset=utf-8" },
+  "/setup/setup.js": { file: "setup.js", contentType: "text/javascript; charset=utf-8" },
+};
 const DEFAULT_INITIAL_CONVERSATION_LIMIT = 100;
 const MAX_INITIAL_CONVERSATION_LIMIT = 10_000;
 
@@ -140,7 +148,6 @@ export const createDevServer = (config: DevServerConfig): Bun.Server<unknown> =>
   const pendingStates = new Map<string, { readonly accountId: AccountId; readonly createdAt: number }>();
   const pendingPubSubStates = new Map<string, number>();
   const syncJobs = new Map<AccountId, SyncJob>();
-  const html = renderAccountBindingPage();
 
   const tokens = config.tokens ?? createGmailAccessTokenProvider({ registry: config.registry, oauth: config.oauth, vault });
   const events = config.events ?? createAccountEventBus();
@@ -194,12 +201,13 @@ export const createDevServer = (config: DevServerConfig): Bun.Server<unknown> =>
         });
       }
 
-      if (request.method === "GET" && url.pathname === "/setup") {
-        return new Response(html, {
+      const setupFile = request.method === "GET" ? SETUP_FILES[url.pathname] : undefined;
+      if (setupFile) {
+        return new Response(Bun.file(join(SETUP_DIRECTORY, setupFile.file)), {
           headers: {
-            "Content-Type": "text/html; charset=utf-8",
+            "Content-Type": setupFile.contentType,
             "Cache-Control": "no-store",
-            "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
+            "Content-Security-Policy": "default-src 'none'; style-src 'self'; script-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
             "X-Content-Type-Options": "nosniff",
             "Referrer-Policy": "no-referrer",
           },
