@@ -1,5 +1,0 @@
-{
-  "dev_mode": "manual",
-  "folder": ".",
-  "include": ["datasources", "endpoints", "pipes"]
-}

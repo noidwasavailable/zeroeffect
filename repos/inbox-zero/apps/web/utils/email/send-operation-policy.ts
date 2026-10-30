@@ -1,1 +1,0 @@
-export const MAIL_MUTATION_RETRY_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
