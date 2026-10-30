@@ -3,7 +3,9 @@ import { join } from "node:path";
 import { Context, Effect, Layer } from "effect";
 import { Database } from "bun:sqlite";
 import { AccountIsolationError, DatabaseError } from "../../shared/errors";
+import { formatFilterExpr, renameFilterLabels } from "../../shared/filterDsl";
 import type { FilterExpr, FilterThread } from "../../shared/schemas";
+import type { ThreadDetail, ThreadSummary, ViewSummary } from "../../shared/api";
 import type { CompiledFilter } from "./BooleanFilter";
 
 export interface ThreadRecord extends FilterThread {
@@ -99,6 +101,12 @@ export interface AccountDbService {
   readonly listPersistedThreadIds: () => Effect.Effect<ReadonlyArray<string>, DatabaseError>;
   readonly markThreadHydrated: (id: string) => Effect.Effect<void, DatabaseError>;
   readonly queryThreads: (filter: CompiledFilter) => Effect.Effect<ReadonlyArray<FilterThread>, DatabaseError>;
+  /** One page of matching threads, newest first, as shown in the thread list. */
+  readonly listThreadSummaries: (filter: CompiledFilter, page: { readonly limit: number; readonly offset: number }) => Effect.Effect<ReadonlyArray<ThreadSummary>, DatabaseError>;
+  readonly getThreadDetail: (id: string) => Effect.Effect<ThreadDetail | null, DatabaseError>;
+  /** Stores a thread's label names and derives its unread/starred/archived flags from them. */
+  readonly setThreadLabels: (id: string, labels: ReadonlyArray<string>) => Effect.Effect<ThreadSummary | null, DatabaseError>;
+  readonly listSavedViews: () => Effect.Effect<ReadonlyArray<ViewSummary>, DatabaseError>;
   readonly upsertMessage: (message: MessageRecord) => Effect.Effect<void, DatabaseError>;
   readonly deleteMessage: (id: string) => Effect.Effect<void, DatabaseError>;
   /** Replaces the label catalog and rewrites stored thread labels for renamed (or legacy ID-valued) labels. */
@@ -260,6 +268,14 @@ const toFilterThread = (row: Pick<ThreadRow, "id" | "subject" | "sender_summary"
   isArchived: row.is_archived === 1,
 });
 
+const toThreadSummary = (row: ThreadRow): ThreadSummary => ({
+  ...toFilterThread(row),
+  snippet: row.snippet,
+  lastMessageAt: row.last_message_at,
+  ghostLabels: JSON.parse(row.ghost_labels_json) as string[],
+  aiStatus: row.ai_status,
+});
+
 const makeService = (accountId: string, database: Database): AccountDbService => ({
   accountId,
   upsertThread: (thread) =>
@@ -331,6 +347,62 @@ const makeService = (accountId: string, database: Database): AccountDbService =>
         return rows.map(toFilterThread);
       },
       catch: (cause) => new DatabaseError({ message: "Failed to query threads.", operation: "queryThreads", cause }),
+    }),
+  listThreadSummaries: (filter, page) =>
+    Effect.try({
+      try: () => (database
+        .prepare(`SELECT threads.* FROM threads WHERE ${filter.sql} ORDER BY last_message_at DESC, id LIMIT ? OFFSET ?`)
+        .all(...filter.params, page.limit, page.offset) as ThreadRow[]).map(toThreadSummary),
+      catch: (cause) => new DatabaseError({ message: "Failed to list threads.", operation: "listThreadSummaries", cause }),
+    }),
+  getThreadDetail: (id) =>
+    Effect.try({
+      try: () => {
+        const row = database.prepare("SELECT * FROM threads WHERE id = ?").get(id) as ThreadRow | null;
+        if (!row) return null;
+        const messages = (database.prepare(`
+          SELECT id, from_address, to_addresses_json, cc_addresses_json, delivered_to, date_ts, body_markdown, body_html_sanitized
+          FROM messages WHERE thread_id = ? ORDER BY date_ts ASC, id ASC
+        `).all(id) as Array<{
+          id: string; from_address: string; to_addresses_json: string; cc_addresses_json: string;
+          delivered_to: string | null; date_ts: number; body_markdown: string; body_html_sanitized: string;
+        }>).map((message) => ({
+          id: message.id,
+          fromAddress: message.from_address,
+          toAddresses: JSON.parse(message.to_addresses_json) as string[],
+          ccAddresses: JSON.parse(message.cc_addresses_json) as string[],
+          deliveredTo: message.delivered_to,
+          dateTs: message.date_ts,
+          bodyMarkdown: message.body_markdown,
+          bodyHtmlSanitized: message.body_html_sanitized,
+        }));
+        return { ...toThreadSummary(row), messages };
+      },
+      catch: (cause) => new DatabaseError({ message: "Failed to load thread.", operation: "getThreadDetail", cause }),
+    }),
+  setThreadLabels: (id, labels) =>
+    Effect.try({
+      try: () => {
+        const row = database.prepare(`
+          UPDATE threads SET labels_json = ?, is_unread = ?, is_starred = ?, is_archived = ?
+          WHERE id = ? RETURNING *
+        `).get(
+          JSON.stringify(labels),
+          Number(labels.includes("UNREAD")),
+          Number(labels.includes("STARRED")),
+          Number(!labels.includes("INBOX")),
+          id,
+        ) as ThreadRow | null;
+        return row ? toThreadSummary(row) : null;
+      },
+      catch: (cause) => new DatabaseError({ message: "Failed to update thread labels.", operation: "setThreadLabels", cause }),
+    }),
+  listSavedViews: () =>
+    Effect.try({
+      try: () => (database.prepare("SELECT id, name, dsl_string FROM saved_views ORDER BY sort_order, name").all() as Array<{
+        id: string; name: string; dsl_string: string;
+      }>).map((row) => ({ id: row.id, name: row.name, dsl: row.dsl_string, builtIn: false })),
+      catch: (cause) => new DatabaseError({ message: "Failed to load saved views.", operation: "listSavedViews", cause }),
     }),
   upsertMessage: (message) =>
     Effect.try({
@@ -406,9 +478,14 @@ const makeService = (accountId: string, database: Database): AccountDbService =>
           // Threads store label names. Map renamed labels, and (once) the label IDs written by earlier importers.
           const legacyIdsPending = !database.prepare("SELECT 1 FROM schema_migrations WHERE id = ?").get(LABEL_NAMES_MIGRATION_ID);
           const renames = new Map<string, string>();
+          // Saved views and AI rules are written by the user with names, so only real renames apply to them.
+          const userRenames = new Map<string, string>();
           for (const label of labels) {
             const previousName = previousNames.get(label.id);
-            if (previousName !== undefined && previousName !== label.name) renames.set(previousName, label.name);
+            if (previousName !== undefined && previousName !== label.name) {
+              renames.set(previousName, label.name);
+              userRenames.set(previousName.toLowerCase(), label.name);
+            }
             if (legacyIdsPending && label.id !== label.name) renames.set(label.id, label.name);
           }
           database.prepare("DELETE FROM labels").run();
@@ -422,6 +499,28 @@ const makeService = (accountId: string, database: Database): AccountDbService =>
               const labelsJson = rename(row.labels_json);
               const ghostLabelsJson = rename(row.ghost_labels_json);
               if (labelsJson !== row.labels_json || ghostLabelsJson !== row.ghost_labels_json) update.run(labelsJson, ghostLabelsJson, row.id);
+            }
+          }
+          if (userRenames.size > 0) {
+            const views = database.prepare("SELECT id, filter_ast_json FROM saved_views").all() as Array<{ id: string; filter_ast_json: string }>;
+            const updateView = database.prepare("UPDATE saved_views SET filter_ast_json = ?, dsl_string = ? WHERE id = ?");
+            for (const view of views) {
+              const renamed = renameFilterLabels(JSON.parse(view.filter_ast_json) as FilterExpr, userRenames);
+              const renamedJson = JSON.stringify(renamed);
+              if (renamedJson !== view.filter_ast_json) updateView.run(renamedJson, formatFilterExpr(renamed), view.id);
+            }
+            const renameAll = (values: unknown): unknown => Array.isArray(values)
+              ? values.map((value) => typeof value === "string" ? userRenames.get(value.toLowerCase()) ?? value : value)
+              : values;
+            const rules = database.prepare("SELECT id, precondition_ast_json, actions_json FROM ai_rules").all() as Array<{ id: string; precondition_ast_json: string; actions_json: string }>;
+            const updateRule = database.prepare("UPDATE ai_rules SET precondition_ast_json = ?, actions_json = ? WHERE id = ?");
+            for (const rule of rules) {
+              const precondition = JSON.stringify(renameFilterLabels(JSON.parse(rule.precondition_ast_json) as FilterExpr, userRenames));
+              const actions = JSON.parse(rule.actions_json) as unknown;
+              const renamedActions = JSON.stringify(typeof actions === "object" && actions !== null && !Array.isArray(actions)
+                ? { ...actions, ...("addLabels" in actions ? { addLabels: renameAll(actions.addLabels) } : {}), ...("removeLabels" in actions ? { removeLabels: renameAll(actions.removeLabels) } : {}) }
+                : actions);
+              if (precondition !== rule.precondition_ast_json || renamedActions !== rule.actions_json) updateRule.run(precondition, renamedActions, rule.id);
             }
           }
           if (legacyIdsPending) database.prepare("INSERT OR IGNORE INTO schema_migrations (id) VALUES (?)").run(LABEL_NAMES_MIGRATION_ID);

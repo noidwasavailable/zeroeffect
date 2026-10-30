@@ -1,8 +1,7 @@
 import { Effect, Layer, ManagedRuntime } from "effect";
-import { GmailApiError } from "../../shared/errors";
-import type { AccountRecord } from "../../shared/schemas";
 import type { RegistryDbService } from "./RegistryDb";
-import type { GoogleOAuth2Api, GoogleOAuthTokens } from "./GoogleOAuth2";
+import type { GoogleOAuth2Api } from "./GoogleOAuth2";
+import { createGmailAccessTokenProvider, type GmailAccessTokenProvider } from "./GmailAccessTokens";
 import { AccountDbLive } from "./AccountDb";
 import { GmailClient, GmailClientLive } from "./GmailClient";
 import { GmailSyncService, GmailSyncServiceLive } from "./GmailSyncService";
@@ -23,6 +22,10 @@ export interface GmailAccountOperationsConfig {
   readonly accountDataDirectory?: string;
   readonly gmailApiBaseUrl?: string;
   /** Optional sync executor for deterministic service tests. Production uses the scoped GmailSyncService. */
+  /** Shared with the HTTP API so both refresh tokens through one place. */
+  readonly tokens?: GmailAccessTokenProvider;
+  /** Called after each successful account sync (e.g. to notify connected web clients). */
+  readonly onSynced?: (accountId: GmailAccountId, result: GmailAccountSyncResult) => void;
   readonly syncAccount?: (accountId: GmailAccountId, accessToken: string) => Promise<GmailAccountSyncResult>;
 }
 
@@ -33,41 +36,11 @@ export interface GmailAccountOperations {
   readonly processNotification: (data: string) => Promise<"synced" | "ignored">;
 }
 
-interface StoredTokens {
-  readonly tokens: GoogleOAuthTokens;
-  readonly expiresAt: number;
-}
-
 /** Centralizes account-scoped Gmail sync and watch operations for HTTP and background workers. */
 export const createGmailAccountOperations = (config: GmailAccountOperationsConfig): GmailAccountOperations => {
   const inFlightSyncs = new Map<GmailAccountId, Promise<GmailAccountSyncResult>>();
 
-  const getUsableAccessToken = async (accountId: GmailAccountId): Promise<{ account: AccountRecord; accessToken: string }> => {
-    const account = await Effect.runPromise(config.registry.getAccount(accountId));
-    if (!account) throw new Error(`${accountId} Gmail account is not connected.`);
-    let stored: StoredTokens;
-    try {
-      stored = config.vault.decrypt<StoredTokens>(account.oauthTokensEnc);
-    } catch {
-      throw new Error(`Could not decrypt ${accountId} account tokens. Check OAUTH_ENCRYPTION_KEY.`);
-    }
-    if (stored.expiresAt > Date.now() + 60_000) return { account, accessToken: stored.tokens.accessToken };
-    if (!stored.tokens.refreshToken) throw new Error(`${accountId} Gmail access token expired and has no refresh token; reconnect the account.`);
-    const refreshed = await Effect.runPromise(config.oauth.refreshAccessToken(accountId, stored.tokens.refreshToken));
-    const tokens: GoogleOAuthTokens = {
-      ...refreshed.tokens,
-      refreshToken: refreshed.tokens.refreshToken ?? stored.tokens.refreshToken,
-    };
-    const refreshedAccount: AccountRecord = {
-      ...account,
-      oauthTokensEnc: config.vault.encrypt({
-        tokens,
-        expiresAt: Date.now() + (tokens.expiresIn ?? 3600) * 1000,
-      } satisfies StoredTokens),
-    };
-    await Effect.runPromise(config.registry.upsertAccount(refreshedAccount));
-    return { account: refreshedAccount, accessToken: tokens.accessToken };
-  };
+  const getUsableAccessToken = (config.tokens ?? createGmailAccessTokenProvider(config)).get;
 
   const sync = (accountId: GmailAccountId): Promise<GmailAccountSyncResult> => {
     const active = inFlightSyncs.get(accountId);
@@ -86,7 +59,10 @@ export const createGmailAccountOperations = (config: GmailAccountOperationsConfi
       } finally {
         await runtime.dispose();
       }
-    })();
+    })().then((result) => {
+      config.onSynced?.(accountId, result);
+      return result;
+    });
     inFlightSyncs.set(accountId, task);
     void task.finally(() => {
       if (inFlightSyncs.get(accountId) === task) inFlightSyncs.delete(accountId);
