@@ -3,13 +3,15 @@ import type { RegistryDbService } from "./services/RegistryDb";
 import { AccountDbLive } from "./services/AccountDb";
 import { GmailClient, GmailClientLive } from "./services/GmailClient";
 import { GmailSyncService, GmailSyncServiceLive } from "./services/GmailSyncService";
-import type { GoogleOAuth2Api, GoogleOAuthTokens } from "./services/GoogleOAuth2";
+import type { GoogleOAuth2Api } from "./services/GoogleOAuth2";
 import { OAuthTokenVault } from "./services/OAuthTokenVault";
+import { createGmailAccessTokenProvider, type GmailAccessTokenProvider, type StoredTokens } from "./services/GmailAccessTokens";
+import { createApiHandler, isTrustedMutation, type ApiHandler } from "./routes/api";
+import { createAccountEventBus, type AccountEventBus } from "./routes/sse";
 import { renderAccountBindingPage } from "../client/auth-page";
+import appHtml from "../client/index.html";
+import { isAccountId, type AccountId } from "../shared/api";
 import { GmailApiError } from "../shared/errors";
-
-const ACCOUNT_IDS = ["personal", "work"] as const;
-type AccountId = (typeof ACCOUNT_IDS)[number];
 const DEFAULT_INITIAL_CONVERSATION_LIMIT = 100;
 const MAX_INITIAL_CONVERSATION_LIMIT = 10_000;
 
@@ -32,11 +34,6 @@ type SyncJob = {
   error?: string;
 };
 
-interface StoredTokens {
-  readonly tokens: GoogleOAuthTokens;
-  readonly expiresAt: number;
-}
-
 export interface DevServerConfig {
   readonly registry: RegistryDbService;
   readonly oauth: GoogleOAuth2Api;
@@ -53,15 +50,16 @@ export interface DevServerConfig {
   readonly gmailApiBaseUrl?: string;
   readonly hostname?: string;
   readonly port?: number;
+  /** Shared with background workers; created per server when omitted (e.g. in tests). */
+  readonly tokens?: GmailAccessTokenProvider;
+  readonly events?: AccountEventBus;
+  readonly api?: ApiHandler;
 }
 
 const json = (value: unknown, status = 200): Response => Response.json(value, {
   status,
   headers: { "Cache-Control": "no-store" },
 });
-
-const isAccountId = (value: string | null): value is AccountId =>
-  value !== null && ACCOUNT_IDS.some((accountId) => accountId === value);
 
 const escapeHtml = (value: string): string => value
   .replaceAll("&", "&amp;")
@@ -100,9 +98,11 @@ const syncJobErrorMessage = (error: unknown, conversationsSaved: number): string
 const runSyncJob = async (
   job: SyncJob,
   work: () => Promise<SyncJob["result"]>,
+  events: AccountEventBus,
 ): Promise<void> => {
   job.status = "running";
   job.updatedAt = Date.now();
+  events.publish(job.accountId, { type: "sync", status: "running" });
   job.progress = { ...job.progress, stage: "preparing" };
   try {
     const result = await work();
@@ -119,6 +119,11 @@ const runSyncJob = async (
     job.error = syncJobErrorMessage(error, job.progress.conversationsCompleted);
   }
   job.updatedAt = Date.now();
+  events.publish(job.accountId, job.status === "failed"
+    ? { type: "sync", status: "failed", error: job.error! }
+    : { type: "sync", status: "completed" });
+  // Even a failed initial import keeps the conversations saved before the failure.
+  events.publish(job.accountId, { type: "threads-changed" });
 };
 
 export const createDevServer = (config: DevServerConfig): Bun.Server<unknown> => {
@@ -137,44 +142,49 @@ export const createDevServer = (config: DevServerConfig): Bun.Server<unknown> =>
   const syncJobs = new Map<AccountId, SyncJob>();
   const html = renderAccountBindingPage();
 
-  const getUsableAccessToken = async (accountId: AccountId) => {
-    const account = await Effect.runPromise(config.registry.getAccount(accountId));
-    if (!account) throw new Error(`${accountId} Gmail account is not connected.`);
-    let stored: StoredTokens;
-    try {
-      stored = vault.decrypt<StoredTokens>(account.oauthTokensEnc);
-    } catch {
-      throw new Error(`Could not decrypt ${accountId} account tokens. Check OAUTH_ENCRYPTION_KEY.`);
-    }
-    if (stored.expiresAt > Date.now() + 60_000) return stored.tokens.accessToken;
-    if (!stored.tokens.refreshToken) throw new Error(`${accountId} Gmail access token expired and has no refresh token; reconnect the account.`);
-    const refreshed = await Effect.runPromise(config.oauth.refreshAccessToken(accountId, stored.tokens.refreshToken));
-    const tokens: GoogleOAuthTokens = {
-      ...refreshed.tokens,
-      refreshToken: refreshed.tokens.refreshToken ?? stored.tokens.refreshToken,
-    };
-    await Effect.runPromise(config.registry.upsertAccount({
-      ...account,
-      oauthTokensEnc: vault.encrypt({
-        tokens,
-        expiresAt: Date.now() + (tokens.expiresIn ?? 3600) * 1000,
-      } satisfies StoredTokens),
-    }));
-    return tokens.accessToken;
-  };
+  const tokens = config.tokens ?? createGmailAccessTokenProvider({ registry: config.registry, oauth: config.oauth, vault });
+  const events = config.events ?? createAccountEventBus();
+  const api = config.api ?? createApiHandler({
+    registry: config.registry,
+    tokens,
+    events,
+    accountDataDirectory: config.accountDataDirectory,
+    gmailApiBaseUrl: config.gmailApiBaseUrl,
+  });
 
   return Bun.serve({
     hostname,
     port: config.port ?? 3000,
     // Initial hydration fetches Gmail messages one at a time and can exceed Bun's 10s default.
     idleTimeout: 255,
+    development: process.env.NODE_ENV !== "production",
+    // The web client: Bun bundles src/client from the HTML import. Client-side routing owns /a/*.
+    routes: { "/a/*": appHtml },
     fetch: async (request) => {
       const url = new URL(request.url);
+      if (request.method === "GET" && url.pathname === "/") {
+        let accounts: ReadonlyArray<{ readonly id: string }> = [];
+        try {
+          accounts = await Effect.runPromise(config.registry.listAccounts());
+        } catch {
+          // Fall through to the setup page, which reports registry problems itself.
+        }
+        const first = accounts.find((account) => isAccountId(account.id));
+        return new Response(null, {
+          status: 302,
+          headers: { Location: first ? `/a/${first.id}/views/inbox` : "/setup", "Cache-Control": "no-store" },
+        });
+      }
+
+      const apiResponse = await api.handle(request, url);
+      if (apiResponse) return apiResponse;
+
+      // Google only accepts loopback OAuth callbacks, so account setup runs on the server's own host.
       if (
         request.method === "GET" &&
         url.hostname !== callbackHostname &&
         url.hostname !== pubsubCallbackHostname &&
-        (url.pathname === "/" || url.pathname === "/auth/google/start" || url.pathname === "/auth/google/pubsub/start")
+        (url.pathname === "/setup" || url.pathname === "/auth/google/start" || url.pathname === "/auth/google/pubsub/start")
       ) {
         const canonicalUrl = new URL(url);
         canonicalUrl.hostname = url.pathname === "/auth/google/pubsub/start" ? pubsubCallbackHostname : callbackHostname;
@@ -184,7 +194,7 @@ export const createDevServer = (config: DevServerConfig): Bun.Server<unknown> =>
         });
       }
 
-      if (request.method === "GET" && url.pathname === "/") {
+      if (request.method === "GET" && url.pathname === "/setup") {
         return new Response(html, {
           headers: {
             "Content-Type": "text/html; charset=utf-8",
@@ -255,7 +265,7 @@ export const createDevServer = (config: DevServerConfig): Bun.Server<unknown> =>
         const redirectError = (message: string): Response => new Response(null, {
           status: 303,
           headers: {
-            Location: "/?pubsub_error=" + encodeURIComponent(message),
+            Location: "/setup?pubsub_error=" + encodeURIComponent(message),
             "Set-Cookie": clearStateCookie,
             "Cache-Control": "no-store",
           },
@@ -290,7 +300,7 @@ export const createDevServer = (config: DevServerConfig): Bun.Server<unknown> =>
           return new Response(null, {
             status: 303,
             headers: {
-              Location: "/?pubsub_connected=1",
+              Location: "/setup?pubsub_connected=1",
               "Set-Cookie": clearStateCookie,
               "Cache-Control": "no-store",
             },
@@ -321,7 +331,7 @@ export const createDevServer = (config: DevServerConfig): Bun.Server<unknown> =>
         const redirectError = (message: string): Response => new Response(null, {
           status: 303,
           headers: {
-            Location: "/?error=" + encodeURIComponent(message),
+            Location: "/setup?error=" + encodeURIComponent(message),
             "Set-Cookie": clearStateCookie,
             "Cache-Control": "no-store",
           },
@@ -363,7 +373,7 @@ export const createDevServer = (config: DevServerConfig): Bun.Server<unknown> =>
           return new Response(null, {
             status: 303,
             headers: {
-              Location: "/?connected=" + encodeURIComponent(pending.accountId),
+              Location: "/setup?connected=" + encodeURIComponent(pending.accountId),
               "Set-Cookie": clearStateCookie,
               "Cache-Control": "no-store",
             },
@@ -407,8 +417,8 @@ export const createDevServer = (config: DevServerConfig): Bun.Server<unknown> =>
           const job = syncJobs.get(accountId);
           return json({ job: job ?? null });
         }
-        if (request.headers.get("origin") !== url.origin || request.headers.get("x-zeroeffect-local") !== "1") {
-          return json({ error: "Sync requests must come from the local account screen." }, 403);
+        if (!isTrustedMutation(request)) {
+          return json({ error: "Sync requests must come from the ZeroEffect web client." }, 403);
         }
         let requestBody: unknown = {};
         try {
@@ -446,7 +456,7 @@ export const createDevServer = (config: DevServerConfig): Bun.Server<unknown> =>
         };
         syncJobs.set(accountId, job);
         void runSyncJob(job, async () => {
-          const accessToken = await getUsableAccessToken(accountId);
+          const { accessToken } = await tokens.get(accountId);
           const dependencies = Layer.merge(
             AccountDbLive(accountId, config.accountDataDirectory),
             GmailClientLive({ accessToken, apiBaseUrl: config.gmailApiBaseUrl }),
@@ -464,7 +474,7 @@ export const createDevServer = (config: DevServerConfig): Bun.Server<unknown> =>
           } finally {
             await runtime.dispose();
           }
-        });
+        }, events);
         return json({ job }, 202);
       }
 

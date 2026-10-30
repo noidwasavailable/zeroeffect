@@ -11,6 +11,9 @@ import { PubSubListenerService, PubSubListenerServiceLive } from "./services/Pub
 import { RedisQueueService, RedisQueueServiceLive } from "./services/RedisQueue";
 import type { RedisQueueServiceApi } from "./services/RedisQueue";
 import { RegistryDb, RegistryDbLive } from "./services/RegistryDb";
+import { createGmailAccessTokenProvider } from "./services/GmailAccessTokens";
+import { createApiHandler } from "./routes/api";
+import { createAccountEventBus } from "./routes/sse";
 import { createDevServer, devServerConfigFromEnvironment } from "./dev-server";
 
 const main = async (): Promise<void> => {
@@ -72,10 +75,22 @@ const main = async (): Promise<void> => {
   const pubSubOAuth = Effect.runSync(Effect.gen(function* () { return yield* GoogleOAuth2; }).pipe(Effect.provide(pubSubOAuthLayer)));
   const vault = OAuthTokenVault.fromKey(config.encryptionKey);
   const redisUrl = process.env.REDIS_URL ?? "redis://127.0.0.1:6379";
+  const tokens = createGmailAccessTokenProvider({ registry, oauth, vault });
+  const events = createAccountEventBus();
+  const api = createApiHandler({
+    registry,
+    tokens,
+    events,
+    accountDataDirectory: config.accountDataDirectory,
+    gmailApiBaseUrl: config.gmailApiBaseUrl,
+  });
   const accountOperations = createGmailAccountOperations({
     registry,
     oauth,
     vault,
+    tokens,
+    // Pub/Sub-driven syncs refresh any open web clients for that account.
+    onSynced: (accountId) => events.publish(accountId, { type: "threads-changed" }),
     accountDataDirectory: config.accountDataDirectory,
     gmailApiBaseUrl: config.gmailApiBaseUrl,
   });
@@ -191,6 +206,9 @@ const main = async (): Promise<void> => {
     ...config,
     registry,
     oauth,
+    tokens,
+    events,
+    api,
     pubsubOAuth: pubSubOAuth,
     onPubSubAuthorization: startPubSub,
     onGmailAccountConnected: async (accountId) => {
@@ -202,8 +220,8 @@ const main = async (): Promise<void> => {
       }
     },
   });
-  console.log(`ZeroEffect local account setup: http://${server.hostname}:${server.port}`);
-  console.log("OAuth credentials and tokens stay on this machine; stop this server when you are done.");
+  console.log(`ZeroEffect web client: http://${server.hostname}:${server.port}/`);
+  console.log(`Connect Gmail accounts (on this machine): http://${server.hostname}:${server.port}/setup`);
 
   const stop = async () => {
     if (stopping) return;
@@ -213,6 +231,7 @@ const main = async (): Promise<void> => {
     await pubSubTransport?.close();
     await Promise.all([pubSubTask, notificationWorkerTask]);
     await pubSubRuntime?.dispose();
+    await api.close();
     redisClient?.close();
     await registryRuntime.dispose();
   };
