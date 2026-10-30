@@ -3,7 +3,7 @@ import { Database } from "bun:sqlite";
 import { Effect, Layer } from "effect";
 import { AccountDb, AccountDbTest } from "../src/server/services/AccountDb";
 import { GmailClient, GmailClientLive } from "../src/server/services/GmailClient";
-import type { GmailClientService, GmailMessage } from "../src/server/services/GmailClient";
+import type { GmailClientService, GmailLabel, GmailMessage } from "../src/server/services/GmailClient";
 import { GmailSyncService, GmailSyncServiceLive } from "../src/server/services/GmailSyncService";
 import { parseMimeBody, sanitizeHtml } from "../src/server/services/MimeParser";
 import { GoogleOAuth2, GoogleOAuth2Live } from "../src/server/services/GoogleOAuth2";
@@ -77,6 +77,8 @@ describe("Phase 2: Gmail sync, aliases and Pub/Sub", () => {
       listSendAs: () => Effect.succeed([{ sendAsEmail: "alias@example.com", displayName: "Alias", isDefault: true, isPrimary: false, verificationStatus: "accepted" }]),
       watch: (topicName) => Effect.succeed({ historyId: `watch-${topicName}`, expiration: "1710000000000" }),
       modifyMessage: () => Effect.void,
+      listLabels: () => Effect.succeed([]),
+      createLabel: (name) => Effect.succeed({ id: name, name, type: "user" }),
       sendRaw: () => Effect.succeed({ id: "sent", threadId: "thread-sent" }),
     };
     const gmailLayer = Layer.succeed(GmailClient, gmail);
@@ -128,6 +130,8 @@ describe("Phase 2: Gmail sync, aliases and Pub/Sub", () => {
       listSendAs: () => Effect.succeed([]),
       watch: () => Effect.succeed({ historyId: "initial-history", expiration: "1710000000000" }),
       modifyMessage: () => Effect.void,
+      listLabels: () => Effect.succeed([]),
+      createLabel: (name) => Effect.succeed({ id: name, name, type: "user" }),
       sendRaw: () => Effect.succeed({ id: "sent", threadId: "sent" }),
     };
     const layer = Layer.provide(GmailSyncServiceLive, Layer.merge(accountLayer, Layer.succeed(GmailClient, gmail)));
@@ -192,6 +196,8 @@ describe("Phase 2: Gmail sync, aliases and Pub/Sub", () => {
       listSendAs: () => Effect.succeed([]),
       watch: () => Effect.succeed({ historyId: "initial-history", expiration: "1710000000000" }),
       modifyMessage: () => Effect.void,
+      listLabels: () => Effect.succeed([]),
+      createLabel: (name) => Effect.succeed({ id: name, name, type: "user" }),
       sendRaw: () => Effect.succeed({ id: "sent", threadId: "sent" }),
     };
     const layer = Layer.provide(GmailSyncServiceLive, Layer.merge(accountLayer, Layer.succeed(GmailClient, gmail)));
@@ -248,6 +254,8 @@ describe("Phase 2: Gmail sync, aliases and Pub/Sub", () => {
       listSendAs: () => Effect.succeed([]),
       watch: () => Effect.succeed({ historyId: "initial-history", expiration: "1710000000000" }),
       modifyMessage: () => Effect.void,
+      listLabels: () => Effect.succeed([]),
+      createLabel: (name) => Effect.succeed({ id: name, name, type: "user" }),
       sendRaw: () => Effect.succeed({ id: "sent", threadId: "sent" }),
     };
     const layer = Layer.provide(GmailSyncServiceLive, Layer.merge(accountLayer, Layer.succeed(GmailClient, gmail)));
@@ -265,6 +273,62 @@ describe("Phase 2: Gmail sync, aliases and Pub/Sub", () => {
     expect(database.prepare("SELECT COUNT(*) AS count FROM messages").get()).toEqual({ count: 1 });
     expect(await Effect.runPromise(accountDb.getHistoryId())).toBeNull();
     expect(progress.at(-1)).toEqual({ conversationsCompleted: 1, messagesUpserted: 1 });
+  });
+
+  test("stores Gmail label names on threads and keeps them current across label renames", async () => {
+    const { layer: accountLayer, service: accountDb, database } = makeAccountDb();
+    // A thread written by the earlier importer, which stored raw Gmail label IDs.
+    await Effect.runPromise(accountDb.upsertThread({
+      id: "legacy", subject: "Legacy", senderSummary: "bob@example.com", labels: ["INBOX", "Label_1"],
+      isUnread: false, isStarred: false, isArchived: false, ghostLabels: ["Receipts"],
+    }));
+    // Each labels.list call takes the next catalog; the last one keeps being returned.
+    const catalogs: Array<ReadonlyArray<GmailLabel>> = [[
+      { id: "INBOX", name: "INBOX", type: "system" },
+      { id: "UNREAD", name: "UNREAD", type: "system" },
+      { id: "Label_1", name: "Receipts", type: "user", color: { backgroundColor: "#fff", textColor: "#000" } },
+    ]];
+    let labelListCalls = 0;
+    const gmail: GmailClientService = {
+      getProfile: () => Effect.succeed({ emailAddress: "me@example.com", historyId: "h-1" }),
+      listMessages: () => Effect.succeed({ messages: [{ id: "m1", threadId: "thread-m1" }] }),
+      getMessage: () => Effect.succeed(mockMessage("m2", "thread-m2", ["INBOX", "Label_2"])),
+      listThreads: () => Effect.succeed({ threads: [] }),
+      getThread: (id) => Effect.succeed({ id, messages: [mockMessage("m1", id, ["INBOX", "UNREAD", "Label_1"])] }),
+      listHistory: () => Effect.succeed({ historyId: "h-2", history: [{ id: "h-2", messagesAdded: [{ message: { id: "m2" } }] }] }),
+      listSendAs: () => Effect.succeed([]),
+      watch: () => Effect.succeed({ historyId: "h-1", expiration: "1710000000000" }),
+      modifyMessage: () => Effect.void,
+      listLabels: () => Effect.sync(() => {
+        labelListCalls++;
+        return catalogs.length > 1 ? catalogs.shift()! : catalogs[0]!;
+      }),
+      createLabel: (name) => Effect.succeed({ id: name, name, type: "user" }),
+      sendRaw: () => Effect.succeed({ id: "sent", threadId: "sent" }),
+    };
+    const layer = Layer.provide(GmailSyncServiceLive, Layer.merge(accountLayer, Layer.succeed(GmailClient, gmail)));
+    const service = Effect.runSync(Effect.gen(function* () { return yield* GmailSyncService; }).pipe(Effect.provide(layer)));
+
+    await Effect.runPromise(service.sync());
+    expect(await Effect.runPromise(accountDb.getThread("thread-m1"))).toMatchObject({ labels: ["INBOX", "UNREAD", "Receipts"] });
+    expect(await Effect.runPromise(accountDb.getThread("legacy"))).toMatchObject({ labels: ["INBOX", "Receipts"] });
+    expect(await Effect.runPromise(accountDb.listLabels())).toContainEqual({
+      id: "Label_1", name: "Receipts", type: "user", colorBg: "#fff", colorText: "#000",
+    });
+
+    // The user renames "Receipts" before the next sync, then creates "Travel" after the catalog
+    // was loaded, so the unknown Label_2 on message m2 triggers one reload.
+    const renamed: ReadonlyArray<GmailLabel> = [
+      { id: "INBOX", name: "INBOX", type: "system" },
+      { id: "Label_1", name: "Finance/Receipts", type: "user" },
+    ];
+    catalogs.splice(0, catalogs.length, renamed, [...renamed, { id: "Label_2", name: "Travel", type: "user" }]);
+    labelListCalls = 0;
+    await Effect.runPromise(service.sync());
+    expect(labelListCalls).toBe(2);
+    expect(await Effect.runPromise(accountDb.getThread("thread-m1"))).toMatchObject({ labels: ["INBOX", "UNREAD", "Finance/Receipts"] });
+    expect(await Effect.runPromise(accountDb.getThread("thread-m2"))).toMatchObject({ labels: ["INBOX", "Travel"] });
+    expect(database.prepare("SELECT ghost_labels_json AS ghost FROM threads WHERE id = 'legacy'").get()).toEqual({ ghost: '["Finance/Receipts"]' });
   });
 
   test("removes history messages that Gmail no longer has instead of failing the sync", async () => {
@@ -301,6 +365,8 @@ describe("Phase 2: Gmail sync, aliases and Pub/Sub", () => {
       listSendAs: () => Effect.succeed([]),
       watch: () => Effect.succeed({ historyId: "h-2", expiration: "1710000000000" }),
       modifyMessage: () => Effect.void,
+      listLabels: () => Effect.succeed([]),
+      createLabel: (name) => Effect.succeed({ id: name, name, type: "user" }),
       sendRaw: () => Effect.succeed({ id: "sent", threadId: "sent" }),
     };
     const layer = Layer.provide(GmailSyncServiceLive, Layer.merge(accountLayer, Layer.succeed(GmailClient, gmail)));
@@ -328,6 +394,8 @@ describe("Phase 2: Gmail sync, aliases and Pub/Sub", () => {
       listSendAs: () => Effect.succeed([]),
       watch: () => Effect.succeed({ historyId: "fresh", expiration: "1710000000000" }),
       modifyMessage: () => Effect.void,
+      listLabels: () => Effect.succeed([]),
+      createLabel: (name) => Effect.succeed({ id: name, name, type: "user" }),
       sendRaw: () => Effect.succeed({ id: "sent", threadId: "sent" }),
     };
     const layer = Layer.provide(GmailSyncServiceLive, Layer.merge(accountLayer, Layer.succeed(GmailClient, gmail)));
@@ -491,6 +559,8 @@ describe("Phase 2: Gmail sync, aliases and Pub/Sub", () => {
       getThread: () => Effect.fail({} as never), listHistory: () => Effect.fail({} as never),
       listSendAs: () => Effect.succeed([]), watch: () => Effect.succeed({ historyId: "h1", expiration: "1710000000000" }),
       modifyMessage: () => Effect.void,
+      listLabels: () => Effect.succeed([]),
+      createLabel: (name) => Effect.succeed({ id: name, name, type: "user" }),
       sendRaw: () => Effect.succeed({ id: "sent", threadId: "t1" }),
     } satisfies GmailClientService);
     const layer = Layer.provide(SendAsComposerServiceLive, Layer.merge(accountLayer, gmailLayer));

@@ -146,6 +146,9 @@ describe("local account setup", () => {
           messageListLimits.push(Number(url.searchParams.get("maxResults")));
           return Response.json({ messages: [] });
         }
+        if (url.pathname === "/gmail/v1/users/me/labels") {
+          return Response.json({ labels: [{ id: "INBOX", name: "INBOX", type: "system" }] });
+        }
         if (url.pathname === "/gmail/v1/users/me/settings/sendAs") {
           return Response.json({ sendAs: [{ sendAsEmail: "personal@example.test", isPrimary: true, verificationStatus: "accepted" }] });
         }

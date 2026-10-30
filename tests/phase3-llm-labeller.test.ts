@@ -79,6 +79,12 @@ describe("Phase 3: dual-mode LLM auto-labeller", () => {
       senderSummary: "billing@example.com", labels: ["INBOX", "Old", "AI/New"], isUnread: true, isStarred: false, isArchived: false,
     };
     await Effect.runPromise(account.upsertThread(thread));
+    // Threads store label names; Gmail mutations must use the catalog's label IDs.
+    await Effect.runPromise(account.replaceLabels([
+      { id: "INBOX", name: "INBOX", type: "system", colorBg: null, colorText: null },
+      { id: "Label_old", name: "Old", type: "user", colorBg: null, colorText: null },
+      { id: "Label_new", name: "AI/New", type: "user", colorBg: null, colorText: null },
+    ]));
     await Effect.runPromise(account.upsertMessage({
       id: "message-1", threadId: thread.id, fromAddress: "billing@example.com", toAddresses: ["me@example.com"],
       ccAddresses: [], deliveredTo: null, dateTs: 10, bodyMarkdown: "Your invoice is paid.",
@@ -106,6 +112,7 @@ describe("Phase 3: dual-mode LLM auto-labeller", () => {
       getThread: () => Effect.fail({} as never), listHistory: () => Effect.fail({} as never),
       listSendAs: () => Effect.succeed([]), watch: () => Effect.fail({} as never),
       sendRaw: () => Effect.fail({} as never),
+      listLabels: () => Effect.succeed([]), createLabel: () => Effect.fail({} as never),
       modifyMessage: (id, add, remove) => Effect.sync(() => { gmailChanges.push({ id, add, remove }); }),
     };
     const dependencies = Layer.mergeAll(
@@ -133,14 +140,65 @@ describe("Phase 3: dual-mode LLM auto-labeller", () => {
     current = await Effect.runPromise(account.getAiThreadContext(thread.id));
     expect(current?.thread.labels).toEqual(["AI/New"]);
     expect(current?.thread.isArchived).toBe(true);
-    expect(gmailChanges).toEqual([{ id: "message-1", add: [], remove: ["INBOX", "Old"] }]);
+    expect(gmailChanges).toEqual([{ id: "message-1", add: [], remove: ["INBOX", "Label_old"] }]);
 
     expect(await Effect.runPromise(worker.undoAiAction())).toMatchObject({ reverted: true });
     current = await Effect.runPromise(account.getAiThreadContext(thread.id));
     expect(current?.thread.labels).toEqual(["INBOX", "Old", "AI/New"]);
     expect(current?.thread.isArchived).toBe(false);
-    expect(gmailChanges[1]).toEqual({ id: "message-1", add: ["INBOX", "Old"], remove: [] });
+    expect(gmailChanges[1]).toEqual({ id: "message-1", add: ["INBOX", "Label_old"], remove: [] });
     expect(accountDatabase.prepare("SELECT COUNT(*) AS count FROM ai_audit_logs WHERE reverted = 1").get()).toEqual({ count: 2 });
+    accountDatabase.close();
+    registryDatabase.close();
+  });
+
+  test("creates labels Gmail does not have yet before applying them", async () => {
+    const accountDatabase = new Database(":memory:");
+    const registryDatabase = new Database(":memory:");
+    const accountLayer = AccountDbTest("work", accountDatabase);
+    const registryLayer = RegistryDbTest(registryDatabase);
+    const account = Effect.runSync(Effect.gen(function* () { return yield* AccountDb; }).pipe(Effect.provide(accountLayer)));
+    const registry = Effect.runSync(Effect.gen(function* () { return yield* RegistryDb; }).pipe(Effect.provide(registryLayer)));
+    await Effect.runPromise(account.upsertThread({
+      id: "thread-2", subject: "Receipt", senderSummary: "shop@example.com", labels: ["INBOX", "Old"],
+      isUnread: true, isStarred: false, isArchived: false,
+    }));
+    await Effect.runPromise(account.replaceLabels([
+      { id: "INBOX", name: "INBOX", type: "system", colorBg: null, colorText: null },
+      { id: "Label_old", name: "Old", type: "user", colorBg: null, colorText: null },
+    ]));
+    await Effect.runPromise(account.upsertMessage({
+      id: "message-2", threadId: "thread-2", fromAddress: "shop@example.com", toAddresses: [], ccAddresses: [],
+      deliveredTo: null, dateTs: 1, bodyMarkdown: "Receipt", bodyHtmlSanitized: "", rawHeaders: {},
+    }));
+    accountDatabase.prepare(`INSERT INTO ai_rules (id, name, dry_run, precondition_ast_json, system_prompt, actions_json, llm_endpoint_id)
+      VALUES ('rule', 'Receipts', 0, ?, '', '{}', 'endpoint')`).run(JSON.stringify({ _tag: "Is", value: "unread" }));
+    const vault = OAuthTokenVault.fromKey(new Uint8Array(32).fill(5));
+    await Effect.runPromise(registry.upsertLlmEndpoint({
+      id: "endpoint", name: "local test", baseUrl: `${server.url}/v1`,
+      apiKeyEnc: vault.encrypt("test-key"), modelId: "test-model", apiMode: "chat_completions",
+    }));
+    const created: string[] = [];
+    const gmailChanges: Array<{ add: ReadonlyArray<string>; remove: ReadonlyArray<string> }> = [];
+    const gmail: GmailClientService = {
+      getProfile: () => Effect.fail({} as never), listMessages: () => Effect.fail({} as never),
+      getMessage: () => Effect.fail({} as never), listThreads: () => Effect.fail({} as never),
+      getThread: () => Effect.fail({} as never), listHistory: () => Effect.fail({} as never),
+      listSendAs: () => Effect.succeed([]), watch: () => Effect.fail({} as never),
+      sendRaw: () => Effect.fail({} as never), listLabels: () => Effect.fail({} as never),
+      createLabel: (name) => Effect.sync(() => { created.push(name); return { id: "Label_created", name, type: "user" }; }),
+      modifyMessage: (_id, add, remove) => Effect.sync(() => { gmailChanges.push({ add, remove }); }),
+    };
+    const dependencies = Layer.mergeAll(accountLayer, registryLayer, BooleanFilterLive, Layer.succeed(GmailClient, gmail), LlmProviderLive());
+    const worker = Effect.runSync(Effect.gen(function* () { return yield* AiRuleWorker; }).pipe(
+      Effect.provide(Layer.provide(AiRuleWorkerLive(vault), dependencies)),
+    ));
+
+    expect(await Effect.runPromise(worker.runForThread("thread-2"))).toEqual({ evaluatedRules: 1, appliedRules: ["rule"] });
+    expect(created).toEqual(["AI/New"]);
+    expect(gmailChanges).toEqual([{ add: ["Label_created"], remove: ["INBOX", "Label_old"] }]);
+    expect((await Effect.runPromise(account.listLabels())).map((label) => label.name)).toContain("AI/New");
+    expect(await Effect.runPromise(account.getThread("thread-2"))).toMatchObject({ labels: ["AI/New"], isArchived: true });
     accountDatabase.close();
     registryDatabase.close();
   });
@@ -161,6 +219,7 @@ describe("Phase 3: dual-mode LLM auto-labeller", () => {
       getThread: () => Effect.fail({} as never), listHistory: () => Effect.fail({} as never),
       listSendAs: () => Effect.succeed([]), watch: () => Effect.fail({} as never),
       sendRaw: () => Effect.fail({} as never), modifyMessage: () => Effect.void,
+      listLabels: () => Effect.fail({} as never), createLabel: () => Effect.fail({} as never),
     };
     const dependencies = Layer.mergeAll(
       accountLayer,
