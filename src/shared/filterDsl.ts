@@ -23,9 +23,9 @@ export const formatFilterExpr = (expression: FilterExpr): string => {
     case "Or":
     case "And": {
       if (expression.expressions.length === 1) return formatFilterExpr(expression.expressions[0]!);
-      const own = precedence(expression);
-      // Parenthesize same-precedence children too, so nested groups keep their shape.
-      return expression.expressions.map((child) => formatChild(child, own + 1)).join(` ${expression._tag.toUpperCase()} `);
+      // Nested groups are always parenthesized: precedence alone (AND before OR) is easy to misread,
+      // and same-operator groups keep their shape in the builder.
+      return expression.expressions.map((child) => formatChild(child, 2)).join(` ${expression._tag.toUpperCase()} `);
     }
     case "Not":
       return `NOT ${formatChild(expression.expression, 2)}`;

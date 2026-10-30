@@ -65,6 +65,8 @@ export interface ThreadPage {
   readonly hasMore: boolean;
 }
 
+export const MAX_VIEW_NAME_LENGTH = 60;
+
 export type ThreadAction =
   | { readonly type: "archive" }
   | { readonly type: "moveToInbox" }
@@ -86,4 +88,5 @@ export type SyncJobStatus = "queued" | "running" | "completed" | "failed";
 
 export type AccountEvent =
   | { readonly type: "threads-changed"; readonly threadIds?: ReadonlyArray<string> }
+  | { readonly type: "views-changed" }
   | { readonly type: "sync"; readonly status: SyncJobStatus; readonly error?: string };
