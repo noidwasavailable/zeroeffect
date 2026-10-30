@@ -1,3 +1,4 @@
 [test]
 root = "tests"
 pathIgnorePatterns = ["**/._*"]
+preload = ["./tests/helpers/quietConsole.ts"]

@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { Effect } from "effect";
-import { RedisQueueError } from "../src/shared/errors";
+import { GmailApiError, RedisQueueError } from "../src/shared/errors";
 import type { RedisQueueServiceApi } from "../src/server/services/RedisQueue";
 import { handleQueuedGmailNotification } from "../src/server/services/GmailNotificationWorker";
 
@@ -46,6 +46,30 @@ describe("Gmail notification Redis worker", () => {
       envelope,
       fakeQueue(events),
       async () => { throw new Error("temporary sync failure"); },
+    );
+
+    expect(result).toBe("retried");
+    expect(events).toEqual([`retry:${envelope}`]);
+  });
+
+  test("acknowledges notifications that fail with a non-retryable error", async () => {
+    const events: string[] = [];
+    const result = await handleQueuedGmailNotification(
+      envelope,
+      fakeQueue(events),
+      async () => { throw new GmailApiError({ message: "bad request", status: 400, retryable: false }); },
+    );
+
+    expect(result).toBe("acknowledged");
+    expect(events).toEqual([`ack:${envelope}`]);
+  });
+
+  test("retries notifications that fail with a retryable error", async () => {
+    const events: string[] = [];
+    const result = await handleQueuedGmailNotification(
+      envelope,
+      fakeQueue(events),
+      async () => { throw new GmailApiError({ message: "rate limited", status: 429, retryable: true }); },
     );
 
     expect(result).toBe("retried");
