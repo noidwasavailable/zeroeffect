@@ -14,6 +14,14 @@ export interface ThreadRecord extends FilterThread {
   readonly aiStatus?: "pending" | "processed" | "skipped" | "error";
 }
 
+export interface LabelRecord {
+  readonly id: string;
+  readonly name: string;
+  readonly type: "system" | "user";
+  readonly colorBg: string | null;
+  readonly colorText: string | null;
+}
+
 export interface SendAsAliasRecord {
   readonly sendAsEmail: string;
   readonly displayName: string;
@@ -93,6 +101,10 @@ export interface AccountDbService {
   readonly queryThreads: (filter: CompiledFilter) => Effect.Effect<ReadonlyArray<FilterThread>, DatabaseError>;
   readonly upsertMessage: (message: MessageRecord) => Effect.Effect<void, DatabaseError>;
   readonly deleteMessage: (id: string) => Effect.Effect<void, DatabaseError>;
+  /** Replaces the label catalog and rewrites stored thread labels for renamed (or legacy ID-valued) labels. */
+  readonly replaceLabels: (labels: ReadonlyArray<LabelRecord>) => Effect.Effect<void, DatabaseError>;
+  readonly upsertLabel: (label: LabelRecord) => Effect.Effect<void, DatabaseError>;
+  readonly listLabels: () => Effect.Effect<ReadonlyArray<LabelRecord>, DatabaseError>;
   readonly replaceSendAsAliases: (aliases: ReadonlyArray<SendAsAliasRecord>) => Effect.Effect<void, DatabaseError>;
   readonly listSendAsAliases: () => Effect.Effect<ReadonlyArray<SendAsAliasRecord>, DatabaseError>;
   readonly getHistoryId: () => Effect.Effect<string | null, DatabaseError>;
@@ -123,6 +135,8 @@ interface ThreadRow {
   ghost_labels_json: string;
   ai_status: "pending" | "processed" | "skipped" | "error";
 }
+
+const LABEL_NAMES_MIGRATION_ID = "thread-label-names-v1";
 
 const initialize = (database: Database): void => {
   database.exec("PRAGMA journal_mode = WAL;");
@@ -383,6 +397,55 @@ const makeService = (accountId: string, database: Database): AccountDbService =>
       },
       catch: (cause) => new DatabaseError({ message: "Failed to delete message.", operation: "deleteMessage", cause }),
     }).pipe(Effect.asVoid),
+  replaceLabels: (labels) =>
+    Effect.try({
+      try: () => {
+        database.transaction(() => {
+          const previousNames = new Map((database.prepare("SELECT id, name FROM labels").all() as Array<{ id: string; name: string }>)
+            .map((row) => [row.id, row.name]));
+          // Threads store label names. Map renamed labels, and (once) the label IDs written by earlier importers.
+          const legacyIdsPending = !database.prepare("SELECT 1 FROM schema_migrations WHERE id = ?").get(LABEL_NAMES_MIGRATION_ID);
+          const renames = new Map<string, string>();
+          for (const label of labels) {
+            const previousName = previousNames.get(label.id);
+            if (previousName !== undefined && previousName !== label.name) renames.set(previousName, label.name);
+            if (legacyIdsPending && label.id !== label.name) renames.set(label.id, label.name);
+          }
+          database.prepare("DELETE FROM labels").run();
+          const insert = database.prepare("INSERT INTO labels (id, name, type, color_bg, color_text) VALUES (?, ?, ?, ?, ?)");
+          for (const label of labels) insert.run(label.id, label.name, label.type, label.colorBg, label.colorText);
+          if (renames.size > 0) {
+            const rename = (json: string): string => JSON.stringify([...new Set((JSON.parse(json) as string[]).map((label) => renames.get(label) ?? label))]);
+            const update = database.prepare("UPDATE threads SET labels_json = ?, ghost_labels_json = ? WHERE id = ?");
+            const rows = database.prepare("SELECT id, labels_json, ghost_labels_json FROM threads").all() as Array<Pick<ThreadRow, "id" | "labels_json" | "ghost_labels_json">>;
+            for (const row of rows) {
+              const labelsJson = rename(row.labels_json);
+              const ghostLabelsJson = rename(row.ghost_labels_json);
+              if (labelsJson !== row.labels_json || ghostLabelsJson !== row.ghost_labels_json) update.run(labelsJson, ghostLabelsJson, row.id);
+            }
+          }
+          if (legacyIdsPending) database.prepare("INSERT OR IGNORE INTO schema_migrations (id) VALUES (?)").run(LABEL_NAMES_MIGRATION_ID);
+        })();
+      },
+      catch: (cause) => new DatabaseError({ message: "Failed to replace Gmail labels.", operation: "replaceLabels", cause }),
+    }).pipe(Effect.asVoid),
+  upsertLabel: (label) =>
+    Effect.try({
+      try: () => database.prepare(`
+        INSERT INTO labels (id, name, type, color_bg, color_text) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          name = excluded.name, type = excluded.type, color_bg = excluded.color_bg, color_text = excluded.color_text
+      `).run(label.id, label.name, label.type, label.colorBg, label.colorText),
+      catch: (cause) => new DatabaseError({ message: "Failed to save Gmail label.", operation: "upsertLabel", cause }),
+    }).pipe(Effect.asVoid),
+  listLabels: () =>
+    Effect.try({
+      try: () => database.prepare(`
+        SELECT id, name, type, color_bg AS colorBg, color_text AS colorText
+        FROM labels ORDER BY type DESC, name
+      `).all() as LabelRecord[],
+      catch: (cause) => new DatabaseError({ message: "Failed to load Gmail labels.", operation: "listLabels", cause }),
+    }),
   replaceSendAsAliases: (aliases) =>
     Effect.try({
       try: () => {

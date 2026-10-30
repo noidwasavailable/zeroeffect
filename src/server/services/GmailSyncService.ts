@@ -4,6 +4,7 @@ import { AccountDb } from "./AccountDb";
 import type { MessageRecord, ThreadRecord } from "./AccountDb";
 import { GmailClient } from "./GmailClient";
 import type { GmailMessage } from "./GmailClient";
+import { syncLabels } from "./GmailLabels";
 import { parseMimeBody } from "./MimeParser";
 
 export interface GmailSyncResult {
@@ -56,12 +57,26 @@ export const GmailSyncServiceLive: Layer.Layer<GmailSyncService, never, AccountD
         return aliases.length;
       });
 
+      // Threads store label names (what filters and the UI use); Gmail messages carry label IDs.
+      let labelNamesById = new Map<string, string>();
+      let labelsRefreshedThisSync = false;
+      const refreshLabels = Effect.gen(function* () {
+        const labels = yield* syncLabels(accountDb, gmail);
+        labelNamesById = new Map(labels.map((label) => [label.id, label.name]));
+      });
+
       const upsert = (message: GmailMessage) => Effect.gen(function* () {
         if (!message.payload) return false;
+        const labelIds = message.labelIds ?? [];
+        if (!labelsRefreshedThisSync && labelIds.some((id) => !labelNamesById.has(id))) {
+          // A label created since the catalog was loaded; reload it once per sync.
+          labelsRefreshedThisSync = true;
+          yield* refreshLabels;
+        }
         const headers = Object.fromEntries((message.payload.headers ?? [])
           .filter((header) => header.name && header.value !== undefined)
           .map((header) => [header.name!.toLowerCase(), header.value ?? ""]));
-        const labels = message.labelIds ?? [];
+        const labels = labelIds.map((id) => labelNamesById.get(id) ?? id);
         const parsedBody = parseMimeBody(message.payload);
         const aliasRecords = yield* accountDb.listSendAsAliases();
         const deliveredTo = headers["delivered-to"] ?? headers["x-original-to"] ?? null;
@@ -158,6 +173,8 @@ export const GmailSyncServiceLive: Layer.Layer<GmailSyncService, never, AccountD
         }
         yield* Effect.logInfo(`Gmail sync started for ${accountDb.accountId}`);
         yield* syncAliases;
+        yield* refreshLabels;
+        labelsRefreshedThisSync = false;
         const profile = yield* gmail.getProfile();
         const historyId = yield* accountDb.getHistoryId();
         if (!historyId) {

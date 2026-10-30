@@ -50,6 +50,13 @@ export interface GmailSendAs {
   readonly verificationStatus?: string;
 }
 
+export interface GmailLabel {
+  readonly id: string;
+  readonly name: string;
+  readonly type?: string;
+  readonly color?: { readonly backgroundColor?: string; readonly textColor?: string };
+}
+
 export interface GmailClientService {
   readonly getProfile: () => Effect.Effect<GmailProfile, GmailApiError>;
   readonly listMessages: (pageToken?: string) => Effect.Effect<{
@@ -64,6 +71,8 @@ export interface GmailClientService {
   readonly getThread: (id: string) => Effect.Effect<GmailThread, GmailApiError>;
   readonly listHistory: (startHistoryId: string, pageToken?: string) => Effect.Effect<GmailHistoryPage, GmailApiError>;
   readonly listSendAs: () => Effect.Effect<ReadonlyArray<GmailSendAs>, GmailApiError>;
+  readonly listLabels: () => Effect.Effect<ReadonlyArray<GmailLabel>, GmailApiError>;
+  readonly createLabel: (name: string) => Effect.Effect<GmailLabel, GmailApiError>;
   readonly watch: (topicName: string) => Effect.Effect<GmailWatchResponse, GmailApiError>;
   readonly sendRaw: (raw: string) => Effect.Effect<{ readonly id: string; readonly threadId: string }, GmailApiError>;
   readonly modifyMessage: (id: string, addLabelIds: ReadonlyArray<string>, removeLabelIds: ReadonlyArray<string>) => Effect.Effect<void, GmailApiError>;
@@ -175,6 +184,14 @@ const makeClient = (config: GmailClientConfig): GmailClientService => {
     listSendAs: () => request<{ sendAs?: ReadonlyArray<GmailSendAs> }>("/users/me/settings/sendAs").pipe(
       Effect.map((result) => result.sendAs ?? []),
     ),
+    listLabels: () => request<{ labels?: ReadonlyArray<GmailLabel> }>("/users/me/labels").pipe(
+      Effect.map((result) => result.labels ?? []),
+    ),
+    createLabel: (name) => request("/users/me/labels", {}, {
+      name,
+      labelListVisibility: "labelShow",
+      messageListVisibility: "show",
+    }),
     watch: (topicName) => request("/users/me/watch", {}, { topicName }),
     sendRaw: (raw) => request("/users/me/messages/send", {}, { raw }),
     modifyMessage: (id, addLabelIds, removeLabelIds) => request(

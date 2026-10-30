@@ -5,6 +5,7 @@ import type { LabellingDecision } from "../../shared/schemas";
 import { AccountDb, type AiAppliedAction, type AiAuditRecord, type AiThreadContext, type AccountDbService } from "./AccountDb";
 import { BooleanFilter, type BooleanFilterService } from "./BooleanFilter";
 import { GmailClient, type GmailClientService } from "./GmailClient";
+import { resolveLabelIds } from "./GmailLabels";
 import { LlmProvider, type LlmProviderService } from "./LlmProvider";
 import { RegistryDb, type RegistryDbService } from "./RegistryDb";
 import { OAuthTokenVault } from "./OAuthTokenVault";
@@ -113,8 +114,10 @@ const makeService = (
       };
 
       if (!rule.dryRun) {
+        const addLabelIds = yield* resolveLabelIds(accountDb, gmail, appliedAction.labelsAdded, { create: true });
+        const removeLabelIds = yield* resolveLabelIds(accountDb, gmail, appliedAction.labelsRemoved, { create: false });
         for (const messageId of appliedAction.gmailMessageIds) {
-          yield* gmail.modifyMessage(messageId, appliedAction.labelsAdded, appliedAction.labelsRemoved);
+          yield* gmail.modifyMessage(messageId, addLabelIds, removeLabelIds);
         }
       }
 
@@ -159,8 +162,8 @@ const makeService = (
     const action = audit.actionsApplied;
 
     if (!action.dryRun) {
-      const addLabelIds = action.labelsRemoved;
-      const removeLabelIds = action.labelsAdded;
+      const addLabelIds = yield* resolveLabelIds(accountDb, gmail, action.labelsRemoved, { create: true });
+      const removeLabelIds = yield* resolveLabelIds(accountDb, gmail, action.labelsAdded, { create: false });
       for (const messageId of action.gmailMessageIds) {
         yield* gmail.modifyMessage(messageId, addLabelIds, removeLabelIds);
       }
