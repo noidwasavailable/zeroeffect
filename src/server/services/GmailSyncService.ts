@@ -207,10 +207,18 @@ export const GmailSyncServiceLive: Layer.Layer<GmailSyncService, never, AccountD
         let messagesUpserted = 0;
         let messagesDeleted = 0;
         for (const [id, action] of changed) {
-          if (action === "delete") {
+          // History can reference messages deleted since (e.g. superseded drafts, purged trash);
+          // Gmail then 404s on fetch, which means the message is gone and should be removed locally.
+          const message = action === "delete" ? null : yield* gmail.getMessage(id).pipe(
+            Effect.catchIf(
+              (error) => error.status === 404,
+              () => Effect.succeed(null),
+            ),
+          );
+          if (message === null) {
             yield* accountDb.deleteMessage(id);
             messagesDeleted++;
-          } else if (yield* upsert(yield* gmail.getMessage(id))) {
+          } else if (yield* upsert(message)) {
             messagesUpserted++;
           }
         }

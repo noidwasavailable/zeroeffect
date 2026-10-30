@@ -269,14 +269,19 @@ describe("Phase 2: Gmail sync, aliases and Pub/Sub", () => {
 
   test("removes history messages that Gmail no longer has instead of failing the sync", async () => {
     const { layer: accountLayer, service: accountDb, database } = makeAccountDb();
-    await Effect.runPromise(accountDb.upsertThread({
-      id: "thread-gone", subject: "Gone", senderSummary: "alice@example.com", labels: ["INBOX"],
-      isUnread: false, isStarred: false, isArchived: false,
-    }));
-    await Effect.runPromise(accountDb.upsertMessage({
-      id: "gone", threadId: "thread-gone", fromAddress: "alice@example.com", toAddresses: ["me@example.com"],
-      ccAddresses: [], deliveredTo: null, dateTs: 1710000000000, bodyMarkdown: "", bodyHtmlSanitized: "", rawHeaders: {},
-    }));
+    const localMessages = [["gone", "thread-gone"], ["shared-gone", "thread-shared"], ["shared-kept", "thread-shared"]];
+    for (const threadId of ["thread-gone", "thread-shared"]) {
+      await Effect.runPromise(accountDb.upsertThread({
+        id: threadId, subject: threadId, senderSummary: "alice@example.com", labels: ["INBOX"],
+        isUnread: false, isStarred: false, isArchived: false,
+      }));
+    }
+    for (const [id, threadId] of localMessages) {
+      await Effect.runPromise(accountDb.upsertMessage({
+        id: id!, threadId: threadId!, fromAddress: "alice@example.com", toAddresses: ["me@example.com"],
+        ccAddresses: [], deliveredTo: null, dateTs: 1710000000000, bodyMarkdown: "", bodyHtmlSanitized: "", rawHeaders: {},
+      }));
+    }
     await Effect.runPromise(accountDb.setHistoryId("h-1"));
     const gmail: GmailClientService = {
       getProfile: () => Effect.succeed({ emailAddress: "me@example.com", historyId: "h-2" }),
@@ -288,7 +293,10 @@ describe("Phase 2: Gmail sync, aliases and Pub/Sub", () => {
       getThread: (id) => Effect.succeed({ id, messages: [] }),
       listHistory: () => Effect.succeed({
         historyId: "h-2",
-        history: [{ id: "h-2", messagesAdded: [{ message: { id: "gone" } }, { message: { id: "kept" } }] }],
+        history: [{
+          id: "h-2",
+          messagesAdded: [{ message: { id: "gone" } }, { message: { id: "shared-gone" } }, { message: { id: "kept" } }],
+        }],
       }),
       listSendAs: () => Effect.succeed([]),
       watch: () => Effect.succeed({ historyId: "h-2", expiration: "1710000000000" }),
@@ -298,9 +306,12 @@ describe("Phase 2: Gmail sync, aliases and Pub/Sub", () => {
     const layer = Layer.provide(GmailSyncServiceLive, Layer.merge(accountLayer, Layer.succeed(GmailClient, gmail)));
     const service = Effect.runSync(Effect.gen(function* () { return yield* GmailSyncService; }).pipe(Effect.provide(layer)));
 
-    expect(await Effect.runPromise(service.sync())).toEqual({ mode: "incremental", messagesUpserted: 1, messagesDeleted: 1 });
+    expect(await Effect.runPromise(service.sync())).toEqual({ mode: "incremental", messagesUpserted: 1, messagesDeleted: 2 });
     expect(await Effect.runPromise(accountDb.getHistoryId())).toBe("h-2");
-    expect(database.prepare("SELECT id FROM messages WHERE id = ?").get("gone")).toBeNull();
+    // A thread whose last message is gone is removed; one with remaining messages stays.
+    expect(await Effect.runPromise(accountDb.getThread("thread-gone"))).toBeNull();
+    expect(await Effect.runPromise(accountDb.getThread("thread-shared"))).not.toBeNull();
+    expect(database.prepare("SELECT id FROM messages WHERE thread_id = ?").all("thread-shared")).toEqual([{ id: "shared-kept" }]);
     expect(await Effect.runPromise(accountDb.getThread("thread-kept"))).not.toBeNull();
   });
 

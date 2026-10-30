@@ -363,17 +363,23 @@ const makeService = (accountId: string, database: Database): AccountDbService =>
   deleteMessage: (id) =>
     Effect.try({
       try: () => {
-        const row = database.prepare("SELECT thread_id FROM messages WHERE id = ?").get(id) as { thread_id: string } | null;
-        database.prepare("DELETE FROM messages WHERE id = ?").run(id);
-        if (row) {
-          database.prepare("DELETE FROM messages_fts WHERE thread_id = ?").run(row.thread_id);
-          database.prepare(`
-            INSERT INTO messages_fts (thread_id, subject, from_address, body_markdown)
-            SELECT messages.thread_id, threads.subject, messages.from_address, messages.body_markdown
-            FROM messages JOIN threads ON threads.id = messages.thread_id
-            WHERE messages.thread_id = ?
-          `).run(row.thread_id);
-        }
+        database.transaction(() => {
+          const row = database.prepare("SELECT thread_id FROM messages WHERE id = ?").get(id) as { thread_id: string } | null;
+          database.prepare("DELETE FROM messages WHERE id = ?").run(id);
+          if (row) {
+            database.prepare("DELETE FROM messages_fts WHERE thread_id = ?").run(row.thread_id);
+            database.prepare(`
+              INSERT INTO messages_fts (thread_id, subject, from_address, body_markdown)
+              SELECT messages.thread_id, threads.subject, messages.from_address, messages.body_markdown
+              FROM messages JOIN threads ON threads.id = messages.thread_id
+              WHERE messages.thread_id = ?
+            `).run(row.thread_id);
+            // Gmail has no empty threads, so drop the thread (and its cascaded rows) with its last message.
+            database.prepare(`
+              DELETE FROM threads WHERE id = ? AND NOT EXISTS (SELECT 1 FROM messages WHERE thread_id = ?)
+            `).run(row.thread_id, row.thread_id);
+          }
+        })();
       },
       catch: (cause) => new DatabaseError({ message: "Failed to delete message.", operation: "deleteMessage", cause }),
     }).pipe(Effect.asVoid),

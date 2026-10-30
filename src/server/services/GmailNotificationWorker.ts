@@ -8,6 +8,10 @@ export interface QueuedGmailNotification {
 
 export type GmailNotificationProcessor = (data: string) => Promise<"synced" | "ignored">;
 
+/** Errors that explicitly declare `retryable: false` (e.g. GmailApiError) will not succeed on retry. */
+const isPermanentFailure = (error: unknown): boolean =>
+  typeof error === "object" && error !== null && (error as { retryable?: unknown }).retryable === false;
+
 /** Process a reserved Redis item, acknowledging only after handling succeeds. */
 export const handleQueuedGmailNotification = async (
   payload: string,
@@ -36,7 +40,12 @@ export const handleQueuedGmailNotification = async (
       return "acknowledged";
     }
 
-    await processNotification((envelope as QueuedGmailNotification).data);
+    try {
+      await processNotification((envelope as QueuedGmailNotification).data);
+    } catch (error) {
+      if (!isPermanentFailure(error)) throw error;
+      console.error("Gmail notification processing failed with a non-retryable error; discarding it.", error);
+    }
     await Effect.runPromise(queue.acknowledge(processingQueue, payload));
     return "acknowledged";
   } catch (error) {
