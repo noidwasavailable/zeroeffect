@@ -2,3 +2,6 @@
 root = "tests"
 pathIgnorePatterns = ["**/._*"]
 preload = ["./tests/helpers/quietConsole.ts"]
+
+[serve.static]
+plugins = ["bun-plugin-tailwind"]
