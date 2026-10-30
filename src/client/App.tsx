@@ -9,6 +9,8 @@ import {
   type ThreadSummary,
   type ViewSummary,
 } from "../shared/api";
+import { formatFilterExpr } from "../shared/filterDsl";
+import { parseFilterDsl } from "../shared/filterParser";
 import { applyThreadAction } from "../shared/threadActions";
 import { BUILT_IN_VIEWS } from "../shared/views";
 import { buildActions } from "./actions";
@@ -17,6 +19,8 @@ import { AccountSwitcher } from "./components/AccountSwitcher";
 import { ActionToolbar } from "./components/ActionToolbar";
 import { CommandPalette, type PalettePage } from "./components/CommandPalette";
 import { FilterBar } from "./components/FilterBar";
+import { FilterBuilder } from "./components/FilterBuilder";
+import { SaveViewDialog } from "./components/SaveViewDialog";
 import { ThreadList } from "./components/ThreadList";
 import { ThreadReader } from "./components/ThreadReader";
 import { ViewSidebar } from "./components/ViewSidebar";
@@ -28,6 +32,15 @@ const PAGE_SIZE = 50;
 const MAX_REFRESH_SIZE = 200;
 
 const errorMessage = (error: unknown): string => error instanceof Error ? error.message : "Something went wrong.";
+
+/** The DSL for "what you see now": the view's filter AND the extra query, when there is one. */
+const combinedDsl = (viewDsl: string, query: string): string => {
+  const view = parseFilterDsl(viewDsl);
+  const extra = query.trim() ? parseFilterDsl(query) : null;
+  if (!extra || !extra.ok) return viewDsl;
+  if (!view.ok) return query.trim();
+  return formatFilterExpr({ _tag: "And", expressions: [view.expression, extra.expression] });
+};
 
 function FullPageMessage({ children }: { readonly children: ReactNode }) {
   return <main className="flex h-full items-center justify-center p-6 text-center text-sm text-zinc-600 dark:text-zinc-400">{children}</main>;
@@ -81,6 +94,10 @@ function Inbox({ accounts, route, navigate }: {
   const [views, setViews] = useState<ReadonlyArray<ViewSummary>>(BUILT_IN_VIEWS);
   const [labels, setLabels] = useState<ReadonlyArray<LabelSummary>>([]);
   const [query, setQuery] = useState("");
+  // The text in the DSL box, shared with the visual builder; applied as `query` on Enter / Apply.
+  const [draft, setDraft] = useState("");
+  const [builderOpen, setBuilderOpen] = useState(false);
+  const [viewDialog, setViewDialog] = useState<{ readonly mode: "create" | "edit"; readonly name: string; readonly dsl: string } | null>(null);
   const [queryError, setQueryError] = useState<{ readonly message: string; readonly offset?: number } | null>(null);
   const [threads, setThreads] = useState<ReadonlyArray<ThreadSummary>>([]);
   const [hasMore, setHasMore] = useState(false);
@@ -227,6 +244,10 @@ function Inbox({ accounts, route, navigate }: {
       }, 300);
       return;
     }
+    if (event.type === "views-changed") {
+      api.views(accountId).then(setViews, () => undefined);
+      return;
+    }
     setSyncing(event.status === "queued" || event.status === "running");
     if (event.status === "completed") loadMeta();
     if (event.status === "failed") setNotice({ text: event.error ?? "Gmail sync failed.", tone: "error" });
@@ -245,6 +266,34 @@ function Inbox({ accounts, route, navigate }: {
     );
   }, [accountId, account]);
 
+  const savedViews = views.filter((candidate) => !candidate.builtIn);
+  const savedIndex = savedViews.findIndex((candidate) => candidate.id === viewId);
+
+  const applyQuery = useCallback((next: string) => {
+    setSelection({ id: null, index: 0 });
+    setQuery(next);
+    setQueryError(null);
+  }, []);
+
+  const submitView = useCallback(async (mode: "create" | "edit", name: string, dsl: string): Promise<string | null> => {
+    try {
+      const saved = mode === "create"
+        ? await api.createView(accountId, { name, dsl })
+        : await api.updateView(accountId, viewId, { name, dsl });
+      setViews(await api.views(accountId));
+      setViewDialog(null);
+      setBuilderOpen(false);
+      setQuery("");
+      setDraft("");
+      setSelection({ id: null, index: 0 });
+      goTo({ viewId: saved.id, threadId: null });
+      setNotice({ text: mode === "create" ? `Saved split view “${saved.name}”.` : `Updated “${saved.name}”.`, tone: "info" });
+      return null;
+    } catch (error) {
+      return errorMessage(error);
+    }
+  }, [accountId, viewId, goTo]);
+
   const actions = useMemo(() => buildActions({
     accounts,
     accountId,
@@ -255,6 +304,8 @@ function Inbox({ accounts, route, navigate }: {
     canSelectNext: selectedIndex < threads.length - 1,
     canSelectPrevious: selectedIndex > 0,
     syncing,
+    builderOpen,
+    savedViewPosition: savedIndex >= 0 ? { index: savedIndex, count: savedViews.length } : null,
     moveSelection: (delta) => {
       const index = Math.max(0, Math.min(threads.length - 1, selectedIndex + delta));
       const thread = threads[index];
@@ -283,13 +334,40 @@ function Inbox({ accounts, route, navigate }: {
     }),
     goToView: (nextViewId) => {
       setQuery("");
+      setDraft("");
       setSelection({ id: null, index: 0 });
       goTo({ viewId: nextViewId, threadId: null });
     },
     sync,
-  }), [accounts, accountId, views, viewId, selectedThread, openThreadId, selectedIndex, threads, syncing, goTo, closeThread, runThreadAction, navigate, sync]);
+    toggleBuilder: () => setBuilderOpen((open) => !open),
+    saveView: () => {
+      // Prefer the draft when it is valid, so a filter built but not yet applied can be saved directly.
+      const pending = draft.trim() && parseFilterDsl(draft).ok ? draft : query;
+      setViewDialog({ mode: "create", name: "", dsl: combinedDsl(view?.dsl ?? "", pending) });
+    },
+    editView: () => {
+      if (view && !view.builtIn) setViewDialog({ mode: "edit", name: view.name, dsl: view.dsl });
+    },
+    deleteView: () => {
+      if (!view || view.builtIn || !confirm(`Delete the split view “${view.name}”?`)) return;
+      api.deleteView(accountId, view.id).then(
+        async () => {
+          setViews(await api.views(accountId));
+          goTo({ viewId: "inbox", threadId: null });
+        },
+        (error) => setNotice({ text: errorMessage(error), tone: "error" }),
+      );
+    },
+    moveView: (delta) => {
+      const ids = savedViews.map((candidate) => candidate.id);
+      const target = savedIndex + delta;
+      if (savedIndex < 0 || target < 0 || target >= ids.length) return;
+      [ids[savedIndex], ids[target]] = [ids[target]!, ids[savedIndex]!];
+      api.reorderViews(accountId, ids).then(setViews, (error) => setNotice({ text: errorMessage(error), tone: "error" }));
+    },
+  }), [accounts, accountId, views, view, viewId, savedViews, savedIndex, selectedThread, openThreadId, selectedIndex, threads, syncing, builderOpen, draft, query, goTo, closeThread, runThreadAction, navigate, sync]);
 
-  useVimShortcuts(actions, !paletteOpen);
+  useVimShortcuts(actions, !paletteOpen && viewDialog === null);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -308,17 +386,18 @@ function Inbox({ accounts, route, navigate }: {
       <header className="flex items-center gap-3 border-b border-zinc-200 px-3 py-2 dark:border-zinc-800">
         <span className="font-semibold tracking-tight">ZeroEffect</span>
         <AccountSwitcher accounts={accounts} activeAccountId={accountId} actions={actions} />
-        <FilterBar
-          ref={searchRef}
-          value={query}
-          error={queryError}
-          onApply={(next) => {
-            setSelection({ id: null, index: 0 });
-            setQuery(next);
-            setQueryError(null);
-          }}
-        />
+        <FilterBar ref={searchRef} draft={draft} appliedError={queryError} onDraftChange={setDraft} onApply={applyQuery} />
       </header>
+      {builderOpen && (
+        <FilterBuilder
+          dsl={draft}
+          labelNames={labels.map((label) => label.name)}
+          onDslChange={setDraft}
+          onApply={() => applyQuery(draft.trim())}
+          onSave={() => actions.find((action) => action.id === "views.save")?.run()}
+          onClose={() => setBuilderOpen(false)}
+        />
+      )}
       <ActionToolbar actions={actions} onOpenPalette={() => { setPalettePage("actions"); setPaletteOpen(true); }} />
       <div className="flex min-h-0 flex-1">
         <ViewSidebar views={views} activeViewId={viewId} actions={actions} />
@@ -352,6 +431,16 @@ function Inbox({ accounts, route, navigate }: {
         >
           {notice.text}
         </div>
+      )}
+      {viewDialog && (
+        <SaveViewDialog
+          title={viewDialog.mode === "create" ? "Save as Split View" : "Edit split view"}
+          submitLabel={viewDialog.mode === "create" ? "Save view" : "Save changes"}
+          initialName={viewDialog.name}
+          initialDsl={viewDialog.dsl}
+          onSubmit={(name, dsl) => submitView(viewDialog.mode, name, dsl)}
+          onClose={() => setViewDialog(null)}
+        />
       )}
       <CommandPalette
         open={paletteOpen}

@@ -21,7 +21,7 @@ export class ApiRequestError extends Error {
   }
 }
 
-const request = async <A>(path: string, init: { readonly method?: "GET" | "POST"; readonly body?: unknown } = {}): Promise<A> => {
+const request = async <A>(path: string, init: { readonly method?: "GET" | "POST" | "PATCH" | "PUT" | "DELETE"; readonly body?: unknown } = {}): Promise<A> => {
   const method = init.method ?? "GET";
   let response: Response;
   try {
@@ -46,6 +46,16 @@ const accountPath = (accountId: string, path: string) => `/api/a/${encodeURIComp
 export const api = {
   accounts: () => request<{ accounts: ReadonlyArray<AccountSummary> }>("/api/accounts").then((body) => body.accounts),
   views: (accountId: string) => request<{ views: ReadonlyArray<ViewSummary> }>(accountPath(accountId, "/views")).then((body) => body.views),
+  createView: (accountId: string, view: { readonly name: string; readonly dsl: string }) =>
+    request<{ view: ViewSummary }>(accountPath(accountId, "/views"), { method: "POST", body: view }).then((body) => body.view),
+  updateView: (accountId: string, viewId: string, update: { readonly name?: string; readonly dsl?: string }) =>
+    request<{ view: ViewSummary }>(accountPath(accountId, `/views/${encodeURIComponent(viewId)}`), { method: "PATCH", body: update })
+      .then((body) => body.view),
+  deleteView: (accountId: string, viewId: string) =>
+    request<unknown>(accountPath(accountId, `/views/${encodeURIComponent(viewId)}`), { method: "DELETE" }),
+  reorderViews: (accountId: string, ids: ReadonlyArray<string>) =>
+    request<{ views: ReadonlyArray<ViewSummary> }>(accountPath(accountId, "/views/order"), { method: "PUT", body: { ids } })
+      .then((body) => body.views),
   labels: (accountId: string) => request<{ labels: ReadonlyArray<LabelSummary> }>(accountPath(accountId, "/labels")).then((body) => body.labels),
   threads: (accountId: string, options: { readonly view: string; readonly q?: string; readonly limit: number; readonly offset?: number }) => {
     const params = new URLSearchParams({ view: options.view, limit: String(options.limit), offset: String(options.offset ?? 0) });

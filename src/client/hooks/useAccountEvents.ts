@@ -19,6 +19,7 @@ export const useAccountEvents = (accountId: string, onEvent: (event: AccountEven
     };
     source.addEventListener("threads-changed", handle);
     source.addEventListener("sync", handle);
+    source.addEventListener("views-changed", handle);
     source.onerror = () => { disconnected = true; };
     source.onopen = () => {
       // Events sent while disconnected are lost, so refresh once the stream is back.

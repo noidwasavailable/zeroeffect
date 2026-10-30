@@ -11,13 +11,14 @@ export interface Shortcut {
   readonly alt?: boolean;
 }
 
-export type ActionGroup = "Navigation" | "Thread" | "Views" | "Account";
+export type ActionGroup = "Navigation" | "Thread" | "Filter & Views" | "Account";
 
 export interface AppAction {
   readonly id: string;
   readonly label: string;
   readonly group: ActionGroup;
-  readonly shortcut: Shortcut;
+  /** Omitted only for rare, destructive or positional actions (palette + button only). */
+  readonly shortcut?: Shortcut;
   readonly enabled: boolean;
   readonly run: () => void;
   /** The action opens a palette page, so choosing it from the palette must not close the palette. */
@@ -34,6 +35,9 @@ export interface ActionContext {
   readonly canSelectNext: boolean;
   readonly canSelectPrevious: boolean;
   readonly syncing: boolean;
+  readonly builderOpen: boolean;
+  /** Position of the current view among saved views, or null for a built-in view. */
+  readonly savedViewPosition: { readonly index: number; readonly count: number } | null;
   readonly moveSelection: (delta: 1 | -1) => void;
   readonly openSelectedThread: () => void;
   readonly closeThread: () => void;
@@ -43,6 +47,11 @@ export interface ActionContext {
   readonly switchAccount: (accountId: string) => void;
   readonly goToView: (viewId: string) => void;
   readonly sync: () => void;
+  readonly toggleBuilder: () => void;
+  readonly saveView: () => void;
+  readonly editView: () => void;
+  readonly deleteView: () => void;
+  readonly moveView: (delta: 1 | -1) => void;
 }
 
 /** Action ids shown as buttons in the persistent toolbar, in order. */
@@ -53,6 +62,8 @@ export const TOOLBAR_ACTION_IDS = [
   "thread.label",
   "thread.toggleRead",
   "thread.toggleStar",
+  "filter.builder",
+  "views.save",
   "account.sync",
 ] as const;
 
@@ -76,8 +87,33 @@ export const buildActions = (context: ActionContext): ReadonlyArray<AppAction> =
       enabled: context.threadOpen, run: context.closeThread,
     },
     {
-      id: "navigation.search", label: "Filter by Boolean DSL", group: "Navigation", shortcut: { key: "/" },
+      id: "navigation.search", label: "Filter by Boolean DSL", group: "Filter & Views", shortcut: { key: "/" },
       enabled: true, run: context.focusSearch,
+    },
+    {
+      id: "filter.builder", label: context.builderOpen ? "Close filter builder" : "Filter builder", group: "Filter & Views",
+      shortcut: { key: "f" }, enabled: true, run: context.toggleBuilder,
+    },
+    {
+      id: "views.save", label: "Save as Split View", group: "Filter & Views", shortcut: { key: "v" },
+      enabled: true, run: context.saveView,
+    },
+    {
+      id: "views.edit", label: "Edit current view", group: "Filter & Views",
+      enabled: context.savedViewPosition !== null, run: context.editView,
+    },
+    {
+      id: "views.delete", label: "Delete current view", group: "Filter & Views",
+      enabled: context.savedViewPosition !== null, run: context.deleteView,
+    },
+    {
+      id: "views.moveUp", label: "Move current view up", group: "Filter & Views",
+      enabled: (context.savedViewPosition?.index ?? 0) > 0, run: () => context.moveView(-1),
+    },
+    {
+      id: "views.moveDown", label: "Move current view down", group: "Filter & Views",
+      enabled: context.savedViewPosition !== null && context.savedViewPosition.index < context.savedViewPosition.count - 1,
+      run: () => context.moveView(1),
     },
     {
       id: "thread.archive", label: thread?.isArchived ? "Move to Inbox" : "Archive", group: "Thread", shortcut: { key: "e" },
@@ -107,7 +143,7 @@ export const buildActions = (context: ActionContext): ReadonlyArray<AppAction> =
   // Views take the digit keys in sidebar order.
   context.views.slice(0, 9).forEach((view, index) => {
     actions.push({
-      id: `views.${view.id}`, label: `Go to ${view.name}`, group: "Views", shortcut: { key: String(index + 1) },
+      id: `views.go.${view.id}`, label: `Go to ${view.name}`, group: "Filter & Views", shortcut: { key: String(index + 1) },
       enabled: view.id !== context.viewId, run: () => context.goToView(view.id),
     });
   });

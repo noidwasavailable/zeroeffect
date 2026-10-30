@@ -6,7 +6,7 @@ import { Keycap } from "./Keycap";
 
 export type PalettePage = "actions" | "labels";
 
-const GROUP_ORDER: ReadonlyArray<ActionGroup> = ["Thread", "Navigation", "Views", "Account"];
+const GROUP_ORDER: ReadonlyArray<ActionGroup> = ["Thread", "Navigation", "Filter & Views", "Account"];
 
 /** Cmd+K: every registered action, plus a label picker page for the selected thread. */
 export function CommandPalette({ open, page, actions, labels, thread, onOpenChange, onPageChange, onToggleLabel }: {
@@ -68,7 +68,7 @@ export function CommandPalette({ open, page, actions, labels, thread, onOpenChan
                   }}
                 >
                   <span>{action.label}</span>
-                  <Keycap shortcut={action.shortcut} />
+                  {action.shortcut && <Keycap shortcut={action.shortcut} />}
                 </Command.Item>
               ))}
             </Command.Group>

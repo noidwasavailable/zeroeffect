@@ -1,6 +1,7 @@
 import { Effect, ManagedRuntime, type Layer } from "effect";
 import {
   isAccountId,
+  MAX_VIEW_NAME_LENGTH,
   LOCAL_REQUEST_HEADER,
   type AccountId,
   type ApiErrorBody,
@@ -165,6 +166,71 @@ export const createApiHandler = (config: ApiConfig): ApiHandler => {
     return json({ thread: updated });
   };
 
+  const readJson = async (request: Request): Promise<Record<string, unknown> | null> => {
+    try {
+      const body: unknown = await request.json();
+      return typeof body === "object" && body !== null && !Array.isArray(body) ? body as Record<string, unknown> : null;
+    } catch {
+      return null;
+    }
+  };
+
+  /** Validates a view name, rejecting names that another view (built-in or saved) already uses. */
+  const viewNameError = (name: unknown, views: ReadonlyArray<ViewSummary>, ownId?: string): Response | null => {
+    if (typeof name !== "string" || name.trim().length === 0 || name.trim().length > MAX_VIEW_NAME_LENGTH) {
+      return apiError(400, { error: `View name must be 1-${MAX_VIEW_NAME_LENGTH} characters.` });
+    }
+    const normalized = name.trim().toLowerCase();
+    return views.some((view) => view.id !== ownId && view.name.toLowerCase() === normalized)
+      ? apiError(409, { error: `A view named "${name.trim()}" already exists.` })
+      : null;
+  };
+
+  const createView = async (accountId: AccountId, request: Request): Promise<Response> => {
+    const body = await readJson(request);
+    if (!body || typeof body.dsl !== "string") return apiError(400, { error: "A view needs a name and a filter (dsl)." });
+    const db = await accountDb(accountId);
+    const nameError = viewNameError(body.name, await listViews(db));
+    if (nameError) return nameError;
+    const filter = await Effect.runPromise(booleanFilter.parse(body.dsl));
+    const view = await Effect.runPromise(db.createSavedView({ id: `v-${crypto.randomUUID().slice(0, 8)}`, name: (body.name as string).trim(), filter }));
+    config.events.publish(accountId, { type: "views-changed" });
+    return json({ view }, 201);
+  };
+
+  const updateView = async (accountId: AccountId, viewId: string, request: Request): Promise<Response> => {
+    if (BUILT_IN_VIEWS.some((view) => view.id === viewId)) return apiError(400, { error: "Built-in views cannot be changed." });
+    const body = await readJson(request);
+    if (!body || (body.name === undefined && body.dsl === undefined)) return apiError(400, { error: "Provide a new name and/or filter (dsl)." });
+    const db = await accountDb(accountId);
+    if (body.name !== undefined) {
+      const nameError = viewNameError(body.name, await listViews(db), viewId);
+      if (nameError) return nameError;
+    }
+    if (body.dsl !== undefined && typeof body.dsl !== "string") return apiError(400, { error: "dsl must be a string." });
+    const filter = typeof body.dsl === "string" ? await Effect.runPromise(booleanFilter.parse(body.dsl)) : undefined;
+    const view = await Effect.runPromise(db.updateSavedView(viewId, {
+      ...(typeof body.name === "string" ? { name: body.name.trim() } : {}),
+      ...(filter ? { filter } : {}),
+    }));
+    if (!view) return apiError(404, { error: "View not found." });
+    config.events.publish(accountId, { type: "views-changed" });
+    return json({ view });
+  };
+
+  const reorderViews = async (accountId: AccountId, request: Request): Promise<Response> => {
+    const body = await readJson(request);
+    const ids = body?.ids;
+    const db = await accountDb(accountId);
+    const saved = (await Effect.runPromise(db.listSavedViews())).map((view) => view.id);
+    if (!Array.isArray(ids) || ids.length !== saved.length || new Set(ids).size !== ids.length || !ids.every((id) => saved.includes(id))) {
+      return apiError(400, { error: "ids must list every saved view exactly once." });
+    }
+    await Effect.runPromise(db.reorderSavedViews(ids as string[]));
+    config.events.publish(accountId, { type: "views-changed" });
+    return json({ views: await listViews(db) });
+  };
+
   const route = async (request: Request, url: URL, accountId: AccountId, rest: string): Promise<Response> => {
     const account = await Effect.runPromise(config.registry.getAccount(accountId));
     if (!account) return apiError(404, { error: `The ${accountId} account is not connected. Connect it from /setup.` });
@@ -179,6 +245,19 @@ export const createApiHandler = (config: ApiConfig): ApiHandler => {
       return json({ labels: await Effect.runPromise((await accountDb(accountId)).listLabels()) });
     }
     if (request.method === "GET" && rest === "/views") return json({ views: await listViews(await accountDb(accountId)) });
+    if (request.method === "POST" && rest === "/views") return createView(accountId, request);
+    if (request.method === "PUT" && rest === "/views/order") return reorderViews(accountId, request);
+    const viewMatch = /^\/views\/([^/]+)$/.exec(rest);
+    if (viewMatch) {
+      const viewId = decodeURIComponent(viewMatch[1]!);
+      if (request.method === "PATCH") return updateView(accountId, viewId, request);
+      if (request.method === "DELETE") {
+        if (BUILT_IN_VIEWS.some((view) => view.id === viewId)) return apiError(400, { error: "Built-in views cannot be deleted." });
+        if (!await Effect.runPromise((await accountDb(accountId)).deleteSavedView(viewId))) return apiError(404, { error: "View not found." });
+        config.events.publish(accountId, { type: "views-changed" });
+        return json({ deleted: true });
+      }
+    }
 
     const threadMatch = /^\/threads\/([^/]+)(\/actions)?$/.exec(rest);
     if (threadMatch) {

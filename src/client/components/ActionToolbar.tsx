@@ -19,7 +19,7 @@ export function ActionToolbar({ actions, onOpenPalette }: {
         return (
           <button key={id} type="button" className={toolbarButtonClass} disabled={!action.enabled} onClick={action.run}>
             {action.label}
-            <Keycap shortcut={action.shortcut} />
+            {action.shortcut && <Keycap shortcut={action.shortcut} />}
           </button>
         );
       })}

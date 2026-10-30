@@ -107,6 +107,12 @@ export interface AccountDbService {
   /** Stores a thread's label names and derives its unread/starred/archived flags from them. */
   readonly setThreadLabels: (id: string, labels: ReadonlyArray<string>) => Effect.Effect<ThreadSummary | null, DatabaseError>;
   readonly listSavedViews: () => Effect.Effect<ReadonlyArray<ViewSummary>, DatabaseError>;
+  /** Appends a saved view; its DSL is always the canonical formatting of `filter`. */
+  readonly createSavedView: (view: { readonly id: string; readonly name: string; readonly filter: FilterExpr }) => Effect.Effect<ViewSummary, DatabaseError>;
+  readonly updateSavedView: (id: string, update: { readonly name?: string; readonly filter?: FilterExpr }) => Effect.Effect<ViewSummary | null, DatabaseError>;
+  readonly deleteSavedView: (id: string) => Effect.Effect<boolean, DatabaseError>;
+  /** Sets the sidebar order; `ids` must list every saved view exactly once. */
+  readonly reorderSavedViews: (ids: ReadonlyArray<string>) => Effect.Effect<void, DatabaseError>;
   readonly upsertMessage: (message: MessageRecord) => Effect.Effect<void, DatabaseError>;
   readonly deleteMessage: (id: string) => Effect.Effect<void, DatabaseError>;
   /** Replaces the label catalog and rewrites stored thread labels for renamed (or legacy ID-valued) labels. */
@@ -404,6 +410,52 @@ const makeService = (accountId: string, database: Database): AccountDbService =>
       }>).map((row) => ({ id: row.id, name: row.name, dsl: row.dsl_string, builtIn: false })),
       catch: (cause) => new DatabaseError({ message: "Failed to load saved views.", operation: "listSavedViews", cause }),
     }),
+  createSavedView: (view) =>
+    Effect.try({
+      try: () => {
+        const row = database.prepare(`
+          INSERT INTO saved_views (id, name, sort_order, filter_ast_json, dsl_string)
+          VALUES (?, ?, (SELECT COALESCE(MAX(sort_order), 0) + 1 FROM saved_views), ?, ?)
+          RETURNING id, name, dsl_string
+        `).get(view.id, view.name, JSON.stringify(view.filter), formatFilterExpr(view.filter)) as { id: string; name: string; dsl_string: string };
+        return { id: row.id, name: row.name, dsl: row.dsl_string, builtIn: false };
+      },
+      catch: (cause) => new DatabaseError({ message: "Failed to save view.", operation: "createSavedView", cause }),
+    }),
+  updateSavedView: (id, update) =>
+    Effect.try({
+      try: () => {
+        const row = database.prepare(`
+          UPDATE saved_views SET
+            name = COALESCE(?, name),
+            filter_ast_json = COALESCE(?, filter_ast_json),
+            dsl_string = COALESCE(?, dsl_string)
+          WHERE id = ? RETURNING id, name, dsl_string
+        `).get(
+          update.name ?? null,
+          update.filter ? JSON.stringify(update.filter) : null,
+          update.filter ? formatFilterExpr(update.filter) : null,
+          id,
+        ) as { id: string; name: string; dsl_string: string } | null;
+        return row ? { id: row.id, name: row.name, dsl: row.dsl_string, builtIn: false } : null;
+      },
+      catch: (cause) => new DatabaseError({ message: "Failed to update view.", operation: "updateSavedView", cause }),
+    }),
+  deleteSavedView: (id) =>
+    Effect.try({
+      try: () => database.prepare("DELETE FROM saved_views WHERE id = ?").run(id).changes > 0,
+      catch: (cause) => new DatabaseError({ message: "Failed to delete view.", operation: "deleteSavedView", cause }),
+    }),
+  reorderSavedViews: (ids) =>
+    Effect.try({
+      try: () => {
+        database.transaction(() => {
+          const update = database.prepare("UPDATE saved_views SET sort_order = ? WHERE id = ?");
+          ids.forEach((id, index) => update.run(index + 1, id));
+        })();
+      },
+      catch: (cause) => new DatabaseError({ message: "Failed to reorder views.", operation: "reorderSavedViews", cause }),
+    }).pipe(Effect.asVoid),
   upsertMessage: (message) =>
     Effect.try({
       try: () => {

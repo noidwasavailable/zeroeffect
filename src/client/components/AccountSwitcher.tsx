@@ -35,7 +35,7 @@ export function AccountSwitcher({ accounts, activeAccountId, actions }: {
           >
             {!active && <span className={`size-2 rounded-full ${theme.dot}`} />}
             {account.displayName}
-            {action && !active && <Keycap shortcut={action.shortcut} />}
+            {action?.shortcut && !active && <Keycap shortcut={action.shortcut} />}
           </button>
         );
       })}
