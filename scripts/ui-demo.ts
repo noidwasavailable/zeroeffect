@@ -11,6 +11,7 @@ import { createGmailAccessTokenProvider } from "../src/server/services/GmailAcce
 import type { GoogleOAuth2Api } from "../src/server/services/GoogleOAuth2";
 import { OAuthTokenVault } from "../src/server/services/OAuthTokenVault";
 import { RegistryDb, RegistryDbTest } from "../src/server/services/RegistryDb";
+import { parseFilterDsl } from "../src/shared/filterParser";
 
 const port = Number(process.env.PORT ?? 3001);
 const vault = OAuthTokenVault.fromKey(crypto.getRandomValues(new Uint8Array(32)));
@@ -76,6 +77,10 @@ await seed("work", "me@work.example", [
   { subject: "Q4 planning doc", from: "Manager <boss@work.example>", labels: ["INBOX", "UNREAD"], hoursAgo: 2, html: "<p>Please review the Q4 plan before Thursday.</p>" },
   { subject: "Deploy finished", from: "CI <ci@work.example>", labels: ["INBOX"], hoursAgo: 8, html: "<p>Build <code>#881</code> deployed to production.</p>" },
 ]);
+
+const receiptsAndTravel = parseFilterDsl('label:Receipts OR (label:Travel AND NOT is:archived)');
+if (!receiptsAndTravel.ok) throw new Error(receiptsAndTravel.message);
+await Effect.runPromise(silo("personal").createSavedView({ id: "v-demo", name: "Receipts & Travel", filter: receiptsAndTravel.expression }));
 
 const events = createAccountEventBus();
 const unusedOAuth: GoogleOAuth2Api = {
