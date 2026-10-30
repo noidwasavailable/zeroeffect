@@ -1,0 +1,45 @@
+@import "tailwindcss";
+
+:root {
+  color-scheme: light dark;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  @apply bg-white text-zinc-900 antialiased dark:bg-zinc-950 dark:text-zinc-100;
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+/* cmdk exposes its parts as data attributes rather than class names. */
+[cmdk-input] {
+  @apply w-full border-b border-zinc-200 bg-transparent px-4 py-3 text-sm outline-none placeholder:text-zinc-400 dark:border-zinc-800;
+}
+
+[cmdk-list] {
+  @apply max-h-96 overflow-y-auto p-2;
+}
+
+[cmdk-group-heading] {
+  @apply px-2 pb-1 pt-2 text-xs font-medium text-zinc-500;
+}
+
+[cmdk-item] {
+  @apply flex cursor-pointer items-center justify-between gap-3 rounded-md px-2 py-1.5 text-sm;
+}
+
+[cmdk-item][data-selected="true"] {
+  @apply bg-zinc-100 dark:bg-zinc-800;
+}
+
+[cmdk-item][data-disabled="true"] {
+  @apply cursor-not-allowed opacity-40;
+}
+
+[cmdk-empty] {
+  @apply px-2 py-6 text-center text-sm text-zinc-500;
+}
