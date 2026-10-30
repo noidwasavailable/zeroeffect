@@ -181,7 +181,7 @@ describe("local account setup", () => {
     });
     servers.push(app);
 
-    const page = await fetch(app.url);
+    const page = await fetch(new URL("/setup", app.url));
     expect(page.status).toBe(200);
     expect(await page.text()).toContain("Connect Gmail accounts");
 
