@@ -1,5 +1,4 @@
 import { RedisClient } from "bun";
-import { GoogleAuth } from "google-auth-library";
 import { PubSub } from "@google-cloud/pubsub";
 import { Effect, Layer, ManagedRuntime } from "effect";
 import { GoogleOAuth2, GoogleOAuth2Live, PUBSUB_OAUTH_SCOPES } from "./services/GoogleOAuth2";
@@ -16,6 +15,8 @@ import { createAiRunner } from "./services/AiRunner";
 import { createApiHandler } from "./routes/api";
 import { createAccountEventBus } from "./routes/sse";
 import { createDevServer, devServerConfigFromEnvironment } from "./dev-server";
+import { ensureLocalValkey, VALKEY_CONTAINER } from "./localValkey";
+import type { LocalValkey } from "./localValkey";
 
 const main = async (): Promise<void> => {
   const config = devServerConfigFromEnvironment();
@@ -124,6 +125,7 @@ const main = async (): Promise<void> => {
   let pubSubTask: Promise<void> | undefined;
   let notificationWorkerTask: Promise<void> | undefined;
   let watchRenewalTimer: ReturnType<typeof setInterval> | undefined;
+  let localValkey: LocalValkey | undefined;
   const renewWatchesSafely = async (topicName: string): Promise<void> => {
     try {
       await accountOperations.renewWatches(topicName);
@@ -133,18 +135,17 @@ const main = async (): Promise<void> => {
   };
   const startPubSub = async (refreshToken: string): Promise<void> => {
     if (!pubSubProjectId || !pubSubSubscription || !pubSubTopic || stopping || pubSubTask) return;
-    pubSubTransport = new GooglePubSubTransport(pubSubProjectId, () => {
-      const auth = new GoogleAuth({
-        credentials: {
-          type: "authorized_user",
-          client_id: config.clientId,
-          client_secret: config.clientSecret,
-          refresh_token: refreshToken,
-        },
-        scopes: [...PUBSUB_OAUTH_SCOPES],
-      });
-      return new PubSub({ projectId: pubSubProjectId, auth });
-    });
+    // PubSub builds its own GoogleAuth from these options, so google-auth-library needn't be imported directly.
+    pubSubTransport = new GooglePubSubTransport(pubSubProjectId, () => new PubSub({
+      projectId: pubSubProjectId,
+      credentials: {
+        type: "authorized_user",
+        client_id: config.clientId,
+        client_secret: config.clientSecret,
+        refresh_token: refreshToken,
+      },
+      scopes: [...PUBSUB_OAUTH_SCOPES],
+    }));
     redisClient = new RedisClient(redisUrl);
     const queueLayer = RedisQueueServiceLive({ url: redisUrl, client: redisClient });
     const queueApi: RedisQueueServiceApi = Effect.runSync(Effect.gen(function* () { return yield* RedisQueueService; }).pipe(Effect.provide(queueLayer)));
@@ -209,6 +210,13 @@ const main = async (): Promise<void> => {
     }, 12 * 60 * 60 * 1000);
   };
   if (pubSubProjectId && pubSubSubscription && pubSubTopic) {
+    // The notification queue needs Redis/Valkey; start a local Valkey container if nothing is listening yet.
+    try {
+      localValkey = await ensureLocalValkey(redisUrl);
+      if (localValkey.started) console.log(`Started Valkey (Docker container ${VALKEY_CONTAINER}) at ${redisUrl}.`);
+    } catch (error) {
+      console.error(error instanceof Error ? error.message : error, "Gmail notifications will queue once it is reachable.");
+    }
     try {
       const encrypted = await registryRuntime.runPromise(registry.getServiceCredential("google_pubsub"));
       if (encrypted) {
@@ -257,6 +265,7 @@ const main = async (): Promise<void> => {
     await pubSubRuntime?.dispose();
     await api.close();
     redisClient?.close();
+    await localValkey?.stop();
     await registryRuntime.dispose();
   };
   process.once("SIGINT", () => { void stop(); });
