@@ -496,7 +496,7 @@ describe("Phase 5: commands, bulk targets and views", () => {
     accounts: [{ id: "personal", email: "me@example.com", displayName: "Personal", colorTheme: "blue" }],
     accountId: "personal", views: orderViews([{ id: "v-1", name: "Bills", dsl: "label:Bills", builtIn: false }]), viewId: "inbox",
     selectedThread: thread("t1", ["INBOX", "UNREAD"]), targets: [thread("t1", ["INBOX", "UNREAD"])],
-    checkedCount: 0, loadedCount: 2, viewName: "Inbox", selectedOtpCode: null, threadOpen: false,
+    checkedCount: 0, loadedCount: 2, viewName: "Inbox", searchActive: false, selectedOtpCode: null, threadOpen: false,
     canSelectNext: true, canSelectPrevious: true, syncing: false, builderOpen: false, auditOpen: false, composerOpen: false, aiBusy: false,
     rules: [], savedViewPosition: null, openMessageCount: 3, allMessagesExpanded: false, newMessageOpen: false,
     moveSelection: noop("move"), moveSelectionTo: (position) => calls.push(`to:${position}`), moveMessage: (delta) => calls.push(`message:${delta}`),
@@ -548,6 +548,26 @@ describe("Phase 5: commands, bulk targets and views", () => {
     expect(BUILT_IN_VIEWS.filter((view) => view.secondary).map((view) => view.id)).toEqual(["trash", "spam"]);
   });
 
+  test("the current view's digit key clears an active search", () => {
+    const viewKey = (searchActive: boolean) => key(buildActions({ ...base, searchActive }), "1")!;
+    expect(viewKey(false)).toMatchObject({ id: "views.go.inbox", enabled: false });
+    expect(viewKey(true)).toMatchObject({ id: "views.go.inbox", enabled: true });
+    calls.length = 0;
+    viewKey(true).run();
+    expect(calls).toEqual(["view:inbox"]);
+  });
+
+  test("Esc closes the AI audit drawer, then the filter builder, then the reader", () => {
+    const esc = (overrides: Partial<ActionContext>) => key(buildActions({ ...base, ...overrides }), "Escape")!;
+    expect(esc({}).enabled).toBe(false);
+    calls.length = 0;
+    esc({ auditOpen: true, builderOpen: true, threadOpen: true }).run();
+    esc({ builderOpen: true, threadOpen: true }).run();
+    esc({ threadOpen: true }).run();
+    expect(calls).toEqual(["audit", "builder", "close"]);
+    expect(esc({ auditOpen: true }).label).toBe("Close AI audit");
+  });
+
   test("with checked threads, thread actions describe and act on all of them", () => {
     const targets = [thread("t1", ["INBOX", "UNREAD"]), thread("t2", ["INBOX", "STARRED"])];
     const actions = buildActions({ ...base, targets, checkedCount: 2 });
@@ -555,6 +575,7 @@ describe("Phase 5: commands, bulk targets and views", () => {
     expect(byId("thread.archive").label).toBe("Archive (2)");
     expect(byId("thread.toggleRead").label).toBe("Mark as read (2)");
     expect(byId("thread.toggleStar").label).toBe("Star (2)");
+    expect(byId("ai.run")).toMatchObject({ label: "Run AI (2)", enabled: true, shortcut: { key: "a" } });
     expect(byId("selection.clear").enabled).toBe(true);
     expect(byId("selection.all")).toMatchObject({ label: "Check all loaded threads (2)", enabled: false });
     const trashed = buildActions({ ...base, targets: targets.map((target) => applyThreadAction(target, { type: "trash" })), checkedCount: 2 });
@@ -565,6 +586,7 @@ describe("Phase 5: commands, bulk targets and views", () => {
     expect(calls).toEqual(["action:untrash"]);
     const none = buildActions({ ...base, selectedThread: null, targets: [] });
     expect(none.find((action) => action.id === "thread.archive")!.enabled).toBe(false);
+    expect(none.find((action) => action.id === "ai.run")!.enabled).toBe(false);
   });
 
   test("moving between messages expands the one reached and reveals hidden runs", () => {

@@ -41,6 +41,8 @@ export interface ActionContext {
   /** How many threads are loaded in the list (what "select all" checks). */
   readonly loadedCount: number;
   readonly viewName: string;
+  /** A search or filter is typed or applied on top of the view (its view key clears it). */
+  readonly searchActive: boolean;
   /** The selected thread's one-time code, when it carries an OTP label (see shared/otp.ts). */
   readonly selectedOtpCode: string | null;
   readonly threadOpen: boolean;
@@ -171,8 +173,12 @@ export const buildActions = (context: ActionContext): ReadonlyArray<AppAction> =
       enabled: context.openMessageCount > 1, run: () => context.moveMessage(-1),
     },
     {
-      id: "navigation.close", label: "Close thread", group: "Navigation", shortcut: { key: "Escape" },
-      enabled: context.threadOpen, run: context.closeThread,
+      // Esc closes the innermost open pane first: the AI audit drawer, then the filter builder, then the reader.
+      id: "navigation.close",
+      label: context.auditOpen ? "Close AI audit" : context.builderOpen ? "Close filter builder" : "Close thread",
+      group: "Navigation", shortcut: { key: "Escape" },
+      enabled: context.auditOpen || context.builderOpen || context.threadOpen,
+      run: context.auditOpen ? context.toggleAudit : context.builderOpen ? context.toggleBuilder : context.closeThread,
     },
     {
       id: "navigation.search", label: "Search or filter by Boolean DSL", group: "Filter & Views", shortcut: { key: "/" },
@@ -333,8 +339,10 @@ export const buildActions = (context: ActionContext): ReadonlyArray<AppAction> =
       enabled: !context.syncing, run: context.sync,
     },
     {
-      id: "ai.run", label: context.aiBusy ? "Running AI…" : "Run AI", group: "AI", shortcut: { key: "a" },
-      enabled: thread !== null && !context.aiBusy, run: context.runAi,
+      id: "ai.run",
+      label: context.aiBusy ? "Running AI…" : context.checkedCount > 0 ? `Run AI (${context.targets.length})` : "Run AI",
+      group: "AI", shortcut: { key: "a" },
+      enabled: context.targets.length > 0 && !context.aiBusy, run: context.runAi,
     },
     {
       id: "ai.acceptGhost", label: "Accept suggested labels", group: "AI", shortcut: { key: "y" },
@@ -376,7 +384,8 @@ export const buildActions = (context: ActionContext): ReadonlyArray<AppAction> =
     const key = !view.secondary && digit < 9 ? String(++digit) : null;
     actions.push({
       id: `views.go.${view.id}`, label: `Go to ${view.name}`, group: "Filter & Views", ...(key ? { shortcut: { key } } : {}),
-      enabled: view.id !== context.viewId, run: () => context.goToView(view.id),
+      // On the current view the key clears the search instead.
+      enabled: view.id !== context.viewId || context.searchActive, run: () => context.goToView(view.id),
     });
   }
 

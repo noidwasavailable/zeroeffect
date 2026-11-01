@@ -176,7 +176,16 @@ export function FilterBuilder({ dsl, labelNames, onDslChange, onApply, onSave, o
   const [complete, setComplete] = useState(true);
   const dslInvalid = dsl.trim() !== "" && !parseFilterDsl(dsl).ok;
   return (
-    <section aria-label="Filter builder" className="flex flex-col gap-3 border-b border-zinc-200 bg-zinc-50/60 px-4 py-3 dark:border-zinc-800 dark:bg-zinc-900/40">
+    <section
+      aria-label="Filter builder"
+      // Esc from inside the builder's fields closes it too (outside them, the Esc shortcut does).
+      onKeyDown={(event) => {
+        if (event.key === "Escape" && !event.defaultPrevented) {
+          event.preventDefault();
+          onClose();
+        }
+      }}
+      className="flex flex-col gap-3 border-b border-zinc-200 bg-zinc-50/60 px-4 py-3 dark:border-zinc-800 dark:bg-zinc-900/40">
       {dslInvalid && (
         <p className="text-xs text-amber-700 dark:text-amber-400">The DSL above has a syntax error; the builder shows the last valid filter.</p>
       )}

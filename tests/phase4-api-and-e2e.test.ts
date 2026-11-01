@@ -268,6 +268,7 @@ describe("Phase 4: one action registry drives the palette, toolbar and Vim keys"
     checkedCount: 0,
     loadedCount: 3,
     viewName: "Inbox",
+    searchActive: false,
     moveSelectionTo: (position) => calls.push(`move-to:${position}`),
     moveMessage: (delta) => calls.push(`message:${delta}`),
     toggleChecked: () => calls.push("check"),

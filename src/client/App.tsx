@@ -5,6 +5,7 @@ import {
   type LabelSummary as LabelRecordSummary,
   type SendAsAliasDetail,
   type AiAuditSummary,
+  type AiRunSummary,
   type AccountSummary,
   type LabelSummary,
   type ThreadAction,
@@ -446,28 +447,51 @@ function Inbox({ accounts, route, navigate }: {
     if (auditThreadId) void loadAudits(auditThreadId);
   }, [auditThreadId, loadAudits]);
 
+  /** Runs the AI rules on the targets: the checked threads (a few at a time), else the selected one. */
   const runAi = useCallback(async () => {
-    const target = selectedThread;
-    if (!target) return;
+    const queue = [...targets];
+    if (queue.length === 0) return;
     setAiBusy(true);
-    setNotice({ text: "Running AI rules…", tone: "info" });
+    const plural = (count: number) => `${count} ${count === 1 ? "conversation" : "conversations"}`;
+    setNotice({ text: queue.length === 1 ? "Running AI rules…" : `Running AI rules on ${plural(queue.length)}…`, tone: "info" });
+    const results: Array<{ readonly thread: ThreadSummary; readonly result: AiRunSummary | null; readonly error: string | null }> = [];
+    const worker = async () => {
+      for (let thread = queue.shift(); thread; thread = queue.shift()) {
+        try {
+          results.push({ thread, result: await api.runAi(accountId, thread.id), error: null });
+        } catch (error) {
+          results.push({ thread, result: null, error: errorMessage(error) });
+        }
+        if (targets.length > 1) setNotice({ text: `Running AI rules… ${results.length}/${targets.length}`, tone: "info" });
+      }
+    };
     try {
-      const result = await api.runAi(accountId, target.id);
-      setNotice({
-        text: result.appliedRules.length > 0
-          ? `AI applied: ${result.appliedRules.join(", ")}${result.llmCalled ? "" : " (no LLM call needed)"}`
-          : `No rule applied. ${result.reason}`,
-        tone: "info",
-      });
+      await Promise.all(Array.from({ length: Math.min(3, queue.length) }, worker));
+      const [only] = results;
+      if (results.length === 1 && only) {
+        setNotice(only.result
+          ? {
+              text: only.result.appliedRules.length > 0
+                ? `AI applied: ${only.result.appliedRules.join(", ")}${only.result.llmCalled ? "" : " (no LLM call needed)"}`
+                : `No rule applied. ${only.result.reason}`,
+              tone: "info",
+            }
+          : { text: only.error!, tone: "error" });
+      } else {
+        const labelled = results.filter((entry) => (entry.result?.appliedRules.length ?? 0) > 0).length;
+        const failed = results.filter((entry) => entry.error !== null);
+        setNotice({
+          text: `AI applied rules to ${labelled} of ${plural(results.length)}.${failed.length > 0 ? ` ${failed.length} failed: ${failed[0]!.error}` : ""}`,
+          tone: failed.length > 0 ? "error" : "info",
+        });
+      }
       void loadThreads("refresh");
-      if (openThreadId === target.id) void loadDetail(target.id);
-      if (auditOpen) void loadAudits(target.id);
-    } catch (error) {
-      setNotice({ text: errorMessage(error), tone: "error" });
+      if (openThreadId && results.some((entry) => entry.thread.id === openThreadId)) void loadDetail(openThreadId);
+      if (auditOpen && auditThreadId && results.some((entry) => entry.thread.id === auditThreadId)) void loadAudits(auditThreadId);
     } finally {
       setAiBusy(false);
     }
-  }, [selectedThread, accountId, openThreadId, auditOpen, loadThreads, loadDetail, loadAudits]);
+  }, [targets, accountId, openThreadId, auditOpen, auditThreadId, loadThreads, loadDetail, loadAudits]);
 
   const decideGhostLabels = useCallback(async (decision: "accept" | "reject") => {
     const target = selectedThread;
@@ -717,6 +741,7 @@ function Inbox({ accounts, route, navigate }: {
     checkedCount: checkedThreads.length,
     loadedCount: threads.length,
     viewName: view?.name ?? "this view",
+    searchActive: query !== "" || draft.trim() !== "",
     moveSelectionTo: (position) => {
       const index = position === "first" ? 0 : threads.length - 1;
       const thread = threads[index];
