@@ -18,6 +18,7 @@ import {
   type RulesResponse,
   type ApiErrorBody,
   type LabelSummary,
+  type ServerStatus,
   type SyncJobStatus,
   type ThreadAction,
   type ThreadDetail,
@@ -98,6 +99,8 @@ export const api = {
   refreshAliases: (accountId: string) =>
     request<{ aliases: ReadonlyArray<SendAsAliasDetail> }>(accountPath(accountId, "/aliases/refresh"), { method: "POST", body: {} })
       .then((body) => body.aliases),
+  serverStatus: () => request<{ status: ServerStatus }>("/api/status").then((body) => body.status),
+  dismissResolvedProblems: () => request<{ status: ServerStatus }>("/api/status/dismiss", { method: "POST", body: {} }).then((body) => body.status),
   syncStatus: (accountId: string) =>
     request<{ job: { readonly status: SyncJobStatus; readonly error?: string } | null }>(`/api/accounts/${encodeURIComponent(accountId)}/sync`)
       .then((body) => body.job),

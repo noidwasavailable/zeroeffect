@@ -8,6 +8,7 @@ import { GmailClientLive } from "./GmailClient";
 import { LlmProviderLive, type LlmProviderConfig } from "./LlmProvider";
 import type { OAuthTokenVault } from "./OAuthTokenVault";
 import { RegistryDb, type RegistryDbService } from "./RegistryDb";
+import { describeError, type ProblemReporter } from "../serverStatus";
 
 export interface AiRunnerConfig {
   readonly registry: RegistryDbService;
@@ -19,6 +20,8 @@ export interface AiRunnerConfig {
   readonly llm?: LlmProviderConfig;
   /** Opens an account's silo; defaults to its SQLite file (tests pass in-memory silos). */
   readonly accountDbLayer?: (accountId: string) => Layer.Layer<AccountDb, unknown>;
+  /** Surfaces background (new-mail) labelling failures in the web client's status panel. */
+  readonly reportProblem?: ProblemReporter;
 }
 
 export interface AiRunner {
@@ -68,10 +71,21 @@ export const createAiRunner = (config: AiRunnerConfig): AiRunner => {
       return result;
     }),
     runNewMail: (accountId, threadIds) => threadIds.length === 0 ? Promise.resolve() : enqueue(accountId, async () => {
-      await withWorker(accountId, (worker) => Effect.forEach(threadIds, (threadId) => worker.runForThread(threadId, { trigger: "auto" }).pipe(
-        Effect.tap((result) => Effect.logInfo(`AI labeller (${accountId}) ${threadId}: ${result.status}${result.appliedRules.length ? ` → ${result.appliedRules.join(", ")}` : ""}${result.llmCalled ? "" : " (no LLM call)"}`)),
-        Effect.catch((error) => Effect.logError(`AI labeller failed for ${accountId} thread ${threadId}: ${String((error as { message?: unknown }).message ?? error)}`)),
-      ), { discard: true }));
+      const failures: string[] = [];
+      try {
+        await withWorker(accountId, (worker) => Effect.forEach(threadIds, (threadId) => worker.runForThread(threadId, { trigger: "auto" }).pipe(
+          Effect.tap((result) => Effect.logInfo(`AI labeller (${accountId}) ${threadId}: ${result.status}${result.appliedRules.length ? ` → ${result.appliedRules.join(", ")}` : ""}${result.llmCalled ? "" : " (no LLM call)"}`)),
+          Effect.catch((error) => Effect.sync(() => { failures.push(describeError(error)); }).pipe(
+            Effect.andThen(Effect.logError(`AI labeller failed for ${accountId} thread ${threadId}: ${describeError(error)}`)),
+          )),
+        ), { discard: true }));
+      } catch (error) {
+        config.reportProblem?.("ai", accountId, error);
+        throw error;
+      }
+      config.reportProblem?.("ai", accountId, failures.length === 0
+        ? null
+        : `${failures.length} of ${threadIds.length} new ${threadIds.length === 1 ? "conversation" : "conversations"} could not be labelled: ${failures[0]}`);
       notify(accountId, threadIds);
     }),
     undo: (accountId) => enqueue(accountId, async () => {

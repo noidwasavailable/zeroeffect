@@ -144,7 +144,33 @@ export type AccountEvent =
   | { readonly type: "threads-changed"; readonly threadIds?: ReadonlyArray<string> }
   | { readonly type: "views-changed" }
   | { readonly type: "rules-changed" }
-  | { readonly type: "sync"; readonly status: SyncJobStatus; readonly error?: string };
+  | { readonly type: "sync"; readonly status: SyncJobStatus; readonly error?: string }
+  /** The server's background status changed (Pub/Sub state or a problem); refetch `/api/status`. */
+  | { readonly type: "server-status" };
+
+/** Background work whose failures only showed up in the server log before. */
+export type ServerProblemSource = "pubsub" | "catch_up" | "watch" | "notifications" | "ai" | "sync";
+
+/** One background problem, kept per source and account; repeats bump `count` and `lastAt`. */
+export interface ServerProblem {
+  readonly id: string;
+  readonly source: ServerProblemSource;
+  readonly accountId: string | null;
+  readonly message: string;
+  readonly firstAt: number;
+  readonly lastAt: number;
+  readonly count: number;
+  /** When the same work next succeeded; null while the problem is ongoing. */
+  readonly resolvedAt: number | null;
+}
+
+export type PubSubState = "disabled" | "unauthorized" | "connecting" | "listening" | "retrying" | "needs_reauthorization";
+
+export interface ServerStatus {
+  readonly pubSub: { readonly state: PubSubState; readonly detail: string | null; readonly since: number };
+  /** Ongoing problems first, then recently resolved ones; newest first within each. */
+  readonly problems: ReadonlyArray<ServerProblem>;
+}
 
 export interface LlmEndpointSummary {
   readonly id: string;

@@ -8,6 +8,7 @@ import {
   type AiRunSummary,
   type AccountSummary,
   type LabelSummary,
+  type ServerStatus,
   type ThreadAction,
   type ThreadDetail,
   type ThreadSummary,
@@ -42,6 +43,7 @@ import { useAccountEvents } from "./hooks/useAccountEvents";
 import { useVimShortcuts } from "./hooks/useVimShortcuts";
 import { routePath, useRoute, type Route } from "./router";
 import { ShortcutHelp } from "./components/ShortcutHelp";
+import { serverHealth, ServerStatusIndicator, ServerStatusPanel } from "./components/ServerStatusPanel";
 
 const PAGE_SIZE = 50;
 const MAX_REFRESH_SIZE = 200;
@@ -163,6 +165,29 @@ function Inbox({ accounts, route, navigate }: {
   const [checked, setChecked] = useState<ReadonlySet<string>>(new Set());
   const lastChecked = useRef<number | null>(null);
   const [helpOpen, setHelpOpen] = useState(false);
+  const [serverStatus, setServerStatus] = useState<ServerStatus | null>(null);
+  const [serverStatusError, setServerStatusError] = useState<string | null>(null);
+  const [statusOpen, setStatusOpen] = useState(false);
+  const loadServerStatus = useCallback(() => {
+    api.serverStatus().then(
+      (status) => {
+        setServerStatus(status);
+        setServerStatusError(null);
+      },
+      (error) => setServerStatusError(errorMessage(error)),
+    );
+  }, []);
+  // The server pushes "server-status" events; polling covers a dropped event stream.
+  useEffect(() => {
+    loadServerStatus();
+    const timer = setInterval(loadServerStatus, 60_000);
+    const onVisible = () => { if (document.visibilityState === "visible") loadServerStatus(); };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+  }, [loadServerStatus]);
   const [accountAliases, setAccountAliases] = useState<ReadonlyArray<SendAsAliasDetail> | null>(null);
   useEffect(() => {
     setChecked(new Set());
@@ -685,6 +710,10 @@ function Inbox({ accounts, route, navigate }: {
       loadRuleSummaries();
       return;
     }
+    if (event.type === "server-status") {
+      loadServerStatus();
+      return;
+    }
     setSyncing(event.status === "queued" || event.status === "running");
     if (event.status === "completed") loadMeta();
     if (event.status === "failed") setNotice({ text: event.error ?? "Gmail sync failed.", tone: "error" });
@@ -796,6 +825,9 @@ function Inbox({ accounts, route, navigate }: {
     auditOpen,
     composerOpen: composerVisible,
     aiBusy,
+    statusOpen,
+    serverIssues: serverHealth(serverStatus).ongoing,
+    toggleStatus: () => setStatusOpen((open) => !open),
     rules: ruleSummaries,
     savedViewPosition: savedIndex >= 0 ? { index: savedIndex, count: savedViews.length } : null,
     moveSelection: (delta) => {
@@ -882,9 +914,9 @@ function Inbox({ accounts, route, navigate }: {
     },
     sendReply: () => void sendReply(),
     discardReply,
-  }), [composerVisible, openComposer, sendReply, discardReply, accounts, account, accountId, views, view, viewId, savedViews, savedIndex, selectedThread, targets, checkedThreads, openThreadId, selectedIndex, threads, syncing, builderOpen, auditOpen, aiBusy, ruleSummaries, otpLabels, copyOtp, detail, currentFold, cursorIndex, newMessage, openNewMessage, openForward, sendNewMessage, discardNewMessage, draft, query, goTo, closeThread, runTargetsAction, markAllRead, toggleChecked, loadAccountAliases, navigate, sync, runAi, decideGhostLabels, undoAi, toggleRuleDryRun]);
+  }), [composerVisible, openComposer, sendReply, discardReply, accounts, account, accountId, views, view, viewId, savedViews, savedIndex, selectedThread, targets, checkedThreads, openThreadId, selectedIndex, threads, syncing, builderOpen, auditOpen, aiBusy, statusOpen, serverStatus, ruleSummaries, otpLabels, copyOtp, detail, currentFold, cursorIndex, newMessage, openNewMessage, openForward, sendNewMessage, discardNewMessage, draft, query, goTo, closeThread, runTargetsAction, markAllRead, toggleChecked, loadAccountAliases, navigate, sync, runAi, decideGhostLabels, undoAi, toggleRuleDryRun]);
 
-  useVimShortcuts(actions, !paletteOpen && !helpOpen && viewDialog === null && rulesPanel === null && newMessage === null);
+  useVimShortcuts(actions, !paletteOpen && !helpOpen && !statusOpen && viewDialog === null && rulesPanel === null && newMessage === null);
   const setupAction = actions.find((action) => action.id === "account.setup");
   const rulesAction = actions.find((action) => action.id === "ai.rules");
 
@@ -915,6 +947,7 @@ function Inbox({ accounts, route, navigate }: {
           </button>
         )}
         <FilterBar ref={searchRef} draft={draft} appliedError={queryError} onDraftChange={setDraft} onApply={applyQuery} />
+        <ServerStatusIndicator status={serverStatus} action={actions.find((action) => action.id === "server.status")} />
         {rulesAction && (
           <button type="button" className={toolbarButtonClass} onClick={rulesAction.run}>
             AI rules
@@ -1023,6 +1056,17 @@ function Inbox({ accounts, route, navigate }: {
         />
       )}
       {helpOpen && <ShortcutHelp actions={actions} onClose={() => setHelpOpen(false)} />}
+      {statusOpen && (
+        <ServerStatusPanel
+          status={serverStatus}
+          error={serverStatusError}
+          onRefresh={loadServerStatus}
+          onDismissResolved={() => {
+            api.dismissResolvedProblems().then(setServerStatus, (error) => setServerStatusError(errorMessage(error)));
+          }}
+          onClose={() => setStatusOpen(false)}
+        />
+      )}
       <CommandPalette
         open={paletteOpen}
         page={palettePage}

@@ -53,6 +53,10 @@ export interface ActionContext {
   readonly auditOpen: boolean;
   readonly composerOpen: boolean;
   readonly aiBusy: boolean;
+  readonly statusOpen: boolean;
+  /** Ongoing background problems on the server (Pub/Sub, syncs, AI runs), for the status action's label. */
+  readonly serverIssues: number;
+  readonly toggleStatus: () => void;
   /** The account's rules, for per-rule palette entries. */
   readonly rules: ReadonlyArray<{ readonly name: string; readonly automate: boolean }>;
   /** Position of the current view among saved views, or null for a built-in view. */
@@ -333,6 +337,11 @@ export const buildActions = (context: ActionContext): ReadonlyArray<AppAction> =
     {
       id: "help.shortcuts", label: "Keyboard shortcuts", group: "Help", shortcut: { key: "?" },
       enabled: true, run: context.toggleHelp,
+    },
+    {
+      id: "server.status",
+      label: context.statusOpen ? "Close server status" : context.serverIssues > 0 ? `Server status (${context.serverIssues} ${context.serverIssues === 1 ? "issue" : "issues"})` : "Server status",
+      group: "Account", shortcut: { key: "H" }, enabled: true, run: context.toggleStatus,
     },
     {
       id: "account.sync", label: context.syncing ? "Syncing…" : "Trigger sync", group: "Account", shortcut: { key: "S" },

@@ -11,6 +11,7 @@ import {
   type SendAsAliasDetail,
   type ForwardDraft,
   type ReplyDraft,
+  type ServerStatus,
   type ThreadAction,
   type NewMessageDraft,
   type ThreadDetail,
@@ -33,6 +34,7 @@ import { collectAttachments, findPart, parseMimeBody, type AttachmentRecord } fr
 import type { RegistryDbService } from "../services/RegistryDb";
 import { chooseAlias, isSendableAlias, SendAsComposerService, SendAsComposerServiceLive, type OutgoingFile } from "../services/SendAsComposerService";
 import { accountEventStream, type AccountEventBus } from "./sse";
+import type { ServerStatusStore } from "../serverStatus";
 
 export interface ApiConfig {
   readonly registry: RegistryDbService;
@@ -48,6 +50,8 @@ export interface ApiConfig {
   readonly vault?: OAuthTokenVault;
   /** Called after a reply is sent, e.g. to sync the sent message (and its conversation status) right away. */
   readonly onReplySent?: (accountId: AccountId) => void;
+  /** Background problems and the Pub/Sub state for the status panel; without it the panel shows nothing. */
+  readonly serverStatus?: ServerStatusStore;
 }
 
 export interface ApiHandler {
@@ -879,6 +883,17 @@ export const createApiHandler = (config: ApiConfig): ApiHandler => {
         } catch (error) {
           return failureResponse(error);
         }
+      }
+      if (url.pathname === "/api/status" || url.pathname === "/api/status/dismiss") {
+        const status = config.serverStatus;
+        if (url.pathname === "/api/status") {
+          if (request.method !== "GET") return apiError(405, { error: "Use GET." });
+          return json({ status: status?.snapshot() ?? { pubSub: { state: "disabled", detail: null, since: 0 }, problems: [] } satisfies ServerStatus });
+        }
+        if (request.method !== "POST") return apiError(405, { error: "Use POST." });
+        if (!isTrustedMutation(request)) return apiError(403, { error: "This request must come from the ZeroEffect web client." });
+        status?.dismissResolved();
+        return json({ status: status?.snapshot() ?? { pubSub: { state: "disabled", detail: null, since: 0 }, problems: [] } satisfies ServerStatus });
       }
       const match = /^\/api\/a\/([^/]+)(\/.*)?$/.exec(url.pathname);
       if (!match) return null;

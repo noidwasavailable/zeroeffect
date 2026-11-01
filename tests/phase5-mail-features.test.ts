@@ -496,7 +496,7 @@ describe("Phase 5: commands, bulk targets and views", () => {
     accounts: [{ id: "personal", email: "me@example.com", displayName: "Personal", colorTheme: "blue" }],
     accountId: "personal", views: orderViews([{ id: "v-1", name: "Bills", dsl: "label:Bills", builtIn: false }]), viewId: "inbox",
     selectedThread: thread("t1", ["INBOX", "UNREAD"]), targets: [thread("t1", ["INBOX", "UNREAD"])],
-    checkedCount: 0, loadedCount: 2, viewName: "Inbox", searchActive: false, selectedOtpCode: null, threadOpen: false,
+    checkedCount: 0, loadedCount: 2, viewName: "Inbox", searchActive: false, statusOpen: false, serverIssues: 0, toggleStatus: noop("status"), selectedOtpCode: null, threadOpen: false,
     canSelectNext: true, canSelectPrevious: true, syncing: false, builderOpen: false, auditOpen: false, composerOpen: false, aiBusy: false,
     rules: [], savedViewPosition: null, openMessageCount: 3, allMessagesExpanded: false, newMessageOpen: false,
     moveSelection: noop("move"), moveSelectionTo: (position) => calls.push(`to:${position}`), moveMessage: (delta) => calls.push(`message:${delta}`),

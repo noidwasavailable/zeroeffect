@@ -12,11 +12,14 @@ import type { RedisQueueServiceApi } from "./services/RedisQueue";
 import { RegistryDb, RegistryDbLive } from "./services/RegistryDb";
 import { createGmailAccessTokenProvider } from "./services/GmailAccessTokens";
 import { createAiRunner } from "./services/AiRunner";
+import { ACCOUNT_IDS } from "../shared/api";
 import { createApiHandler } from "./routes/api";
 import { createAccountEventBus } from "./routes/sse";
 import { createDevServer, devServerConfigFromEnvironment } from "./dev-server";
 import { ensureLocalValkey, VALKEY_CONTAINER } from "./localValkey";
 import type { LocalValkey } from "./localValkey";
+import { createServerStatusStore } from "./serverStatus";
+import { supervisePubSub, type PubSubSupervisor } from "./pubSubSupervisor";
 
 const CATCH_UP_INTERVAL_MS = 10 * 60 * 1000;
 
@@ -81,7 +84,13 @@ const main = async (): Promise<void> => {
   const redisUrl = process.env.REDIS_URL ?? "redis://127.0.0.1:6379";
   const tokens = createGmailAccessTokenProvider({ registry, oauth, vault });
   const events = createAccountEventBus();
+  // Background problems and the Pub/Sub state, shown in the web client (GET /api/status).
+  const serverStatus = createServerStatusStore();
+  serverStatus.subscribe(() => {
+    for (const accountId of ACCOUNT_IDS) events.publish(accountId, { type: "server-status" });
+  });
   const aiRunner = createAiRunner({
+    reportProblem: serverStatus.report,
     registry,
     tokens,
     vault,
@@ -102,8 +111,15 @@ const main = async (): Promise<void> => {
     vault,
     // Sync right after sending so the reply appears (and its conversation status updates) without waiting for Pub/Sub.
     onReplySent: (accountId) => {
-      accountOperations.sync(accountId).catch((error) => console.error(`Sync after sending from ${accountId} failed.`, error));
+      accountOperations.sync(accountId).then(
+        () => serverStatus.report("sync", accountId, null),
+        (error) => {
+          console.error(`Sync after sending from ${accountId} failed.`, error);
+          serverStatus.report("sync", accountId, error);
+        },
+      );
     },
+    serverStatus,
     accountDataDirectory: config.accountDataDirectory,
     gmailApiBaseUrl: config.gmailApiBaseUrl,
   });
@@ -119,6 +135,7 @@ const main = async (): Promise<void> => {
     },
     accountDataDirectory: config.accountDataDirectory,
     gmailApiBaseUrl: config.gmailApiBaseUrl,
+    reportProblem: serverStatus.report,
   });
   let stopping = false;
   let pubSubTransport: GooglePubSubTransport | undefined;
@@ -135,19 +152,40 @@ const main = async (): Promise<void> => {
       console.error("Could not load Gmail accounts for watch renewal; retrying on the next renewal cycle.", error);
     }
   };
+  // The current Pub/Sub refresh token. Reauthorizing replaces it and reconnects the running listener.
+  let pubSubRefreshToken = "";
+  let pubSubSupervisor: PubSubSupervisor | undefined;
   const startPubSub = async (refreshToken: string): Promise<void> => {
-    if (!pubSubProjectId || !pubSubSubscription || !pubSubTopic || stopping || pubSubTask) return;
+    if (!pubSubProjectId || !pubSubSubscription || !pubSubTopic || stopping) return;
+    pubSubRefreshToken = refreshToken;
+    // Already running (possibly stuck on a rejected token): reconnect with the new credentials now.
+    if (pubSubSupervisor) return pubSubSupervisor.reauthorized();
     // PubSub builds its own GoogleAuth from these options, so google-auth-library needn't be imported directly.
-    pubSubTransport = new GooglePubSubTransport(pubSubProjectId, () => new PubSub({
-      projectId: pubSubProjectId,
-      credentials: {
-        type: "authorized_user",
-        client_id: config.clientId,
-        client_secret: config.clientSecret,
-        refresh_token: refreshToken,
+    pubSubTransport = new GooglePubSubTransport(pubSubProjectId, async () => {
+      const client = new PubSub({
+        projectId: pubSubProjectId,
+        credentials: {
+          type: "authorized_user",
+          client_id: config.clientId,
+          client_secret: config.clientSecret,
+          refresh_token: pubSubRefreshToken,
+        },
+        scopes: [...PUBSUB_OAUTH_SCOPES],
+      });
+      try {
+        // Exchange the refresh token up front, so a rejected grant fails here with a clear error.
+        await client.auth.getAccessToken();
+      } catch (error) {
+        await client.close().catch(() => undefined);
+        throw error;
+      }
+      return client;
+    }, {
+      onStreamOpened: () => {
+        serverStatus.setPubSub("listening");
+        serverStatus.report("pubsub", null, null);
       },
-      scopes: [...PUBSUB_OAUTH_SCOPES],
-    }));
+    });
     redisClient = new RedisClient(redisUrl);
     const queueLayer = RedisQueueServiceLive({ url: redisUrl, client: redisClient });
     const queueApi: RedisQueueServiceApi = Effect.runSync(Effect.gen(function* () { return yield* RedisQueueService; }).pipe(Effect.provide(queueLayer)));
@@ -166,6 +204,7 @@ const main = async (): Promise<void> => {
           break;
         } catch (error) {
           console.error("Could not recover in-flight Gmail notifications; retrying shortly.", error);
+          serverStatus.report("notifications", null, error);
           await new Promise((resolve) => setTimeout(resolve, 5_000));
         }
       }
@@ -176,12 +215,23 @@ const main = async (): Promise<void> => {
           const outcome = await handleQueuedGmailNotification(
             reserved,
             queueApi,
-            accountOperations.processNotification,
+            // Report the processor's own outcome: the handler only logs the error.
+            (data) => accountOperations.processNotification(data).then(
+              (result) => {
+                serverStatus.report("notifications", null, null);
+                return result;
+              },
+              (error: unknown) => {
+                serverStatus.report("notifications", null, error);
+                throw error;
+              },
+            ),
           );
           reserved = null;
           if (outcome === "retried" && !stopping) await new Promise((resolve) => setTimeout(resolve, 5_000));
         } catch (error) {
           console.error("Gmail notification processing failed; preserving the queue item for retry.", error);
+          serverStatus.report("notifications", null, error);
           if (reserved !== null) {
             try {
               await Effect.runPromise(queueApi!.retry(processingQueue, "gmail:notifications", reserved));
@@ -195,17 +245,13 @@ const main = async (): Promise<void> => {
       }
     })();
     console.log(`Starting Gmail Pub/Sub StreamingPull for ${pubSubSubscription}.`);
-    pubSubTask = (async () => {
-      while (!stopping) {
-        try {
-          await Effect.runPromise(listener.listen(pubSubSubscription));
-          if (!stopping) console.error("Gmail Pub/Sub stream closed; reconnecting in 5 seconds.");
-        } catch (error) {
-          if (!stopping) console.error("Gmail Pub/Sub listener failed; reconnecting in 5 seconds.", error);
-        }
-        if (!stopping) await new Promise((resolve) => setTimeout(resolve, 5_000));
-      }
-    })();
+    const transport = pubSubTransport;
+    pubSubSupervisor = supervisePubSub({
+      listen: () => Effect.runPromise(listener.listen(pubSubSubscription)),
+      replaceClient: () => transport.replaceClient(),
+      status: serverStatus,
+    });
+    pubSubTask = pubSubSupervisor.task;
     void renewWatchesSafely(pubSubTopic);
     watchRenewalTimer = setInterval(() => {
       void renewWatchesSafely(pubSubTopic);
@@ -223,13 +269,19 @@ const main = async (): Promise<void> => {
       const encrypted = await registryRuntime.runPromise(registry.getServiceCredential("google_pubsub"));
       if (encrypted) {
         const stored = vault.decrypt<{ readonly refreshToken?: unknown }>(encrypted);
-        if (typeof stored.refreshToken === "string" && stored.refreshToken.length > 0) await startPubSub(stored.refreshToken);
-        else console.error("Stored Google Pub/Sub authorization is invalid; reconnect it from the local setup page.");
+        if (typeof stored.refreshToken === "string" && stored.refreshToken.length > 0) {
+          await startPubSub(stored.refreshToken);
+        } else {
+          console.error("Stored Google Pub/Sub authorization is invalid; reconnect it from the local setup page.");
+          serverStatus.setPubSub("needs_reauthorization", "The stored Pub/Sub authorization is invalid.");
+        }
       } else {
         console.log("Gmail Pub/Sub is configured but not authorized. Connect its Google account from the local setup page.");
+        serverStatus.setPubSub("unauthorized");
       }
     } catch {
       console.error("Stored Google Pub/Sub authorization could not be read. Reconnect it from the local setup page.");
+      serverStatus.setPubSub("needs_reauthorization", "The stored Pub/Sub authorization could not be read.");
     }
   } else {
     console.log("Gmail Pub/Sub ingestion is disabled; set GCP_PROJECT_ID, GMAIL_PUBSUB_SUBSCRIPTION, and GMAIL_PUBSUB_TOPIC to enable it.");
@@ -258,8 +310,10 @@ const main = async (): Promise<void> => {
       if (!pubSubTopic || !pubSubTask || stopping) return;
       try {
         await accountOperations.ensureWatch(accountId, pubSubTopic);
+        serverStatus.report("watch", accountId, null);
       } catch (error) {
         console.error(`Could not establish a Gmail Pub/Sub watch for newly connected account ${accountId}.`, error);
+        serverStatus.report("watch", accountId, error);
       }
     },
   });
@@ -269,6 +323,7 @@ const main = async (): Promise<void> => {
   const stop = async () => {
     if (stopping) return;
     stopping = true;
+    pubSubSupervisor?.stop();
     server.stop(true);
     if (watchRenewalTimer) clearInterval(watchRenewalTimer);
     clearInterval(catchUpTimer);

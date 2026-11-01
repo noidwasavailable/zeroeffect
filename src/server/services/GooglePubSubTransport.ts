@@ -16,6 +16,11 @@ export interface GooglePubSubOAuthCredentials {
 
 export type GooglePubSubClientFactory = () => GooglePubSubClient | Promise<GooglePubSubClient>;
 
+export interface GooglePubSubTransportOptions {
+  /** Called once a StreamingPull subscription is open and listening. */
+  readonly onStreamOpened?: () => void;
+}
+
 /** Adapts the Google Cloud Pub/Sub subscriber stream to the listener's async-iterable contract. */
 export class GooglePubSubTransport implements StreamingPullTransport {
   private readonly activeSubscriptions = new Set<Subscription>();
@@ -24,7 +29,11 @@ export class GooglePubSubTransport implements StreamingPullTransport {
   private clientPromise: Promise<GooglePubSubClient> | undefined;
   private closePromise: Promise<void> | undefined;
 
-  constructor(projectId: string, clientOrFactory?: GooglePubSubClient | GooglePubSubClientFactory) {
+  constructor(
+    projectId: string,
+    clientOrFactory?: GooglePubSubClient | GooglePubSubClientFactory,
+    private readonly options: GooglePubSubTransportOptions = {},
+  ) {
     this.immediateClient = clientOrFactory && typeof clientOrFactory !== "function" ? clientOrFactory : undefined;
     this.clientFactory = typeof clientOrFactory === "function"
       ? clientOrFactory
@@ -35,8 +44,28 @@ export class GooglePubSubTransport implements StreamingPullTransport {
   }
 
   private getClient(): Promise<GooglePubSubClient> {
-    this.clientPromise ??= Promise.resolve().then(this.clientFactory);
+    if (!this.clientPromise) {
+      const created = Promise.resolve().then(this.clientFactory);
+      this.clientPromise = created;
+      // A client that failed to build (e.g. rejected credentials) is not cached: the next stream retries.
+      created.catch(() => {
+        if (this.clientPromise === created) this.clientPromise = undefined;
+      });
+    }
     return this.clientPromise;
+  }
+
+  /**
+   * Drops the current client (e.g. after Pub/Sub was reauthorized) and ends open streams, so the
+   * listener reconnects through the factory with fresh credentials.
+   */
+  async replaceClient(): Promise<void> {
+    if (this.immediateClient || this.closePromise) return;
+    const previous = this.clientPromise;
+    this.clientPromise = undefined;
+    await Promise.all([...this.activeSubscriptions].map((subscription) => subscription.close()));
+    const client = await previous?.catch(() => undefined);
+    await client?.close();
   }
 
   async *streamingPull(subscriptionName: string): AsyncIterable<PubSubDelivery> {
@@ -75,6 +104,7 @@ export class GooglePubSubTransport implements StreamingPullTransport {
     subscription.on("message", onMessage);
     subscription.on("error", onError);
     subscription.on("close", onClose);
+    this.options.onStreamOpened?.();
 
     try {
       while (!ended || messages.length > 0) {
@@ -107,7 +137,7 @@ export class GooglePubSubTransport implements StreamingPullTransport {
         try {
           await Promise.all([...this.activeSubscriptions].map((subscription) => subscription.close()));
         } finally {
-          const client = await this.clientPromise;
+          const client = await this.clientPromise?.catch(() => undefined);
           await client?.close();
         }
       })();

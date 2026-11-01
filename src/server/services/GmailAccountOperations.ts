@@ -5,6 +5,7 @@ import { createGmailAccessTokenProvider, type GmailAccessTokenProvider } from ".
 import { AccountDbLive } from "./AccountDb";
 import { GmailClient, GmailClientLive } from "./GmailClient";
 import { GmailSyncService, GmailSyncServiceLive, type GmailSyncOptions } from "./GmailSyncService";
+import type { ProblemReporter } from "../serverStatus";
 import { OAuthTokenVault } from "./OAuthTokenVault";
 
 export type GmailAccountId = "personal" | "work";
@@ -40,6 +41,8 @@ export interface GmailAccountOperationsConfig {
   /** Called after each successful account sync (e.g. to notify connected web clients). */
   readonly onSynced?: (accountId: GmailAccountId, result: GmailAccountSyncResult) => void;
   readonly syncAccount?: (accountId: GmailAccountId, accessToken: string, options: GmailSyncOptions) => Promise<GmailAccountSyncResult>;
+  /** Surfaces catch-up and watch failures (and their recovery) in the web client's status panel. */
+  readonly reportProblem?: ProblemReporter;
 }
 
 export interface GmailAccountOperations {
@@ -144,8 +147,10 @@ export const createGmailAccountOperations = (config: GmailAccountOperationsConfi
       if (account.id !== "personal" && account.id !== "work") continue;
       try {
         await ensureWatch(account.id, topicName);
+        config.reportProblem?.("watch", account.id, null);
       } catch (error) {
         console.error(`Could not establish or renew the Gmail watch for ${account.id}.`, error);
+        config.reportProblem?.("watch", account.id, error);
       }
     }
   };
@@ -192,8 +197,10 @@ export const createGmailAccountOperations = (config: GmailAccountOperationsConfi
       if (account.id !== "personal" && account.id !== "work") continue;
       try {
         await sync(account.id, { incrementalOnly: true });
+        config.reportProblem?.("catch_up", account.id, null);
       } catch (error) {
         console.error(`Catch-up sync failed for ${account.id}; retrying on the next cycle.`, error);
+        config.reportProblem?.("catch_up", account.id, error);
       }
     }
   };

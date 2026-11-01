@@ -139,6 +139,8 @@ zero-effect/
 │   ├── server/
 │   │   ├── main.ts                 # Bun.serve() entry, background workers, catch-up sync timer
 │   │   ├── dev-server.ts           # HTTP server: setup/OAuth pages, client bundle, sync jobs
+│   │   ├── serverStatus.ts         # Background problems + Pub/Sub state (GET /api/status)
+│   │   ├── pubSubSupervisor.ts     # StreamingPull reconnects, invalid_grant, reauthorization
 │   │   ├── services/
 │   │   │   ├── RegistryDb.ts
 │   │   │   ├── AccountDb.ts
@@ -170,6 +172,7 @@ zero-effect/
 │   │   │   ├── NewMessageDialog.tsx # New messages and forwards
 │   │   │   ├── AttachmentField.tsx
 │   │   │   ├── ShortcutHelp.tsx
+│   │   │   ├── ServerStatusPanel.tsx # Header status button + background problems panel (H)
 │   │   │   └── AiAuditDrawer.tsx
 │   │   └── hooks/
 │   │       └── useVimShortcuts.ts

@@ -71,6 +71,8 @@ Incoming emails are ingested in real time via outbound Google Cloud Pub/Sub stre
 - **FR-GMAIL-01 (Zero-Funnel Outbound Pub/Sub):**
   - Uses `gmail.users.watch` to publish notifications to a private GCP Pub/Sub topic.
   - The Bun daemon initiates an **outbound** connection to GCP Pub/Sub (`StreamingPull`). No ports are exposed to the public internet, and Tailscale Funnel is not required.
+  - Listener supervision: failures reconnect every 5 seconds, except a rejected authorization (`invalid_grant`), which waits for Pub/Sub to be reauthorized from the setup page; reauthorizing reconnects the running listener with the new token immediately (no restart).
+  - Background status: the Pub/Sub state and failures of catch-up syncs, watches, notification processing, background AI labelling and post-send syncs are kept in memory and shown in the web client (header status button, `H`, palette "Server status"; `GET /api/status`).
   - Catch-up safety net: at startup and every 10 minutes, every account that has synced before runs an incremental `users.history.list` sync (one request per account when nothing changed). It recovers mail whose notification was lost to a lapsed watch, downtime or a dropped delivery, and keeps mail flowing when Pub/Sub is not configured.
 - **FR-GMAIL-02 (Incremental History & MIME Parsing):**
   - Reconciles `messagesAdded`, `messagesDeleted`, `labelsAdded`, and `labelsRemoved` from `history.list`.
