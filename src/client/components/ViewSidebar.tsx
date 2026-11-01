@@ -9,6 +9,13 @@ const VIEW_CONTROLS = [
   { id: "views.delete", label: "Delete", title: "Delete view" },
 ] as const;
 
+/** Label and alias management, at the bottom of the sidebar. */
+const FOOTER_ACTIONS = [
+  { id: "labels.jump", label: "Jump to label…" },
+  { id: "labels.manage", label: "Manage labels…" },
+  { id: "account.aliases", label: "Send As aliases…" },
+] as const;
+
 /** Built-in and saved views; each entry runs its "Go to view" action (digit key / Cmd+K). */
 export function ViewSidebar({ views, activeViewId, actions }: {
   readonly views: ReadonlyArray<ViewSummary>;
@@ -17,6 +24,7 @@ export function ViewSidebar({ views, activeViewId, actions }: {
 }) {
   const byId = new Map(actions.map((action) => [action.id, action]));
   const firstSaved = views.findIndex((view) => !view.builtIn);
+  const firstSecondary = views.findIndex((view) => view.secondary);
   return (
     <nav aria-label="Views" className="flex w-52 shrink-0 flex-col gap-0.5 overflow-y-auto border-r border-zinc-200 p-2 dark:border-zinc-800">
       {views.map((view, index) => {
@@ -25,6 +33,7 @@ export function ViewSidebar({ views, activeViewId, actions }: {
         return (
           <div key={view.id} className="flex flex-col">
             {index === firstSaved && <h3 className="px-2 pb-1 pt-3 text-xs font-medium text-zinc-500">Split views</h3>}
+            {index === firstSecondary && <hr className="mx-2 my-2 border-zinc-200 dark:border-zinc-800" />}
             <button
               type="button"
               title={view.dsl}
@@ -57,6 +66,24 @@ export function ViewSidebar({ views, activeViewId, actions }: {
           </div>
         );
       })}
+      <div className="mt-auto flex flex-col gap-0.5 border-t border-zinc-200 pt-2 dark:border-zinc-800">
+        {FOOTER_ACTIONS.map(({ id, label }) => {
+          const action = byId.get(id);
+          if (!action) return null;
+          return (
+            <button
+              key={id}
+              type="button"
+              title={action.label}
+              onClick={action.run}
+              className="flex items-center justify-between gap-2 rounded-md px-2 py-1 text-left text-xs text-zinc-500 hover:bg-zinc-50 hover:text-zinc-800 dark:hover:bg-zinc-900 dark:hover:text-zinc-200"
+            >
+              {label}
+              {action.shortcut && <Keycap shortcut={action.shortcut} />}
+            </button>
+          );
+        })}
+      </div>
     </nav>
   );
 }

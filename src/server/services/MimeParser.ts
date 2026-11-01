@@ -1,8 +1,9 @@
 export interface GmailMimePart {
+  readonly partId?: string | null;
   readonly mimeType?: string | null;
   readonly filename?: string | null;
   readonly headers?: ReadonlyArray<{ readonly name?: string | null; readonly value?: string | null }>;
-  readonly body?: { readonly data?: string | null; readonly attachmentId?: string | null } | null;
+  readonly body?: { readonly data?: string | null; readonly attachmentId?: string | null; readonly size?: number | null } | null;
   readonly parts?: ReadonlyArray<GmailMimePart> | null;
 }
 
@@ -54,6 +55,59 @@ const collectTextParts = (part: GmailMimePart | null | undefined): { plain: stri
   if (mimeType === "text/plain") return { plain: [text], html: [] };
   if (mimeType === "text/html") return { plain: [], html: [text] };
   return { plain: [], html: [] };
+};
+
+/** A file attached to a message. `attachmentId` is Gmail's handle for fetching its bytes (null when inline in the payload). */
+export interface AttachmentRecord {
+  readonly partId: string;
+  readonly filename: string;
+  readonly mimeType: string;
+  readonly size: number;
+  /** Content-ID without angle brackets, for `cid:` references in the HTML body. */
+  readonly contentId: string | null;
+  readonly inline: boolean;
+  readonly attachmentId: string | null;
+}
+
+const headerValue = (part: GmailMimePart, name: string): string | undefined =>
+  part.headers?.find((item) => item.name?.toLowerCase() === name)?.value ?? undefined;
+
+/** Every attachment part (including inline images referenced by `cid:`), in MIME order. */
+export const collectAttachments = (payload: GmailMimePart | null | undefined): ReadonlyArray<AttachmentRecord> => {
+  const found: AttachmentRecord[] = [];
+  const visit = (part: GmailMimePart | null | undefined, path: string) => {
+    if (!part) return;
+    if (part.parts?.length) {
+      part.parts.forEach((child, index) => visit(child, path ? `${path}.${index}` : String(index)));
+      return;
+    }
+    const mimeType = part.mimeType?.toLowerCase() ?? "application/octet-stream";
+    const contentId = headerValue(part, "content-id")?.trim().replace(/^<|>$/g, "") || null;
+    if (!isAttachment(part) && !(contentId && !mimeType.startsWith("text/"))) return;
+    const disposition = headerValue(part, "content-disposition")?.split(";", 1)[0]?.trim().toLowerCase();
+    found.push({
+      partId: part.partId ?? path,
+      filename: part.filename?.trim() || (contentId ? `inline-${contentId.split("@")[0]}` : "attachment"),
+      mimeType,
+      size: part.body?.size ?? (part.body?.data ? Buffer.from(part.body.data, "base64url").byteLength : 0),
+      contentId,
+      inline: disposition === "inline" || (disposition === undefined && contentId !== null),
+      attachmentId: part.body?.attachmentId ?? null,
+    });
+  };
+  visit(payload, "");
+  return found;
+};
+
+/** The leaf part with this Gmail partId. */
+export const findPart = (payload: GmailMimePart | null | undefined, partId: string): GmailMimePart | null => {
+  if (!payload) return null;
+  if (payload.partId === partId && !payload.parts?.length) return payload;
+  for (const child of payload.parts ?? []) {
+    const match = findPart(child, partId);
+    if (match) return match;
+  }
+  return null;
 };
 
 const isAttachment = (part: GmailMimePart): boolean => {

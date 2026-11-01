@@ -11,7 +11,7 @@ export interface Shortcut {
   readonly alt?: boolean;
 }
 
-export type ActionGroup = "Navigation" | "Thread" | "AI" | "Filter & Views" | "Account";
+export type ActionGroup = "Navigation" | "Thread" | "Selection" | "Labels" | "AI" | "Filter & Views" | "Account" | "Help";
 
 export interface AppAction {
   readonly id: string;
@@ -31,6 +31,16 @@ export interface ActionContext {
   readonly views: ReadonlyArray<ViewSummary>;
   readonly viewId: string;
   readonly selectedThread: ThreadSummary | null;
+  /**
+   * The threads thread actions apply to: the checked threads when any are checked (bulk), else the
+   * selected one. Labels follow them (e.g. "Mark as read" while any target is unread).
+   */
+  readonly targets: ReadonlyArray<ThreadSummary>;
+  /** How many threads are checked for bulk actions. */
+  readonly checkedCount: number;
+  /** How many threads are loaded in the list (what "select all" checks). */
+  readonly loadedCount: number;
+  readonly viewName: string;
   /** The selected thread's one-time code, when it carries an OTP label (see shared/otp.ts). */
   readonly selectedOtpCode: string | null;
   readonly threadOpen: boolean;
@@ -46,6 +56,22 @@ export interface ActionContext {
   /** Position of the current view among saved views, or null for a built-in view. */
   readonly savedViewPosition: { readonly index: number; readonly count: number } | null;
   readonly moveSelection: (delta: 1 | -1) => void;
+  readonly moveSelectionTo: (position: "first" | "last") => void;
+  /** Moves through the open conversation's messages, expanding the one reached. */
+  readonly moveMessage: (delta: 1 | -1) => void;
+  readonly toggleChecked: () => void;
+  readonly checkAll: () => void;
+  readonly clearChecked: () => void;
+  readonly markAllRead: () => void;
+  readonly openForward: () => void;
+  readonly openInGmail: () => void;
+  readonly copyLink: () => void;
+  readonly openLabelJump: () => void;
+  readonly openLabelManager: () => void;
+  readonly openAliases: () => void;
+  readonly refreshAliases: () => void;
+  readonly toggleHelp: () => void;
+  /** Opens the selected thread, or closes the reader when one is open. */
   readonly openSelectedThread: () => void;
   readonly closeThread: () => void;
   readonly focusSearch: () => void;
@@ -87,11 +113,15 @@ export const TOOLBAR_ACTION_IDS = [
   "compose.new",
   "navigation.previous",
   "navigation.next",
+  "navigation.open",
   "thread.archive",
+  "thread.trash",
   "thread.label",
   "thread.toggleRead",
   "thread.toggleStar",
   "thread.reply",
+  "thread.forward",
+  "view.markAllRead",
   "ai.run",
   "ai.audit",
   "filter.builder",
@@ -101,6 +131,16 @@ export const TOOLBAR_ACTION_IDS = [
 
 export const buildActions = (context: ActionContext): ReadonlyArray<AppAction> => {
   const thread = context.selectedThread;
+  const targets = context.targets;
+  const hasTargets = targets.length > 0;
+  // Bulk labels say how many threads they cover.
+  const count = context.checkedCount > 0 ? ` (${context.checkedCount})` : "";
+  const all = (predicate: (target: ThreadSummary) => boolean) => hasTargets && targets.every(predicate);
+  const allArchived = all((target) => target.isArchived);
+  const anyUnread = targets.some((target) => target.isUnread);
+  const anyUnstarred = targets.some((target) => !target.isStarred);
+  const allTrashed = all((target) => target.labels.includes("TRASH"));
+  const allSpam = all((target) => target.labels.includes("SPAM"));
   const actions: AppAction[] = [
     {
       id: "navigation.next", label: "Next thread", group: "Navigation", shortcut: { key: "j" },
@@ -111,8 +151,24 @@ export const buildActions = (context: ActionContext): ReadonlyArray<AppAction> =
       enabled: context.canSelectPrevious, run: () => context.moveSelection(-1),
     },
     {
-      id: "navigation.open", label: "Open thread", group: "Navigation", shortcut: { key: "o" },
-      enabled: thread !== null, run: context.openSelectedThread,
+      id: "navigation.first", label: "First thread", group: "Navigation", shortcut: { key: "{" },
+      enabled: context.canSelectPrevious, run: () => context.moveSelectionTo("first"),
+    },
+    {
+      id: "navigation.last", label: "Last loaded thread", group: "Navigation", shortcut: { key: "}" },
+      enabled: context.canSelectNext, run: () => context.moveSelectionTo("last"),
+    },
+    {
+      id: "navigation.open", label: context.threadOpen ? "Close" : "Open", group: "Navigation", shortcut: { key: "o" },
+      enabled: thread !== null || context.threadOpen, run: context.openSelectedThread,
+    },
+    {
+      id: "navigation.nextMessage", label: "Next message in conversation", group: "Navigation", shortcut: { key: "]" },
+      enabled: context.openMessageCount > 1, run: () => context.moveMessage(1),
+    },
+    {
+      id: "navigation.previousMessage", label: "Previous message in conversation", group: "Navigation", shortcut: { key: "[" },
+      enabled: context.openMessageCount > 1, run: () => context.moveMessage(-1),
     },
     {
       id: "navigation.close", label: "Close thread", group: "Navigation", shortcut: { key: "Escape" },
@@ -148,23 +204,69 @@ export const buildActions = (context: ActionContext): ReadonlyArray<AppAction> =
       run: () => context.moveView(1),
     },
     {
-      id: "thread.archive", label: thread?.isArchived ? "Move to Inbox" : "Archive", group: "Thread", shortcut: { key: "e" },
-      enabled: thread !== null,
-      run: () => context.runThreadAction({ type: thread?.isArchived ? "moveToInbox" : "archive" }),
+      id: "thread.archive", label: `${allArchived ? "Move to Inbox" : "Archive"}${count}`, group: "Thread", shortcut: { key: "e" },
+      enabled: hasTargets,
+      run: () => context.runThreadAction({ type: allArchived ? "moveToInbox" : "archive" }),
     },
     {
-      id: "thread.label", label: "Apply / remove label", group: "Thread", shortcut: { key: "l" },
-      enabled: thread !== null, run: context.openLabelPicker, opensPalettePage: true,
+      id: "thread.trash", label: `${allTrashed ? "Restore from Trash" : "Move to Trash"}${count}`, group: "Thread", shortcut: { key: "#" },
+      enabled: hasTargets,
+      run: () => context.runThreadAction({ type: allTrashed ? "untrash" : "trash" }),
     },
     {
-      id: "thread.toggleRead", label: thread?.isUnread ? "Mark as read" : "Mark as unread", group: "Thread", shortcut: { key: "u" },
-      enabled: thread !== null,
-      run: () => context.runThreadAction({ type: thread?.isUnread ? "markRead" : "markUnread" }),
+      id: "thread.spam", label: `${allSpam ? "Not spam" : "Report spam"}${count}`, group: "Thread", shortcut: { key: "!" },
+      enabled: hasTargets,
+      run: () => context.runThreadAction({ type: allSpam ? "notSpam" : "spam" }),
     },
     {
-      id: "thread.toggleStar", label: thread?.isStarred ? "Unstar" : "Star", group: "Thread", shortcut: { key: "s" },
-      enabled: thread !== null,
-      run: () => context.runThreadAction({ type: thread?.isStarred ? "unstar" : "star" }),
+      id: "thread.label", label: `Apply / remove label${count}`, group: "Labels", shortcut: { key: "l" },
+      enabled: hasTargets, run: context.openLabelPicker, opensPalettePage: true,
+    },
+    {
+      id: "thread.toggleRead", label: `${anyUnread ? "Mark as read" : "Mark as unread"}${count}`, group: "Thread", shortcut: { key: "u" },
+      enabled: hasTargets,
+      run: () => context.runThreadAction({ type: anyUnread ? "markRead" : "markUnread" }),
+    },
+    {
+      id: "thread.toggleStar", label: `${anyUnstarred ? "Star" : "Unstar"}${count}`, group: "Thread", shortcut: { key: "s" },
+      enabled: hasTargets,
+      run: () => context.runThreadAction({ type: anyUnstarred ? "star" : "unstar" }),
+    },
+    {
+      id: "view.markAllRead", label: `Mark all as read in ${context.viewName}`, group: "Selection", shortcut: { key: "U" },
+      enabled: true, run: context.markAllRead,
+    },
+    {
+      id: "selection.toggle", label: thread && context.checkedCount > 0 && targets.some((target) => target.id === thread.id) ? "Uncheck thread" : "Check thread",
+      group: "Selection", shortcut: { key: " " }, enabled: thread !== null, run: context.toggleChecked,
+    },
+    {
+      id: "selection.all", label: `Check all loaded threads (${context.loadedCount})`, group: "Selection", shortcut: { key: "*" },
+      enabled: context.loadedCount > 0 && context.checkedCount < context.loadedCount, run: context.checkAll,
+    },
+    {
+      id: "selection.clear", label: "Clear checked threads", group: "Selection", shortcut: { key: "X" },
+      enabled: context.checkedCount > 0, run: context.clearChecked,
+    },
+    {
+      id: "thread.forward", label: "Forward", group: "Thread", shortcut: { key: "F" },
+      enabled: thread !== null && !context.newMessageOpen, run: context.openForward,
+    },
+    {
+      id: "thread.openInGmail", label: "Open in Gmail", group: "Thread", shortcut: { key: "O" },
+      enabled: thread !== null, run: context.openInGmail,
+    },
+    {
+      id: "thread.copyLink", label: "Copy link to conversation", group: "Thread", shortcut: { key: "Y" },
+      enabled: thread !== null, run: context.copyLink,
+    },
+    {
+      id: "labels.jump", label: "Jump to label", group: "Labels", shortcut: { key: "L" },
+      enabled: true, run: context.openLabelJump, opensPalettePage: true,
+    },
+    {
+      id: "labels.manage", label: "Create, rename or delete labels", group: "Labels",
+      enabled: true, run: context.openLabelManager, opensPalettePage: true,
     },
     {
       id: "thread.toggleExpandAll", label: context.allMessagesExpanded ? "Collapse older messages" : "Expand all messages",
@@ -215,6 +317,18 @@ export const buildActions = (context: ActionContext): ReadonlyArray<AppAction> =
       enabled: true, run: context.openSetup,
     },
     {
+      id: "account.aliases", label: "Send As aliases", group: "Account",
+      enabled: true, run: context.openAliases, opensPalettePage: true,
+    },
+    {
+      id: "account.refreshAliases", label: "Refresh Send As aliases from Gmail", group: "Account",
+      enabled: true, run: context.refreshAliases,
+    },
+    {
+      id: "help.shortcuts", label: "Keyboard shortcuts", group: "Help", shortcut: { key: "?" },
+      enabled: true, run: context.toggleHelp,
+    },
+    {
       id: "account.sync", label: context.syncing ? "Syncing…" : "Trigger sync", group: "Account", shortcut: { key: "S" },
       enabled: !context.syncing, run: context.sync,
     },
@@ -256,13 +370,15 @@ export const buildActions = (context: ActionContext): ReadonlyArray<AppAction> =
     });
   }
 
-  // Views take the digit keys in sidebar order.
-  context.views.slice(0, 9).forEach((view, index) => {
+  // Every view can be reached from the palette; the first nine (Trash and Spam aside) take the digit keys.
+  let digit = 0;
+  for (const view of context.views) {
+    const key = !view.secondary && digit < 9 ? String(++digit) : null;
     actions.push({
-      id: `views.go.${view.id}`, label: `Go to ${view.name}`, group: "Filter & Views", shortcut: { key: String(index + 1) },
+      id: `views.go.${view.id}`, label: `Go to ${view.name}`, group: "Filter & Views", ...(key ? { shortcut: { key } } : {}),
       enabled: view.id !== context.viewId, run: () => context.goToView(view.id),
     });
-  });
+  }
 
   // Accounts follow the PRD's Alt+1 / Alt+2 switcher shortcuts.
   context.accounts.forEach((account, index) => {
@@ -279,6 +395,7 @@ export const buildActions = (context: ActionContext): ReadonlyArray<AppAction> =
 export const shortcutLabel = (shortcut: Shortcut): string => {
   if (shortcut.alt) return `⌥${shortcut.key.toUpperCase()}`;
   if (shortcut.key === "Escape") return "Esc";
+  if (shortcut.key === " ") return "Space";
   if (/^[A-Z]$/.test(shortcut.key)) return `⇧${shortcut.key}`;
   return shortcut.key.toUpperCase();
 };

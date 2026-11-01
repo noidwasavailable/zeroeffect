@@ -11,6 +11,7 @@ import { applyLabelChange } from "../../shared/threadActions";
 import type { FilterExpr, FilterThread } from "../../shared/schemas";
 import type { ThreadDetail, ThreadSummary, ViewSummary } from "../../shared/api";
 import { renameLabelsInRulesFile } from "./AiRules";
+import type { AttachmentRecord } from "./MimeParser";
 import type { CompiledFilter } from "./BooleanFilter";
 
 export interface ThreadRecord extends FilterThread {
@@ -56,6 +57,7 @@ export interface MessageRecord {
   readonly rawHeaders: Readonly<Record<string, string>>;
   /** This message's Gmail label names; a thread's labels are the union over its messages. */
   readonly labels?: ReadonlyArray<string>;
+  readonly attachments?: ReadonlyArray<AttachmentRecord>;
 }
 
 export interface AiThreadMessage {
@@ -130,6 +132,19 @@ export interface AccountDbService {
   readonly deleteMessage: (id: string) => Effect.Effect<void, DatabaseError>;
   /** Stores a message's original HTML (backfill for messages synced before it was kept). */
   readonly setMessageBodyHtml: (id: string, bodyHtml: string) => Effect.Effect<void, DatabaseError>;
+  /** A message's attachments; null when it was stored before attachments were recorded (or is unknown). */
+  readonly getMessageAttachments: (id: string) => Effect.Effect<ReadonlyArray<AttachmentRecord> | null, DatabaseError>;
+  readonly setMessageAttachments: (id: string, attachments: ReadonlyArray<AttachmentRecord>) => Effect.Effect<void, DatabaseError>;
+  /** Messages of a thread stored before attachments were recorded (backfilled when the thread is opened). */
+  readonly listMessagesWithoutAttachmentInfo: (threadId: string) => Effect.Effect<ReadonlyArray<string>, DatabaseError>;
+  /** Applies one label change to many threads in a single transaction (bulk actions). */
+  readonly applyThreadsLabelChange: (ids: ReadonlyArray<string>, add: ReadonlyArray<string>, remove: ReadonlyArray<string>) => Effect.Effect<void, DatabaseError>;
+  /** Message ids of these threads; with `withLabel`, only messages carrying that label (e.g. UNREAD). */
+  readonly listMessageIds: (threadIds: ReadonlyArray<string>, withLabel?: string) => Effect.Effect<ReadonlyArray<string>, DatabaseError>;
+  /** Ids of every thread matching a filter (no paging; bulk actions over a whole view). */
+  readonly listThreadIds: (filter: CompiledFilter) => Effect.Effect<ReadonlyArray<string>, DatabaseError>;
+  /** Drops a deleted Gmail label from every thread and message (and from suggested labels). */
+  readonly removeLabelEverywhere: (name: string) => Effect.Effect<void, DatabaseError>;
   /** Replaces the label catalog and rewrites stored thread labels for renamed (or legacy ID-valued) labels. */
   readonly replaceLabels: (labels: ReadonlyArray<LabelRecord>) => Effect.Effect<void, DatabaseError>;
   readonly upsertLabel: (label: LabelRecord) => Effect.Effect<void, DatabaseError>;
@@ -283,6 +298,10 @@ const migrateAiStorage = (database: Database): void => {
       // NULL marks messages stored before original HTML was kept; the API refetches those on open.
       database.exec("ALTER TABLE messages ADD COLUMN body_html TEXT");
     }
+    if (!columnNames(database, "messages").includes("attachments_json")) {
+      // NULL marks messages stored before attachments were recorded; the API refetches those on open.
+      database.exec("ALTER TABLE messages ADD COLUMN attachments_json TEXT");
+    }
     if (!columnNames(database, "messages").includes("labels_json")) {
       database.exec("ALTER TABLE messages ADD COLUMN labels_json TEXT NOT NULL DEFAULT '[]'");
       // Best available history: each message gets its thread's labels as of this migration.
@@ -352,7 +371,8 @@ const initialize = (database: Database): void => {
       body_html_sanitized TEXT NOT NULL,
       raw_headers_json TEXT NOT NULL,
       labels_json TEXT NOT NULL DEFAULT '[]',
-      body_html TEXT
+      body_html TEXT,
+      attachments_json TEXT
     );
     CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
       thread_id UNINDEXED, subject, from_address, body_markdown
@@ -513,11 +533,12 @@ const makeService = (accountId: string, database: Database, rulesStore: RulesSto
         const row = database.prepare("SELECT * FROM threads WHERE id = ?").get(id) as ThreadRow | null;
         if (!row) return null;
         const messages = (database.prepare(`
-          SELECT id, from_address, to_addresses_json, cc_addresses_json, delivered_to, date_ts, body_markdown, body_html_sanitized, body_html, labels_json
+          SELECT id, from_address, to_addresses_json, cc_addresses_json, delivered_to, date_ts, body_markdown, body_html_sanitized, body_html, labels_json, attachments_json
           FROM messages WHERE thread_id = ? ORDER BY date_ts ASC, id ASC
         `).all(id) as Array<{
           id: string; from_address: string; to_addresses_json: string; cc_addresses_json: string;
           delivered_to: string | null; date_ts: number; body_markdown: string; body_html_sanitized: string; body_html: string | null; labels_json: string;
+          attachments_json: string | null;
         }>).map((message) => ({
           id: message.id,
           fromAddress: message.from_address,
@@ -529,6 +550,8 @@ const makeService = (accountId: string, database: Database, rulesStore: RulesSto
           bodyHtmlSanitized: message.body_html_sanitized,
           bodyHtml: message.body_html,
           isUnread: (JSON.parse(message.labels_json) as string[]).includes("UNREAD"),
+          attachments: (JSON.parse(message.attachments_json ?? "[]") as AttachmentRecord[])
+            .map(({ partId, filename, mimeType, size, contentId, inline }) => ({ partId, filename, mimeType, size, contentId, inline })),
         }));
         return { ...toThreadSummary(row), messages };
       },
@@ -617,8 +640,8 @@ const makeService = (accountId: string, database: Database, rulesStore: RulesSto
           database.prepare(`
             INSERT INTO messages (
               id, thread_id, from_address, to_addresses_json, cc_addresses_json,
-              delivered_to, date_ts, body_markdown, body_html_sanitized, raw_headers_json, labels_json, body_html
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              delivered_to, date_ts, body_markdown, body_html_sanitized, raw_headers_json, labels_json, body_html, attachments_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
               thread_id = excluded.thread_id,
               from_address = excluded.from_address,
@@ -630,7 +653,8 @@ const makeService = (accountId: string, database: Database, rulesStore: RulesSto
               body_html_sanitized = excluded.body_html_sanitized,
               raw_headers_json = excluded.raw_headers_json,
               labels_json = excluded.labels_json,
-              body_html = excluded.body_html
+              body_html = excluded.body_html,
+              attachments_json = excluded.attachments_json
           `).run(
             message.id,
             message.threadId,
@@ -644,6 +668,7 @@ const makeService = (accountId: string, database: Database, rulesStore: RulesSto
             JSON.stringify(message.rawHeaders),
             JSON.stringify(message.labels ?? []),
             message.bodyHtml ?? null,
+            message.attachments ? JSON.stringify(message.attachments) : null,
           );
           database.prepare("DELETE FROM messages_fts WHERE thread_id = ?").run(message.threadId);
           database.prepare(`
@@ -660,6 +685,77 @@ const makeService = (accountId: string, database: Database, rulesStore: RulesSto
     Effect.try({
       try: () => { database.prepare("UPDATE messages SET body_html = ? WHERE id = ?").run(bodyHtml, id); },
       catch: (cause) => new DatabaseError({ message: "Failed to save message HTML.", operation: "setMessageBodyHtml", cause }),
+    }),
+  getMessageAttachments: (id) =>
+    Effect.try({
+      try: () => {
+        const row = database.prepare("SELECT attachments_json FROM messages WHERE id = ?").get(id) as { attachments_json: string | null } | null;
+        return row?.attachments_json ? JSON.parse(row.attachments_json) as AttachmentRecord[] : null;
+      },
+      catch: (cause) => new DatabaseError({ message: "Failed to load attachments.", operation: "getMessageAttachments", cause }),
+    }),
+  setMessageAttachments: (id, attachments) =>
+    Effect.try({
+      try: () => { database.prepare("UPDATE messages SET attachments_json = ? WHERE id = ?").run(JSON.stringify(attachments), id); },
+      catch: (cause) => new DatabaseError({ message: "Failed to save attachments.", operation: "setMessageAttachments", cause }),
+    }),
+  listMessagesWithoutAttachmentInfo: (threadId) =>
+    Effect.try({
+      try: () => (database.prepare("SELECT id FROM messages WHERE thread_id = ? AND attachments_json IS NULL ORDER BY date_ts, id")
+        .all(threadId) as Array<{ id: string }>).map((row) => row.id),
+      catch: (cause) => new DatabaseError({ message: "Failed to list messages.", operation: "listMessagesWithoutAttachmentInfo", cause }),
+    }),
+  applyThreadsLabelChange: (ids, add, remove) =>
+    Effect.try({
+      try: () => database.transaction(() => {
+        const selectThread = database.prepare("SELECT labels_json FROM threads WHERE id = ?");
+        const selectMessages = database.prepare("SELECT id, labels_json FROM messages WHERE thread_id = ?");
+        const updateMessage = database.prepare("UPDATE messages SET labels_json = ? WHERE id = ?");
+        for (const id of ids) {
+          const thread = selectThread.get(id) as { labels_json: string } | null;
+          if (!thread) continue;
+          for (const message of selectMessages.all(id) as Array<{ id: string; labels_json: string }>) {
+            updateMessage.run(JSON.stringify(applyLabelChange(JSON.parse(message.labels_json) as string[], add, remove)), message.id);
+          }
+          writeThreadLabels(database, id, applyLabelChange(JSON.parse(thread.labels_json) as string[], add, remove));
+        }
+      })(),
+      catch: (cause) => new DatabaseError({ message: "Failed to update thread labels.", operation: "applyThreadsLabelChange", cause }),
+    }),
+  listMessageIds: (threadIds, withLabel) =>
+    Effect.try({
+      try: () => {
+        const select = database.prepare("SELECT id, labels_json FROM messages WHERE thread_id = ? ORDER BY date_ts, id");
+        return threadIds.flatMap((threadId) => (select.all(threadId) as Array<{ id: string; labels_json: string }>)
+          .filter((row) => withLabel === undefined || (JSON.parse(row.labels_json) as string[]).includes(withLabel))
+          .map((row) => row.id));
+      },
+      catch: (cause) => new DatabaseError({ message: "Failed to list messages.", operation: "listMessageIds", cause }),
+    }),
+  listThreadIds: (filter) =>
+    Effect.try({
+      try: () => (database.prepare(`SELECT threads.id FROM threads WHERE ${filter.sql} ORDER BY last_message_at DESC, id`)
+        .all(...filter.params) as Array<{ id: string }>).map((row) => row.id),
+      catch: (cause) => new DatabaseError({ message: "Failed to list threads.", operation: "listThreadIds", cause }),
+    }),
+  removeLabelEverywhere: (name) =>
+    Effect.try({
+      try: () => database.transaction(() => {
+        const without = (json: string) => JSON.stringify((JSON.parse(json) as string[]).filter((label) => label !== name));
+        const threads = database.prepare("SELECT id, labels_json, ghost_labels_json FROM threads").all() as Array<Pick<ThreadRow, "id" | "labels_json" | "ghost_labels_json">>;
+        const updateGhosts = database.prepare("UPDATE threads SET ghost_labels_json = ? WHERE id = ?");
+        for (const row of threads) {
+          if ((JSON.parse(row.labels_json) as string[]).includes(name)) writeThreadLabels(database, row.id, JSON.parse(without(row.labels_json)) as string[]);
+          if ((JSON.parse(row.ghost_labels_json) as string[]).includes(name)) updateGhosts.run(without(row.ghost_labels_json), row.id);
+        }
+        const messages = database.prepare("SELECT id, labels_json FROM messages").all() as Array<{ id: string; labels_json: string }>;
+        const updateMessage = database.prepare("UPDATE messages SET labels_json = ? WHERE id = ?");
+        for (const row of messages) {
+          if ((JSON.parse(row.labels_json) as string[]).includes(name)) updateMessage.run(without(row.labels_json), row.id);
+        }
+        database.prepare("DELETE FROM labels WHERE name = ?").run(name);
+      })(),
+      catch: (cause) => new DatabaseError({ message: "Failed to remove label.", operation: "removeLabelEverywhere", cause }),
     }),
   deleteMessage: (id) =>
     Effect.try({

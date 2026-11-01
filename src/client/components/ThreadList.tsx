@@ -6,7 +6,7 @@ import { displayName, formatListDate } from "../format";
 import { Keycap } from "./Keycap";
 import { LabelChips } from "./LabelChips";
 
-export function ThreadList({ threads, selectedIndex, openThreadId, labelCatalog, loading, error, hasMore, onSelect, onOpen, onLoadMore, otpLabels, copyOtpAction, onCopyOtp }: {
+export function ThreadList({ threads, selectedIndex, openThreadId, labelCatalog, loading, error, hasMore, checked, onToggleChecked, onSelect, onOpen, onLoadMore, otpLabels, copyOtpAction, onCopyOtp }: {
   readonly threads: ReadonlyArray<ThreadSummary>;
   readonly selectedIndex: number;
   readonly openThreadId: string | null;
@@ -14,6 +14,10 @@ export function ThreadList({ threads, selectedIndex, openThreadId, labelCatalog,
   readonly loading: boolean;
   readonly error: string | null;
   readonly hasMore: boolean;
+  /** Threads checked for bulk actions. */
+  readonly checked: ReadonlySet<string>;
+  /** Checks or unchecks a row; `range` (shift-click) extends from the last toggled row. */
+  readonly onToggleChecked: (index: number, range: boolean) => void;
   readonly onSelect: (index: number) => void;
   readonly onOpen: (index: number) => void;
   readonly onLoadMore: () => void;
@@ -38,6 +42,7 @@ export function ThreadList({ threads, selectedIndex, openThreadId, labelCatalog,
     <ul role="listbox" aria-label="Conversations" className="divide-y divide-zinc-100 dark:divide-zinc-900">
       {threads.map((thread, index) => {
         const selected = index === selectedIndex;
+        const isChecked = checked.has(thread.id);
         const otp = copyableOtp(thread, otpLabels);
         return (
           <li
@@ -47,8 +52,21 @@ export function ThreadList({ threads, selectedIndex, openThreadId, labelCatalog,
             aria-selected={selected}
             onClick={() => onSelect(index)}
             onDoubleClick={() => onOpen(index)}
-            className={`relative flex cursor-default flex-col gap-0.5 px-4 py-2.5 ${selected ? "bg-zinc-100 dark:bg-zinc-900" : "hover:bg-zinc-50 dark:hover:bg-zinc-900/50"} ${thread.id === openThreadId ? "before:absolute before:inset-y-0 before:left-0 before:w-0.5 before:bg-blue-500" : ""}`}
+            className={`relative flex cursor-default gap-2.5 py-2.5 pl-3 pr-4 ${selected ? "bg-zinc-100 dark:bg-zinc-900" : isChecked ? "bg-blue-50/60 dark:bg-blue-950/30" : "hover:bg-zinc-50 dark:hover:bg-zinc-900/50"} ${thread.id === openThreadId ? "before:absolute before:inset-y-0 before:left-0 before:w-0.5 before:bg-blue-500" : ""}`}
           >
+            <input
+              type="checkbox"
+              aria-label={`Check “${thread.subject}”`}
+              checked={isChecked}
+              className="mt-1 shrink-0 cursor-pointer"
+              onClick={(event) => {
+                event.stopPropagation();
+                onToggleChecked(index, event.shiftKey);
+              }}
+              onChange={() => undefined}
+              onDoubleClick={(event) => event.stopPropagation()}
+            />
+            <div className="flex min-w-0 flex-1 flex-col gap-0.5">
             <div className="flex items-baseline gap-2">
               <span className={`truncate text-sm ${thread.isUnread ? "font-semibold" : "text-zinc-600 dark:text-zinc-400"}`}>
                 {displayName(thread.senderSummary)}
@@ -74,6 +92,7 @@ export function ThreadList({ threads, selectedIndex, openThreadId, labelCatalog,
               <span className={`min-w-0 truncate text-sm ${thread.isUnread ? "font-medium" : ""}`}>{thread.subject}</span>
             </div>
             <div className="truncate text-xs text-zinc-500">{thread.snippet}</div>
+            </div>
           </li>
         );
       })}

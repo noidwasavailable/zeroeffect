@@ -18,6 +18,8 @@ import { createDevServer, devServerConfigFromEnvironment } from "./dev-server";
 import { ensureLocalValkey, VALKEY_CONTAINER } from "./localValkey";
 import type { LocalValkey } from "./localValkey";
 
+const CATCH_UP_INTERVAL_MS = 10 * 60 * 1000;
+
 const main = async (): Promise<void> => {
   const config = devServerConfigFromEnvironment();
   const pubSubProjectId = config.pubsubProjectId;
@@ -233,6 +235,15 @@ const main = async (): Promise<void> => {
     console.log("Gmail Pub/Sub ingestion is disabled; set GCP_PROJECT_ID, GMAIL_PUBSUB_SUBSCRIPTION, and GMAIL_PUBSUB_TOPIC to enable it.");
   }
 
+  // Catch-up sync at startup and every few minutes, whether or not Pub/Sub is configured: it picks up
+  // mail whose notification was lost (lapsed watch, downtime, a dropped delivery). With nothing new it
+  // costs one history.list request per account.
+  const runCatchUp = () => {
+    if (!stopping) accountOperations.catchUp().catch((error) => console.error("Catch-up sync failed.", error));
+  };
+  runCatchUp();
+  const catchUpTimer = setInterval(runCatchUp, CATCH_UP_INTERVAL_MS);
+
   const server = createDevServer({
     ...config,
     registry,
@@ -260,6 +271,7 @@ const main = async (): Promise<void> => {
     stopping = true;
     server.stop(true);
     if (watchRenewalTimer) clearInterval(watchRenewalTimer);
+    clearInterval(catchUpTimer);
     await pubSubTransport?.close();
     await Promise.all([pubSubTask, notificationWorkerTask]);
     await pubSubRuntime?.dispose();

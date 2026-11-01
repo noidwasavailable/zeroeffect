@@ -23,7 +23,13 @@ export function ActionToolbar({ actions, onOpenPalette }: {
           </button>
         );
       })}
-      <button type="button" className={`${toolbarButtonClass} ml-auto`} onClick={onOpenPalette}>
+      {byId.get("help.shortcuts") && (
+        <button type="button" className={`${toolbarButtonClass} ml-auto`} onClick={byId.get("help.shortcuts")!.run}>
+          Shortcuts
+          <Keycap shortcut={byId.get("help.shortcuts")!.shortcut!} />
+        </button>
+      )}
+      <button type="button" className={toolbarButtonClass} onClick={onOpenPalette}>
         Command palette
         <Keycap label="⌘K" />
       </button>

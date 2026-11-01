@@ -32,6 +32,30 @@ export interface ThreadSummary {
   readonly otpCode: string | null;
 }
 
+export interface AttachmentSummary {
+  /** Gmail's MIME part id; with the message id it addresses the download route. */
+  readonly partId: string;
+  readonly filename: string;
+  readonly mimeType: string;
+  readonly size: number;
+  /** Content-ID for `cid:` references in the message HTML (inline images). */
+  readonly contentId: string | null;
+  readonly inline: boolean;
+}
+
+/** Gmail rejects messages over 25 MB; attachments sent through ZeroEffect must fit together. */
+export const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
+
+/** A file attached to an outgoing message, base64-encoded by the client. */
+export interface OutgoingAttachment {
+  readonly filename: string;
+  readonly mimeType: string;
+  readonly dataBase64: string;
+}
+
+export const attachmentPath = (accountId: string, messageId: string, partId: string, options: { readonly inline?: boolean } = {}): string =>
+  `/api/a/${encodeURIComponent(accountId)}/messages/${encodeURIComponent(messageId)}/attachments/${encodeURIComponent(partId)}${options.inline ? "?inline=1" : ""}`;
+
 export interface ThreadMessage {
   readonly id: string;
   readonly fromAddress: string;
@@ -45,6 +69,7 @@ export interface ThreadMessage {
   readonly bodyHtml: string | null;
   /** Unread messages start expanded in the reader, like the newest one. */
   readonly isUnread: boolean;
+  readonly attachments: ReadonlyArray<AttachmentSummary>;
 }
 
 export interface ThreadDetail extends ThreadSummary {
@@ -64,6 +89,8 @@ export interface ViewSummary {
   readonly name: string;
   readonly dsl: string;
   readonly builtIn: boolean;
+  /** Listed after saved views and without a digit key (Trash, Spam). */
+  readonly secondary?: boolean;
 }
 
 export interface ThreadPage {
@@ -80,7 +107,28 @@ export type ThreadAction =
   | { readonly type: "markUnread" }
   | { readonly type: "star" }
   | { readonly type: "unstar" }
+  | { readonly type: "trash" }
+  | { readonly type: "untrash" }
+  | { readonly type: "spam" }
+  | { readonly type: "notSpam" }
   | { readonly type: "setLabels"; readonly add: ReadonlyArray<string>; readonly remove: ReadonlyArray<string> };
+
+export const SIMPLE_THREAD_ACTIONS = [
+  "archive", "moveToInbox", "markRead", "markUnread", "star", "unstar", "trash", "untrash", "spam", "notSpam",
+] as const;
+
+/**
+ * One action over many threads: the listed ones, or every thread in a view (optionally narrowed by a
+ * DSL query), e.g. "mark all as read in this view".
+ */
+export type BulkThreadRequest =
+  | { readonly action: ThreadAction; readonly threadIds: ReadonlyArray<string> }
+  | { readonly action: ThreadAction; readonly view: string; readonly q?: string };
+
+export interface BulkThreadResult {
+  readonly threadsUpdated: number;
+  readonly messagesUpdated: number;
+}
 
 export interface ApiErrorBody {
   readonly error: string;
@@ -153,6 +201,14 @@ export interface SendAsAliasSummary {
   readonly isPrimary: boolean;
 }
 
+/** Every Send As alias of an account, for the "Send As aliases" palette page. */
+export interface SendAsAliasDetail extends SendAsAliasSummary {
+  readonly replyToAddress: string | null;
+  readonly verificationStatus: string;
+  /** Verified (or primary): it can be chosen as the sender. */
+  readonly sendable: boolean;
+}
+
 /** A suggested reply to a thread's latest incoming message. */
 export interface ReplyDraft {
   /** The Gmail message being answered. */
@@ -175,6 +231,17 @@ export interface NewMessageDraft {
   readonly aliases: ReadonlyArray<SendAsAliasSummary>;
 }
 
+/** Defaults for forwarding a thread's newest message. */
+export interface ForwardDraft {
+  /** The Gmail message being forwarded. */
+  readonly messageId: string;
+  readonly subject: string;
+  readonly fromAlias: string | null;
+  readonly aliases: ReadonlyArray<SendAsAliasSummary>;
+  /** The original's attachments; all are forwarded unless listed in `excludeAttachments`. */
+  readonly attachments: ReadonlyArray<AttachmentSummary>;
+}
+
 export interface SendMessageRequest {
   readonly to: ReadonlyArray<string>;
   readonly cc: ReadonlyArray<string>;
@@ -182,6 +249,7 @@ export interface SendMessageRequest {
   readonly subject: string;
   readonly body: string;
   readonly fromAlias: string;
+  readonly attachments?: ReadonlyArray<OutgoingAttachment>;
 }
 
 export interface SendReplyRequest {
@@ -191,4 +259,19 @@ export interface SendReplyRequest {
   readonly subject: string;
   readonly body: string;
   readonly fromAlias: string;
+  readonly attachments?: ReadonlyArray<OutgoingAttachment>;
+}
+
+export interface SendForwardRequest {
+  readonly messageId: string;
+  readonly to: ReadonlyArray<string>;
+  readonly cc: ReadonlyArray<string>;
+  readonly bcc: ReadonlyArray<string>;
+  readonly subject: string;
+  /** Optional note above the forwarded message. */
+  readonly body: string;
+  readonly fromAlias: string;
+  /** Part ids of the original's attachments to leave out. */
+  readonly excludeAttachments: ReadonlyArray<string>;
+  readonly attachments?: ReadonlyArray<OutgoingAttachment>;
 }

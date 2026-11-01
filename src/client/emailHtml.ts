@@ -1,4 +1,5 @@
 import DOMPurify from "dompurify";
+import type { AttachmentSummary } from "../shared/api";
 
 /**
  * Sanitizes a message's original HTML for the Shadow DOM reader. Unlike the server's strict copy,
@@ -14,3 +15,29 @@ export const sanitizeEmailHtml = (html: string): string => DOMPurify.sanitize(ht
   ],
   FORBID_ATTR: ["autofocus"],
 });
+
+/**
+ * Points `cid:` references (inline images) at the attachment download route, before sanitizing:
+ * DOMPurify drops the cid: scheme. Returns the HTML and the Content-IDs it now displays.
+ */
+export const resolveInlineImages = (
+  html: string,
+  attachments: ReadonlyArray<AttachmentSummary>,
+  urlFor: (attachment: AttachmentSummary) => string,
+): { readonly html: string; readonly referenced: ReadonlySet<string> } => {
+  const byContentId = new Map(attachments.flatMap((attachment) => attachment.contentId ? [[attachment.contentId.toLowerCase(), attachment] as const] : []));
+  const referenced = new Set<string>();
+  const resolved = html.replace(/cid:([^"'()\s>]+)/gi, (match, id: string) => {
+    let key = id;
+    try {
+      key = decodeURIComponent(id);
+    } catch {
+      // Keep the raw id.
+    }
+    const attachment = byContentId.get(key.toLowerCase());
+    if (!attachment) return match;
+    referenced.add(attachment.contentId!);
+    return urlFor(attachment);
+  });
+  return { html: resolved, referenced };
+};

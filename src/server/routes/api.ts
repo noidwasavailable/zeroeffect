@@ -1,10 +1,15 @@
 import { Effect, Layer, ManagedRuntime } from "effect";
 import {
   isAccountId,
+  SIMPLE_THREAD_ACTIONS,
+  MAX_ATTACHMENT_BYTES,
   MAX_VIEW_NAME_LENGTH,
   LOCAL_REQUEST_HEADER,
   type AccountId,
   type ApiErrorBody,
+  type BulkThreadResult,
+  type SendAsAliasDetail,
+  type ForwardDraft,
   type ReplyDraft,
   type ThreadAction,
   type NewMessageDraft,
@@ -15,7 +20,7 @@ import {
 import { DatabaseError, FilterParseError, GmailApiError, LlmEndpointError, SendAsComposeError } from "../../shared/errors";
 import type { FilterExpr } from "../../shared/schemas";
 import { threadActionLabels } from "../../shared/threadActions";
-import { BUILT_IN_VIEWS } from "../../shared/views";
+import { BUILT_IN_VIEWS, orderViews } from "../../shared/views";
 import { AccountDb, AccountDbLive, type AccountDbService, type SendAsAliasRecord } from "../services/AccountDb";
 import { formatRulesFile, importInboxZeroRules, parseRulesFile } from "../services/AiRules";
 import type { OAuthTokenVault } from "../services/OAuthTokenVault";
@@ -23,10 +28,10 @@ import type { AiRunner } from "../services/AiRunner";
 import { BooleanFilter, BooleanFilterLive } from "../services/BooleanFilter";
 import type { GmailAccessTokenProvider } from "../services/GmailAccessTokens";
 import { GmailClient, GmailClientLive, type GmailClientService } from "../services/GmailClient";
-import { resolveLabelIds } from "../services/GmailLabels";
-import { parseMimeBody } from "../services/MimeParser";
+import { resolveLabelIds, syncLabels, toLabelRecord, labelColorFor } from "../services/GmailLabels";
+import { collectAttachments, findPart, parseMimeBody, type AttachmentRecord } from "../services/MimeParser";
 import type { RegistryDbService } from "../services/RegistryDb";
-import { chooseAlias, isSendableAlias, SendAsComposerService, SendAsComposerServiceLive } from "../services/SendAsComposerService";
+import { chooseAlias, isSendableAlias, SendAsComposerService, SendAsComposerServiceLive, type OutgoingFile } from "../services/SendAsComposerService";
 import { accountEventStream, type AccountEventBus } from "./sse";
 
 export interface ApiConfig {
@@ -55,6 +60,18 @@ const DEFAULT_PAGE_SIZE = 50;
 const MAX_PAGE_SIZE = 200;
 /** Upper bound on Gmail fetches when one opened conversation needs its original HTML backfilled. */
 const MAX_HTML_BACKFILL = 25;
+
+/** Raster image types the reader may display inline (SVG and HTML are always downloaded). */
+const INLINE_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp", "image/bmp", "image/avif"]);
+
+const toAttachmentSummary = ({ partId, filename, mimeType, size, contentId, inline }: AttachmentRecord) =>
+  ({ partId, filename, mimeType, size, contentId, inline });
+
+/** RFC 6266 Content-Disposition with an ASCII fallback name and the UTF-8 original. */
+export const contentDisposition = (type: "inline" | "attachment", filename: string): string => {
+  const ascii = filename.replace(/[^\x20-\x7e]|["\\]/g, "_").trim() || "attachment";
+  return `${type}; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(filename)}`;
+};
 
 const json = (value: unknown, status = 200): Response => Response.json(value, {
   status,
@@ -106,6 +123,28 @@ const isStringArray = (value: unknown): value is string[] =>
 const addressList = (value: unknown): string[] | null =>
   Array.isArray(value) && value.every((item) => typeof item === "string") ? (value as string[]).map((item) => item.trim()).filter(Boolean) : null;
 
+/**
+ * Decodes the client's attachments ({ filename, mimeType, dataBase64 }[]); a string explains why they
+ * were rejected. Together they must fit Gmail's 25 MB message limit.
+ */
+const parseAttachments = (value: unknown): OutgoingFile[] | string => {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) return "attachments must be a list.";
+  const files: OutgoingFile[] = [];
+  let total = 0;
+  for (const item of value as unknown[]) {
+    const { filename, mimeType, dataBase64 } = (item ?? {}) as Record<string, unknown>;
+    if (typeof filename !== "string" || !filename.trim() || filename.length > 255 || typeof dataBase64 !== "string") {
+      return "Each attachment needs a file name and its data.";
+    }
+    const data = Buffer.from(dataBase64, "base64");
+    total += data.byteLength;
+    if (total > MAX_ATTACHMENT_BYTES) return `Attachments may total at most ${MAX_ATTACHMENT_BYTES / 1024 / 1024} MB.`;
+    files.push({ filename: filename.trim(), mimeType: typeof mimeType === "string" && mimeType ? mimeType : "application/octet-stream", data });
+  }
+  return files;
+};
+
 const parseThreadAction = (body: unknown): ThreadAction | null => {
   if (typeof body !== "object" || body === null) return null;
   const { type, add, remove } = body as { type?: unknown; add?: unknown; remove?: unknown };
@@ -114,10 +153,11 @@ const parseThreadAction = (body: unknown): ThreadAction | null => {
       ? { type, add: add.map((label) => label.trim()), remove: remove.map((label) => label.trim()) }
       : null;
   }
-  return type === "archive" || type === "moveToInbox" || type === "markRead" || type === "markUnread" || type === "star" || type === "unstar"
-    ? { type }
-    : null;
+  return SIMPLE_THREAD_ACTIONS.find((candidate) => candidate === type) ? { type: type as (typeof SIMPLE_THREAD_ACTIONS)[number] } : null;
 };
+
+/** Gmail's messages.batchModify takes at most this many message ids per request. */
+const BATCH_MODIFY_LIMIT = 1000;
 
 export const createApiHandler = (config: ApiConfig): ApiHandler => {
   // One long-lived connection per account silo, opened on first use.
@@ -145,46 +185,116 @@ export const createApiHandler = (config: ApiConfig): ApiHandler => {
   };
 
   /**
-   * Messages synced before original HTML was kept only have the reduced copy. Fetch their HTML from
-   * Gmail once, when the conversation is opened; on failure the reduced copy is shown as before.
+   * Messages synced before original HTML (or attachment details) were kept only have the reduced copy.
+   * Fetch them from Gmail once, when the conversation is opened; on failure the stored copy is shown as before.
    */
   const withOriginalHtml = async (accountId: AccountId, thread: ThreadDetail): Promise<ThreadDetail> => {
-    const missing = thread.messages.filter((message) => message.bodyHtml === null && message.bodyHtmlSanitized !== "");
+    const db = await accountDb(accountId);
+    const withoutAttachmentInfo = new Set(await Effect.runPromise(db.listMessagesWithoutAttachmentInfo(thread.id)));
+    const missing = thread.messages.filter((message) =>
+      (message.bodyHtml === null && message.bodyHtmlSanitized !== "") || withoutAttachmentInfo.has(message.id));
     if (missing.length === 0) return thread;
     try {
-      const db = await accountDb(accountId);
       const gmail = await gmailClient(accountId);
-      const fetched = new Map<string, string>();
+      const fetchedHtml = new Map<string, string>();
+      const fetchedAttachments = new Map<string, ReadonlyArray<AttachmentRecord>>();
       await Promise.all(missing.slice(0, MAX_HTML_BACKFILL).map(async (message) => {
-        const bodyHtml = parseMimeBody((await Effect.runPromise(gmail.getMessage(message.id))).payload).bodyHtml;
-        if (bodyHtml === null) return;
+        const payload = (await Effect.runPromise(gmail.getMessage(message.id))).payload;
+        const attachments = collectAttachments(payload);
+        await Effect.runPromise(db.setMessageAttachments(message.id, attachments));
+        fetchedAttachments.set(message.id, attachments);
+        const bodyHtml = parseMimeBody(payload).bodyHtml;
+        if (bodyHtml === null || message.bodyHtml !== null) return;
         await Effect.runPromise(db.setMessageBodyHtml(message.id, bodyHtml));
-        fetched.set(message.id, bodyHtml);
+        fetchedHtml.set(message.id, bodyHtml);
       }));
-      return { ...thread, messages: thread.messages.map((message) => ({ ...message, bodyHtml: fetched.get(message.id) ?? message.bodyHtml })) };
+      return {
+        ...thread,
+        messages: thread.messages.map((message) => ({
+          ...message,
+          bodyHtml: fetchedHtml.get(message.id) ?? message.bodyHtml,
+          attachments: fetchedAttachments.get(message.id)?.map(toAttachmentSummary) ?? message.attachments,
+        })),
+      };
     } catch (error) {
       console.warn(`Could not fetch original HTML for ${accountId} thread ${thread.id}; showing the stored copy.`, error);
       return thread;
     }
   };
 
+  /**
+   * Streams one attachment from Gmail. Downloads are always served as files (never rendered as a page
+   * of this origin); only raster images may be shown inline, for `cid:` images in the reader.
+   */
+  const downloadAttachment = async (accountId: AccountId, messageId: string, partId: string, url: URL): Promise<Response> => {
+    const db = await accountDb(accountId);
+    // The message must belong to this account's silo.
+    if (await Effect.runPromise(db.getMessageHeaders(messageId)) === null) return apiError(404, { error: "Message not found." });
+    const loaded = await loadAttachment(db, await gmailClient(accountId), messageId, partId);
+    if (!loaded) return apiError(404, { error: "Attachment not found." });
+    const { attachment, data } = loaded;
+    const mimeType = /^[\w.+-]+\/[\w.+-]+$/.test(attachment.mimeType) ? attachment.mimeType : "application/octet-stream";
+    const inline = url.searchParams.get("inline") === "1" && INLINE_IMAGE_TYPES.has(mimeType);
+    return new Response(new Uint8Array(data), {
+      headers: {
+        "Content-Type": mimeType,
+        "Content-Disposition": contentDisposition(inline ? "inline" : "attachment", attachment.filename),
+        "Content-Security-Policy": "sandbox; default-src 'none'",
+        "X-Content-Type-Options": "nosniff",
+        "Cache-Control": "private, max-age=86400",
+      },
+    });
+  };
+
+  /** An attachment's record and bytes, fetched from Gmail (null when the message has no such part). */
+  const loadAttachment = async (
+    db: AccountDbService,
+    gmail: GmailClientService,
+    messageId: string,
+    partId: string,
+  ): Promise<{ readonly attachment: AttachmentRecord; readonly data: Buffer } | null> => {
+    let attachment = (await Effect.runPromise(db.getMessageAttachments(messageId)))?.find((candidate) => candidate.partId === partId);
+    let data: string | null = null;
+    if (attachment?.attachmentId) {
+      // Gmail's attachment ids can go stale; on failure, look the part up again below.
+      data = await Effect.runPromise(gmail.getAttachment(messageId, attachment.attachmentId)).then((result) => result.data, () => null);
+    }
+    if (data === null) {
+      const payload = (await Effect.runPromise(gmail.getMessage(messageId))).payload;
+      const fresh = collectAttachments(payload);
+      await Effect.runPromise(db.setMessageAttachments(messageId, fresh));
+      attachment = fresh.find((candidate) => candidate.partId === partId);
+      if (!attachment) return null;
+      data = findPart(payload, partId)?.body?.data
+        ?? (attachment.attachmentId ? (await Effect.runPromise(gmail.getAttachment(messageId, attachment.attachmentId))).data : null);
+      if (data === null) return null;
+    }
+    return { attachment: attachment!, data: Buffer.from(data, "base64url") };
+  };
+
   const listViews = async (db: AccountDbService): Promise<ReadonlyArray<ViewSummary>> =>
-    [...BUILT_IN_VIEWS, ...await Effect.runPromise(db.listSavedViews())];
+    orderViews(await Effect.runPromise(db.listSavedViews()));
+
+  /** A view's filter, ANDed with an extra DSL query (and `extra` expressions) when given. */
+  const viewFilter = async (db: AccountDbService, viewId: string, query: string | undefined, extra: ReadonlyArray<FilterExpr> = []) => {
+    const view = (await listViews(db)).find((candidate) => candidate.id === viewId);
+    if (!view) return null;
+    const expressions: FilterExpr[] = [await Effect.runPromise(booleanFilter.parse(view.dsl))];
+    if (query?.trim()) expressions.push(await Effect.runPromise(booleanFilter.parse(query.trim())));
+    expressions.push(...extra);
+    return booleanFilter.compile(expressions.length === 1 ? expressions[0]! : { _tag: "And", expressions });
+  };
 
   const listThreads = async (accountId: AccountId, url: URL): Promise<Response> => {
     const db = await accountDb(accountId);
     const viewId = url.searchParams.get("view") ?? "inbox";
-    const view = (await listViews(db)).find((candidate) => candidate.id === viewId);
-    if (!view) return apiError(404, { error: `View '${viewId}' does not exist.` });
+    const filter = await viewFilter(db, viewId, url.searchParams.get("q") ?? undefined);
+    if (!filter) return apiError(404, { error: `View '${viewId}' does not exist.` });
     const limit = Number(url.searchParams.get("limit") ?? DEFAULT_PAGE_SIZE);
     const offset = Number(url.searchParams.get("offset") ?? 0);
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_PAGE_SIZE || !Number.isSafeInteger(offset) || offset < 0) {
       return apiError(400, { error: `limit must be 1-${MAX_PAGE_SIZE} and offset must be a non-negative integer.` });
     }
-    const expressions: FilterExpr[] = [await Effect.runPromise(booleanFilter.parse(view.dsl))];
-    const query = url.searchParams.get("q")?.trim();
-    if (query) expressions.push(await Effect.runPromise(booleanFilter.parse(query)));
-    const filter = booleanFilter.compile(expressions.length === 1 ? expressions[0]! : { _tag: "And", expressions });
     // Fetch one extra row to learn whether another page exists.
     const threads = await Effect.runPromise(db.listThreadSummaries(filter, { limit: limit + 1, offset }));
     return json({ threads: threads.slice(0, limit), hasMore: threads.length > limit } satisfies ThreadPage);
@@ -213,6 +323,113 @@ export const createApiHandler = (config: ApiConfig): ApiHandler => {
     const updated = await Effect.runPromise(db.applyThreadLabelChange(threadId, add, remove));
     config.events.publish(accountId, { type: "threads-changed", threadIds: [threadId] });
     return json({ thread: updated });
+  };
+
+  /**
+   * Applies one action to many threads: Gmail first (messages.batchModify, 1000 messages per request),
+   * then the local copies in one transaction. Only messages the action changes are sent (e.g. unread
+   * ones for "mark read"), so marking a large view read costs a handful of requests.
+   */
+  const applyBulkAction = async (accountId: AccountId, request: Request): Promise<Response> => {
+    const body = await readJson(request);
+    const action = parseThreadAction(body?.action);
+    if (!body || !action) return apiError(400, { error: "Unsupported thread action." });
+    const db = await accountDb(accountId);
+    let threadIds: ReadonlyArray<string>;
+    const { add, remove } = threadActionLabels(action);
+    if (typeof body.view === "string") {
+      // Narrow to threads the action changes, e.g. only unread threads for "mark all read".
+      const narrowing = action.type === "markRead" ? [await Effect.runPromise(booleanFilter.parse("is:unread"))] : [];
+      const filter = await viewFilter(db, body.view, typeof body.q === "string" ? body.q : undefined, narrowing);
+      if (!filter) return apiError(404, { error: `View '${body.view}' does not exist.` });
+      threadIds = await Effect.runPromise(db.listThreadIds(filter));
+    } else if (isStringArray(body.threadIds)) {
+      const known = await Promise.all(body.threadIds.map(async (id) => await Effect.runPromise(db.getThread(id)) ? id : null));
+      threadIds = [...new Set(known.filter((id): id is string => id !== null))];
+    } else {
+      return apiError(400, { error: "Send threadIds, or a view (and optional q)." });
+    }
+    // A pure removal only needs the messages that carry that label.
+    const onlyWith = add.length === 0 && remove.length === 1 ? remove[0] : undefined;
+    const messageIds = await Effect.runPromise(db.listMessageIds(threadIds, onlyWith));
+    if (messageIds.length > 0) {
+      const gmail = await gmailClient(accountId);
+      await Effect.runPromise(Effect.gen(function* () {
+        const addIds = yield* resolveLabelIds(db, gmail, add, { create: true });
+        const removeIds = yield* resolveLabelIds(db, gmail, remove, { create: false });
+        for (let offset = 0; offset < messageIds.length; offset += BATCH_MODIFY_LIMIT) {
+          yield* gmail.batchModify(messageIds.slice(offset, offset + BATCH_MODIFY_LIMIT), addIds, removeIds);
+        }
+      }));
+    }
+    await Effect.runPromise(db.applyThreadsLabelChange(threadIds, add, remove));
+    if (threadIds.length > 0) config.events.publish(accountId, { type: "threads-changed", threadIds });
+    return json({ threadsUpdated: threadIds.length, messagesUpdated: messageIds.length } satisfies BulkThreadResult);
+  };
+
+  const labelName = (value: unknown): string | null =>
+    typeof value === "string" && value.trim().length > 0 && value.trim().length <= 225 ? value.trim() : null;
+
+  /** Creates, renames or deletes a user label in Gmail, then mirrors it in the account silo. */
+  const manageLabel = async (accountId: AccountId, request: Request, labelId: string | null): Promise<Response> => {
+    const db = await accountDb(accountId);
+    const gmail = await gmailClient(accountId);
+    const labels = await Effect.runPromise(db.listLabels());
+    if (labelId === null) {
+      const name = labelName((await readJson(request))?.name);
+      if (!name) return apiError(400, { error: "A label needs a name." });
+      if (labels.some((label) => label.name.toLowerCase() === name.toLowerCase())) return apiError(409, { error: `A label named "${name}" already exists.` });
+      const created = toLabelRecord(await Effect.runPromise(gmail.createLabel(name, labelColorFor(name))));
+      await Effect.runPromise(db.upsertLabel(created));
+      return json({ label: created }, 201);
+    }
+    const label = labels.find((candidate) => candidate.id === labelId);
+    if (!label) return apiError(404, { error: "Label not found." });
+    if (label.type !== "user") return apiError(400, { error: "Gmail's system labels cannot be changed." });
+    if (request.method === "DELETE") {
+      await Effect.runPromise(gmail.deleteLabel(label.id));
+      await Effect.runPromise(db.removeLabelEverywhere(label.name));
+      config.events.publish(accountId, { type: "threads-changed" });
+      return json({ deleted: true });
+    }
+    const name = labelName((await readJson(request))?.name);
+    if (!name) return apiError(400, { error: "A label needs a name." });
+    if (labels.some((candidate) => candidate.id !== label.id && candidate.name.toLowerCase() === name.toLowerCase())) {
+      return apiError(409, { error: `A label named "${name}" already exists.` });
+    }
+    await Effect.runPromise(gmail.renameLabel(label.id, name));
+    // Reloading the catalog renames the label on threads, in saved views and in AI rules.
+    await Effect.runPromise(syncLabels(db, gmail));
+    config.events.publish(accountId, { type: "threads-changed" });
+    config.events.publish(accountId, { type: "views-changed" });
+    config.events.publish(accountId, { type: "rules-changed" });
+    return json({ labels: await Effect.runPromise(db.listLabels()) });
+  };
+
+  const aliasDetails = (aliases: ReadonlyArray<SendAsAliasRecord>): ReadonlyArray<SendAsAliasDetail> => aliases.map((alias) => ({
+    sendAsEmail: alias.sendAsEmail,
+    displayName: alias.displayName,
+    isDefault: alias.isDefault,
+    isPrimary: alias.isPrimary,
+    replyToAddress: alias.replyToAddress,
+    verificationStatus: alias.verificationStatus,
+    sendable: isSendableAlias(alias),
+  }));
+
+  /** Reloads Send As aliases from Gmail (they are otherwise refreshed at most hourly by sync). */
+  const refreshAliases = async (accountId: AccountId): Promise<Response> => {
+    const db = await accountDb(accountId);
+    const aliases = await Effect.runPromise((await gmailClient(accountId)).listSendAs());
+    await Effect.runPromise(db.replaceSendAsAliases(aliases.map((alias) => ({
+      sendAsEmail: alias.sendAsEmail,
+      displayName: alias.displayName ?? "",
+      replyToAddress: alias.replyToAddress ?? null,
+      signatureHtml: alias.signature ?? null,
+      isPrimary: alias.isPrimary ?? false,
+      isDefault: alias.isDefault ?? false,
+      verificationStatus: alias.verificationStatus ?? "unknown",
+    }))));
+    return json({ aliases: aliasDetails(await Effect.runPromise(db.listSendAsAliases())) });
   };
 
   const readJson = async (request: Request): Promise<Record<string, unknown> | null> => {
@@ -436,9 +653,11 @@ export const createApiHandler = (config: ApiConfig): ApiHandler => {
     if (!body || !to || !cc || !bcc || to.length + cc.length + bcc.length === 0 || typeof body.body !== "string" || !body.body.trim() || typeof body.subject !== "string" || typeof body.fromAlias !== "string") {
       return apiError(400, { error: "A message needs at least one recipient, a sender alias and a message." });
     }
+    const attachments = parseAttachments(body.attachments);
+    if (typeof attachments === "string") return apiError(400, { error: attachments });
     const db = await accountDb(accountId);
     const sent = await Effect.runPromise(composerFor(db, await gmailClient(accountId)).send({
-      to, cc, bcc, subject: body.subject, text: body.body, fromAlias: body.fromAlias,
+      to, cc, bcc, subject: body.subject, text: body.body, fromAlias: body.fromAlias, attachments,
     }));
     config.onReplySent?.(accountId);
     return json({ sent });
@@ -451,6 +670,8 @@ export const createApiHandler = (config: ApiConfig): ApiHandler => {
     if (!body || !to || to.length === 0 || !cc || typeof body.body !== "string" || !body.body.trim() || typeof body.subject !== "string" || typeof body.fromAlias !== "string") {
       return apiError(400, { error: "A reply needs recipients, a subject, a sender alias and a message." });
     }
+    const attachments = parseAttachments(body.attachments);
+    if (typeof attachments === "string") return apiError(400, { error: attachments });
     const target = await replyTarget(accountId, threadId);
     if (!target) return apiError(404, { error: "Thread not found." });
     const original = target.context.messages.find((message) => message.id === body.messageId) ?? target.target;
@@ -466,6 +687,88 @@ export const createApiHandler = (config: ApiConfig): ApiHandler => {
       inReplyTo: messageIdHeader,
       references: [headers.references, messageIdHeader].filter(Boolean).join(" ") || null,
       quote: { from: original.fromAddress, dateTs: original.dateTs, text: original.bodyMarkdown },
+      attachments,
+    }));
+    config.onReplySent?.(accountId);
+    return json({ sent });
+  };
+
+  /** The message a forward starts from: the requested one, else the thread's newest (drafts excluded). */
+  const forwardSource = async (accountId: AccountId, threadId: string, messageId?: unknown) => {
+    const db = await accountDb(accountId);
+    const thread = await Effect.runPromise(db.getThreadDetail(threadId));
+    if (!thread) return null;
+    const context = await Effect.runPromise(db.getAiThreadContext(threadId));
+    const candidates = (context?.messages ?? []).filter((message) => !message.labels.includes("DRAFT"));
+    const source = candidates.find((message) => message.id === messageId) ?? candidates.at(-1);
+    const detail = source && thread.messages.find((message) => message.id === source.id);
+    if (!source || !detail) return null;
+    const withAttachments = (await withOriginalHtml(accountId, { ...thread, messages: [detail] })).messages[0]!;
+    return { db, thread, source, detail: withAttachments };
+  };
+
+  const forwardDraft = async (accountId: AccountId, threadId: string): Promise<Response> => {
+    const found = await forwardSource(accountId, threadId);
+    if (!found) return apiError(404, { error: "Thread not found." });
+    const aliases = await Effect.runPromise(found.db.listSendAsAliases());
+    const choice = chooseAlias(aliases, { deliveredTo: found.source.deliveredTo, matchAddresses: [...found.source.toAddresses, ...found.source.ccAddresses], to: [], cc: [] });
+    const subject = found.source.subject.trim() || found.thread.subject;
+    return json({
+      draft: {
+        messageId: found.source.id,
+        subject: /^fwd?:/i.test(subject) ? subject : `Fwd: ${subject}`,
+        fromAlias: choice?.alias.sendAsEmail ?? null,
+        aliases: sendableAliases(aliases),
+        attachments: found.detail.attachments,
+      } satisfies ForwardDraft,
+    });
+  };
+
+  /** Forwards a message (with its attachments unless left out) in the same Gmail conversation. */
+  const sendForward = async (accountId: AccountId, threadId: string, request: Request): Promise<Response> => {
+    const body = await readJson(request);
+    const to = addressList(body?.to);
+    const cc = addressList(body?.cc ?? []);
+    const bcc = addressList(body?.bcc ?? []);
+    if (!body || !to || !cc || !bcc || to.length + cc.length + bcc.length === 0 || typeof body.body !== "string" || typeof body.subject !== "string" || typeof body.fromAlias !== "string") {
+      return apiError(400, { error: "A forward needs at least one recipient and a sender alias." });
+    }
+    const added = parseAttachments(body.attachments);
+    if (typeof added === "string") return apiError(400, { error: added });
+    const found = await forwardSource(accountId, threadId, body.messageId);
+    if (!found) return apiError(404, { error: "Thread not found." });
+    const gmail = await gmailClient(accountId);
+    // Original attachments to leave out, by part id (default: forward them all).
+    const excluded = new Set(Array.isArray(body.excludeAttachments) ? body.excludeAttachments.filter((id): id is string => typeof id === "string") : []);
+    const original: OutgoingFile[] = [];
+    for (const attachment of found.detail.attachments) {
+      if (excluded.has(attachment.partId)) continue;
+      const loaded = await loadAttachment(found.db, gmail, found.source.id, attachment.partId);
+      if (loaded) original.push({ filename: loaded.attachment.filename, mimeType: loaded.attachment.mimeType, data: loaded.data, contentId: loaded.attachment.contentId });
+    }
+    if ([...original, ...added].reduce((total, file) => total + file.data.byteLength, 0) > MAX_ATTACHMENT_BYTES) {
+      return apiError(400, { error: `Attachments may total at most ${MAX_ATTACHMENT_BYTES / 1024 / 1024} MB; leave some out.` });
+    }
+    const headers = await Effect.runPromise(found.db.getMessageHeaders(found.source.id)) ?? {};
+    const messageIdHeader = headers["message-id"] ?? null;
+    const sent = await Effect.runPromise(composerFor(found.db, gmail).send({
+      to, cc, bcc,
+      subject: body.subject,
+      text: body.body,
+      fromAlias: body.fromAlias,
+      threadId,
+      inReplyTo: messageIdHeader,
+      references: [headers.references, messageIdHeader].filter(Boolean).join(" ") || null,
+      forward: {
+        from: found.source.fromAddress,
+        dateTs: found.source.dateTs,
+        subject: found.source.subject,
+        to: found.source.toAddresses,
+        cc: found.source.ccAddresses,
+        text: found.source.bodyMarkdown,
+        html: found.detail.bodyHtml,
+      },
+      attachments: [...original, ...added],
     }));
     config.onReplySent?.(accountId);
     return json({ sent });
@@ -481,9 +784,19 @@ export const createApiHandler = (config: ApiConfig): ApiHandler => {
 
     if (request.method === "GET" && rest === "/events") return accountEventStream(config.events, accountId, request.signal);
     if (request.method === "GET" && rest === "/threads") return listThreads(accountId, url);
+    if (request.method === "POST" && rest === "/threads/bulk") return applyBulkAction(accountId, request);
     if (request.method === "GET" && rest === "/labels") {
       return json({ labels: await Effect.runPromise((await accountDb(accountId)).listLabels()) });
     }
+    if (request.method === "POST" && rest === "/labels") return manageLabel(accountId, request, null);
+    const labelMatch = /^\/labels\/([^/]+)$/.exec(rest);
+    if (labelMatch && (request.method === "PATCH" || request.method === "DELETE")) {
+      return manageLabel(accountId, request, decodeURIComponent(labelMatch[1]!));
+    }
+    if (request.method === "GET" && rest === "/aliases") {
+      return json({ aliases: aliasDetails(await Effect.runPromise((await accountDb(accountId)).listSendAsAliases())) });
+    }
+    if (request.method === "POST" && rest === "/aliases/refresh") return refreshAliases(accountId);
     if (request.method === "GET" && rest === "/views") return json({ views: await listViews(await accountDb(accountId)) });
     if (request.method === "POST" && rest === "/views") return createView(accountId, request);
     if (request.method === "PUT" && rest === "/views/order") return reorderViews(accountId, request);
@@ -499,6 +812,10 @@ export const createApiHandler = (config: ApiConfig): ApiHandler => {
       }
     }
 
+    const attachmentMatch = /^\/messages\/([^/]+)\/attachments\/([^/]+)$/.exec(rest);
+    if (attachmentMatch && request.method === "GET") {
+      return downloadAttachment(accountId, decodeURIComponent(attachmentMatch[1]!), decodeURIComponent(attachmentMatch[2]!), url);
+    }
     if (request.method === "GET" && rest === "/compose") return newMessageDraft(accountId);
     if (request.method === "POST" && rest === "/messages") return sendMessage(accountId, request);
     if (request.method === "GET" && rest === "/rules") {
@@ -512,6 +829,12 @@ export const createApiHandler = (config: ApiConfig): ApiHandler => {
       const threadId = decodeURIComponent(replyMatch[1]!);
       if (request.method === "GET") return replyDraft(accountId, threadId);
       if (request.method === "POST") return sendReply(accountId, threadId, request);
+    }
+    const forwardMatch = /^\/threads\/([^/]+)\/forward$/.exec(rest);
+    if (forwardMatch) {
+      const threadId = decodeURIComponent(forwardMatch[1]!);
+      if (request.method === "GET") return forwardDraft(accountId, threadId);
+      if (request.method === "POST") return sendForward(accountId, threadId, request);
     }
     const ghostMatch = /^\/threads\/([^/]+)\/ghost$/.exec(rest);
     if (ghostMatch && request.method === "POST") return decideGhostLabels(accountId, decodeURIComponent(ghostMatch[1]!), request);

@@ -4,6 +4,11 @@ import {
   type AccountSummary,
   type AiAuditSummary,
   type AiRunSummary,
+  type BulkThreadRequest,
+  type BulkThreadResult,
+  type SendAsAliasDetail,
+  type ForwardDraft,
+  type SendForwardRequest,
   type LlmEndpointSummary,
   type NewMessageDraft,
   type ReplyDraft,
@@ -79,6 +84,20 @@ export const api = {
   threadAction: (accountId: string, threadId: string, action: ThreadAction) =>
     request<{ thread: ThreadSummary }>(accountPath(accountId, `/threads/${encodeURIComponent(threadId)}/actions`), { method: "POST", body: action })
       .then((body) => body.thread),
+  bulkThreadAction: (accountId: string, bulk: BulkThreadRequest) =>
+    request<BulkThreadResult>(accountPath(accountId, "/threads/bulk"), { method: "POST", body: bulk }),
+  createLabel: (accountId: string, name: string) =>
+    request<{ label: LabelSummary }>(accountPath(accountId, "/labels"), { method: "POST", body: { name } }).then((body) => body.label),
+  renameLabel: (accountId: string, labelId: string, name: string) =>
+    request<{ labels: ReadonlyArray<LabelSummary> }>(accountPath(accountId, `/labels/${encodeURIComponent(labelId)}`), { method: "PATCH", body: { name } })
+      .then((body) => body.labels),
+  deleteLabel: (accountId: string, labelId: string) =>
+    request<unknown>(accountPath(accountId, `/labels/${encodeURIComponent(labelId)}`), { method: "DELETE" }),
+  aliases: (accountId: string) =>
+    request<{ aliases: ReadonlyArray<SendAsAliasDetail> }>(accountPath(accountId, "/aliases")).then((body) => body.aliases),
+  refreshAliases: (accountId: string) =>
+    request<{ aliases: ReadonlyArray<SendAsAliasDetail> }>(accountPath(accountId, "/aliases/refresh"), { method: "POST", body: {} })
+      .then((body) => body.aliases),
   syncStatus: (accountId: string) =>
     request<{ job: { readonly status: SyncJobStatus; readonly error?: string } | null }>(`/api/accounts/${encodeURIComponent(accountId)}/sync`)
       .then((body) => body.job),
@@ -98,6 +117,11 @@ export const api = {
     request<{ draft: ReplyDraft }>(accountPath(accountId, `/threads/${encodeURIComponent(threadId)}/reply`)).then((body) => body.draft),
   sendReply: (accountId: string, threadId: string, reply: SendReplyRequest) =>
     request<{ sent: { id: string; threadId: string } }>(accountPath(accountId, `/threads/${encodeURIComponent(threadId)}/reply`), { method: "POST", body: reply })
+      .then((body) => body.sent),
+  forwardDraft: (accountId: string, threadId: string) =>
+    request<{ draft: ForwardDraft }>(accountPath(accountId, `/threads/${encodeURIComponent(threadId)}/forward`)).then((body) => body.draft),
+  sendForward: (accountId: string, threadId: string, forward: SendForwardRequest) =>
+    request<{ sent: { id: string; threadId: string } }>(accountPath(accountId, `/threads/${encodeURIComponent(threadId)}/forward`), { method: "POST", body: forward })
       .then((body) => body.sent),
   newMessageDraft: (accountId: string) =>
     request<{ draft: NewMessageDraft }>(accountPath(accountId, "/compose")).then((body) => body.draft),

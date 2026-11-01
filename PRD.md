@@ -71,7 +71,7 @@ Incoming emails are ingested in real time via outbound Google Cloud Pub/Sub stre
 - **FR-GMAIL-01 (Zero-Funnel Outbound Pub/Sub):**
   - Uses `gmail.users.watch` to publish notifications to a private GCP Pub/Sub topic.
   - The Bun daemon initiates an **outbound** connection to GCP Pub/Sub (`StreamingPull`). No ports are exposed to the public internet, and Tailscale Funnel is not required.
-  - Automatic fallback: A 60-second spaced polling fiber runs `users.history.list` as a safety net if the Pub/Sub stream reconnects.
+  - Catch-up safety net: at startup and every 10 minutes, every account that has synced before runs an incremental `users.history.list` sync (one request per account when nothing changed). It recovers mail whose notification was lost to a lapsed watch, downtime or a dropped delivery, and keeps mail flowing when Pub/Sub is not configured.
 - **FR-GMAIL-02 (Incremental History & MIME Parsing):**
   - Reconciles `messagesAdded`, `messagesDeleted`, `labelsAdded`, and `labelsRemoved` from `history.list`.
   - Parses MIME structures into sanitized HTML (for Shadow DOM rendering) and clean Markdown (for LLM token efficiency).
@@ -90,6 +90,15 @@ Incoming emails are ingested in real time via outbound Google Cloud Pub/Sub stre
   - **In-Memory Predicate:** Evaluates `FilterExpr` directly against a hydrated `Thread` object in memory before deciding whether to invoke an LLM rule.
 - **FR-FILTER-03 (Synchronized Visual & Text DSL Builder):**
   - Users can either type the query in a text bar with syntax highlighting/autocomplete OR build nested groups visually (`[+ Add Condition]`, `[+ Add AND/OR Group]`). Both views read/write the exact same `FilterExpr` AST.
+- **FR-FILTER-04 (Full-Text Search):** _(planned, Phase 6)_
+  - **Syntax:** bare words and quoted phrases in the DSL are search terms, combinable with every other condition: `invoice AND from:"acme" AND NOT label:Paid`, `"quarterly report" OR budget`. `text:"…"` is the explicit form (and what the formatter writes back). A new `FilterExpr` node, `{ _tag: "Text", value }`, carries them; the visual builder offers it as a "Text contains" condition.
+  - **Scope:** a thread matches when any of its messages matches, across subject, sender and body (`messages_fts`, which sync already maintains). Attachment file names are included; attachment contents are not.
+  - **Matching rule (one definition, both targets):** the value is split into tokens with FTS5's `unicode61` rules (case- and diacritic-insensitive, split on non-alphanumerics). Every token must be the **prefix of a word** in the thread's text, in any order; a quoted phrase additionally requires its tokens consecutively. Prefix matching lets Korean words match with particles attached (`보고서` matches `보고서를`).
+  - **SQLite compiler:** `threads.id IN (SELECT thread_id FROM messages_fts WHERE messages_fts MATCH ?)`, with each token bound as a quoted prefix query (`"invoi"*`), never interpolated.
+  - **In-memory evaluator:** AI rule pre-conditions evaluate the same rule against the thread's message text, tokenized identically (`FilterThread` gains the thread's text, loaded only when a pre-condition contains a `Text` node).
+  - **Equivalence law:** the AGENTS.md §3.3 matrix gains `Text` expressions (single words, prefixes, phrases, Hangul, accented and mixed-case text, `NOT` and nested combinations); `evaluateInMemory(E, T) ≡ querySqliteWithCompiledAst(E, T)` must keep holding for all of them.
+  - **Cost:** the index is already written on every sync. A query is a local FTS5 lookup (milliseconds at tens of thousands of messages) and makes no Gmail calls. Search covers mail synced locally, not the whole Gmail mailbox; older mail is reached by raising the initial import size.
+  - **UI:** typing plain words in the filter bar searches the current view; `/` focuses it; "Save as Split View" saves searches like any other filter.
 
 ### 3.4 Dual-Endpoint OpenAI-Compatible Auto-Labeller (`FR-LLM`)
 
@@ -122,6 +131,17 @@ Incoming emails are ingested in real time via outbound Google Cloud Pub/Sub stre
 - **FR-UI-03 (Tailscale Service Integration):**
   - Server binds to `127.0.0.1:3838` and is exposed to the private Tailnet via `tailscale serve --bg 3838`.
   - Reads `Tailscale-User-Login` / `Tailscale-User-Name` headers injected by `tailscale serve` for zero-password authentication across trusted Tailnet devices.
+
+### 3.6 Everyday Mail Handling (`FR-MAIL`)
+
+- **FR-MAIL-01 (Attachments):**
+  - Sync records each message's attachments (`messages.attachments_json`: part id, file name, MIME type, size, Content-ID, inline flag, Gmail attachment id); messages stored before this are filled in when their thread is first opened.
+  - The reader lists attachments as download chips and shows `cid:` inline images. Downloads go through `GET /api/a/:accountId/messages/:messageId/attachments/:partId`, scoped to the account's silo, always as `Content-Disposition: attachment` with `nosniff` and a sandbox CSP; only raster images may be served inline.
+  - Replies, new messages and forwards accept attachments (file picker or drag and drop), up to Gmail's 25 MB per message. Messages with attachments are `multipart/mixed` and are sent through Gmail's upload endpoint (`uploadType=multipart`).
+- **FR-MAIL-02 (Forward):** forwards a thread's newest message in the same Gmail conversation with Gmail's "Forwarded message" header, the original HTML, and the original attachments (each can be left out; inline images keep their Content-ID).
+- **FR-MAIL-03 (Trash & Spam):** thread actions that add `TRASH` / `SPAM` (and leave the inbox), with restore; built-in Trash and Spam views listed after split views, without digit keys.
+- **FR-MAIL-04 (Bulk Actions):** threads are checked with `Space`, shift-click ranges, `*` (all loaded) and `X` (clear); while any are checked, every thread action applies to all of them through `POST /threads/bulk`, which calls `messages.batchModify` (1,000 messages per request) for only the messages the action changes. "Mark all as read" (`U`) covers the whole current view and query, not just the loaded page.
+- **FR-MAIL-05 (Labels & Aliases):** labels can be created, renamed (renames follow into saved views and AI rules) and deleted from the palette; the "Send As aliases" page lists every alias with its verification status, starts a message from one, and refreshes them from Gmail.
 
 ---
 
@@ -188,7 +208,8 @@ CREATE TABLE threads (
     labels_json TEXT NOT NULL,           -- JSON array of label names: ["Label A", "AI/Urgent"]
     ghost_labels_json TEXT NOT NULL DEFAULT '[]', -- Pending dry-run AI suggestions
     ai_status TEXT NOT NULL DEFAULT 'pending',    -- 'pending' | 'processed' | 'skipped' | 'error'
-    ai_evaluated_through INTEGER                  -- date_ts of the newest message the AI has classified
+    ai_evaluated_through INTEGER,                 -- date_ts of the newest message the AI has classified
+    otp_code TEXT                                 -- One-time code found in the newest message
 );
 
 CREATE TABLE messages (
@@ -202,7 +223,9 @@ CREATE TABLE messages (
     body_markdown TEXT NOT NULL,
     body_html_sanitized TEXT NOT NULL,
     raw_headers_json TEXT NOT NULL,
-    labels_json TEXT NOT NULL DEFAULT '[]' -- This message's labels; threads.labels_json is their union (Gmail semantics)
+    labels_json TEXT NOT NULL DEFAULT '[]', -- This message's labels; threads.labels_json is their union (Gmail semantics)
+    body_html TEXT,                      -- Original HTML (sanitized by the client); NULL for plain text
+    attachments_json TEXT                -- Attachment metadata (FR-MAIL-01); NULL = not yet recorded
 );
 
 CREATE VIRTUAL TABLE messages_fts USING fts5(
@@ -287,3 +310,24 @@ CREATE TABLE ai_audit_logs (
 - **🛑 HARD CHECKPOINT 4:**
   - Run full `bun test` suite across Phases 1–4.
   - Expose via `tailscale serve --bg 3838` and perform end-to-end manual acceptance across Personal and Work accounts.
+
+### Phase 5: Everyday Mail Handling & Keyboard Coverage _(implemented)_
+
+- **Scope:**
+  - Catch-up `history.list` sync at startup and every 10 minutes (FR-GMAIL-01).
+  - Attachments in and out, Forward, Trash & Spam, bulk actions and "Mark all as read" (FR-MAIL).
+  - More palette commands and keys: Open/Close (`o`), first/last thread (`{` `}`), previous/next message (`[` `]`), check (`Space`), Forward (`F`), Trash (`#`), Spam (`!`), Jump to label (`L`), Open in Gmail (`O`), Copy link (`Y`), shortcut cheat sheet (`?`), label management and Send As aliases.
+  - Text inputs opt out of password-manager autofill, and `Cmd+K` is captured before extension listeners.
+- **🛑 HARD CHECKPOINT 5:**
+  - Run `bun test` (including `tests/phase5-mail-features.test.ts`) and `bun run typecheck`.
+  - Manually: open a thread with attachments and inline images, forward it with one attachment left out, trash and restore a thread, check several threads and archive them, and run "Mark all as read" on a view.
+
+### Phase 6: Full-Text Search _(planned)_
+
+- **Scope:**
+  - `Text` node in `FilterExpr` (bare words, quoted phrases, `text:"…"`) in the shared parser, formatter and visual builder (FR-FILTER-04).
+  - SQLite compilation to `messages_fts MATCH` with bound prefix queries; in-memory evaluation with the identical tokenizer for AI rule pre-conditions.
+  - Attachment file names added to `messages_fts`.
+- **🛑 HARD CHECKPOINT 6:**
+  - Run `bun test` with the AST equivalence matrix extended to `Text` expressions (AGENTS.md §3.3), and `bun run typecheck`.
+  - Manually: search a word, a prefix, a quoted phrase and a Korean word with a particle in the filter bar; combine a search with `label:` and `NOT`; save one as a split view.

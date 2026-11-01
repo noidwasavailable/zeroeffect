@@ -14,6 +14,7 @@ import {
   type BuilderNode,
   type ConditionField,
 } from "../filterBuilderModel";
+import { noAutofill } from "../noAutofill";
 import { toolbarButtonClass } from "./ActionToolbar";
 
 const FIELDS: ReadonlyArray<{ readonly value: ConditionField; readonly label: string }> = [
@@ -100,6 +101,7 @@ export function FilterTreeEditor({ dsl, labelNames, onDslChange, onCompleteChang
             </select>
           ) : (
             <input
+              {...noAutofill}
               aria-label="Value"
               aria-invalid={invalid}
               list={node.field === "label" ? datalistId : undefined}

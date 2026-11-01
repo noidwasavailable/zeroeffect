@@ -1,3 +1,4 @@
+import { unusedGmailExtras } from "./helpers/TestLayers";
 import { afterAll, beforeEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { Effect, Layer } from "effect";
@@ -96,6 +97,7 @@ const makeEnvironment = async (rulesFile: Partial<AiRulesFile> = {}, apiMode: "r
   const createdLabels: string[] = [];
   const unused = () => Effect.die("unused in this test");
   const gmail: GmailClientService = {
+    ...unusedGmailExtras,
     getProfile: unused, listMessages: unused, getMessage: unused, listThreads: unused, getThread: unused,
     listHistory: unused, listSendAs: unused, watch: unused, sendRaw: unused, modifyMessage: unused, listLabels: unused,
     createLabel: (name) => Effect.sync(() => {

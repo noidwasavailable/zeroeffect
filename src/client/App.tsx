@@ -2,6 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } fro
 import {
   isAccountId,
   type AccountEvent,
+  type LabelSummary as LabelRecordSummary,
+  type SendAsAliasDetail,
   type AiAuditSummary,
   type AccountSummary,
   type LabelSummary,
@@ -15,16 +17,17 @@ import { formatFilterExpr } from "../shared/filterDsl";
 import { parseFilterDsl } from "../shared/filterParser";
 import { copyableOtp, otpLabelNames } from "../shared/otp";
 import { copyText } from "./clipboard";
-import { allMessagesExpanded, initialFold, toggleAllMessages, type MessageFold } from "./threadFolding";
+import { allMessagesExpanded, initialFold, revealMessage, toggleAllMessages, type MessageFold } from "./threadFolding";
 import { applyThreadAction } from "../shared/threadActions";
 import { BUILT_IN_VIEWS } from "../shared/views";
-import { buildActions } from "./actions";
+import { buildActions, type AppAction as AppActionType } from "./actions";
 import { api, ApiRequestError } from "./api";
 import { AccountSwitcher } from "./components/AccountSwitcher";
 import { ActionToolbar, toolbarButtonClass } from "./components/ActionToolbar";
 import { AiAuditDrawer } from "./components/AiAuditDrawer";
 import { Keycap } from "./components/Keycap";
-import { canSendNewMessage, emptyNewMessage, NewMessageDialog, type NewMessageState } from "./components/NewMessageDialog";
+import { canSendNewMessage, emptyNewMessage, forwardMessage, NewMessageDialog, type NewMessageState } from "./components/NewMessageDialog";
+import { outgoingAttachments } from "./components/AttachmentField";
 import { ReplyComposer, splitAddressList, type ComposerState } from "./components/ReplyComposer";
 import { RulesPanel } from "./components/RulesPanel";
 import { CommandPalette, type PalettePage } from "./components/CommandPalette";
@@ -36,7 +39,8 @@ import { ThreadReader } from "./components/ThreadReader";
 import { ViewSidebar } from "./components/ViewSidebar";
 import { useAccountEvents } from "./hooks/useAccountEvents";
 import { useVimShortcuts } from "./hooks/useVimShortcuts";
-import { useRoute, type Route } from "./router";
+import { routePath, useRoute, type Route } from "./router";
+import { ShortcutHelp } from "./components/ShortcutHelp";
 
 const PAGE_SIZE = 50;
 const MAX_REFRESH_SIZE = 200;
@@ -51,6 +55,29 @@ const combinedDsl = (viewDsl: string, query: string): string => {
   if (!view.ok) return query.trim();
   return formatFilterExpr({ _tag: "And", expressions: [view.expression, extra.expression] });
 };
+
+/** Shown above the list while threads are checked: the count and the selection actions. */
+function SelectionBar({ count, actions }: { readonly count: number; readonly actions: ReadonlyArray<AppActionType> }) {
+  const byId = new Map(actions.map((action) => [action.id, action]));
+  return (
+    <div role="status" className="sticky top-0 z-10 flex items-center gap-2 border-b border-zinc-200 bg-blue-50 px-4 py-1.5 text-sm dark:border-zinc-800 dark:bg-blue-950/40">
+      <span className="font-medium">{count} checked</span>
+      <span className="text-xs text-zinc-500">Thread actions apply to all of them.</span>
+      <span className="ml-auto flex gap-1.5">
+        {["selection.all", "selection.clear"].map((id) => {
+          const action = byId.get(id);
+          if (!action) return null;
+          return (
+            <button key={id} type="button" className={toolbarButtonClass} disabled={!action.enabled} onClick={action.run}>
+              {id === "selection.all" ? "Check all" : "Clear"}
+              {action.shortcut && <Keycap shortcut={action.shortcut} />}
+            </button>
+          );
+        })}
+      </span>
+    </div>
+  );
+}
 
 function FullPageMessage({ children }: { readonly children: ReactNode }) {
   return <main className="flex h-full items-center justify-center p-6 text-center text-sm text-zinc-600 dark:text-zinc-400">{children}</main>;
@@ -131,15 +158,31 @@ function Inbox({ accounts, route, navigate }: {
   const ruleSummaries = useMemo(() => (rulesFile?.rules ?? []).map(({ name, automate }) => ({ name, automate })), [rulesFile]);
   const otpLabels = useMemo(() => otpLabelNames(rulesFile?.rules ?? []), [rulesFile]);
   const searchRef = useRef<HTMLInputElement>(null);
+  // Threads checked for bulk actions (by id); cleared when the list's view or query changes.
+  const [checked, setChecked] = useState<ReadonlySet<string>>(new Set());
+  const lastChecked = useRef<number | null>(null);
+  const [helpOpen, setHelpOpen] = useState(false);
+  const [accountAliases, setAccountAliases] = useState<ReadonlyArray<SendAsAliasDetail> | null>(null);
+  useEffect(() => {
+    setChecked(new Set());
+    lastChecked.current = null;
+  }, [viewId, query]);
 
   const threadsRef = useRef(threads);
   threadsRef.current = threads;
   const labelCatalog = useMemo(() => new Map(labels.map((label) => [label.name, label])), [labels]);
   const view = views.find((candidate) => candidate.id === viewId);
+  const viewDsl = view?.dsl;
 
   const foundIndex = threads.findIndex((thread) => thread.id === selection.id);
   const selectedIndex = foundIndex >= 0 ? foundIndex : Math.min(selection.index, threads.length - 1);
   const selectedThread = threads[selectedIndex] ?? null;
+  const checkedThreads = useMemo(() => threads.filter((thread) => checked.has(thread.id)), [threads, checked]);
+  // Thread actions apply to the checked threads when there are any, else to the selected one.
+  const targets = useMemo(
+    () => checkedThreads.length > 0 ? checkedThreads : selectedThread ? [selectedThread] : [],
+    [checkedThreads, selectedThread],
+  );
 
   useEffect(() => {
     document.title = `${view?.name ?? "ZeroEffect"} · ${account.displayName} — ZeroEffect`;
@@ -200,7 +243,9 @@ function Inbox({ accounts, route, navigate }: {
     } finally {
       if (request === listRequest.current) setListLoading(false);
     }
-  }, [accountId, viewId, query]);
+    // The view's filter is a dependency so editing it (here, in another tab, or by a label rename)
+    // reloads the list.
+  }, [accountId, viewId, query, viewDsl]);
 
   useEffect(() => {
     void loadThreads("replace");
@@ -251,9 +296,121 @@ function Inbox({ accounts, route, navigate }: {
     }
   }, [selectedThread, accountId, openThreadId, closeThread, loadThreads]);
 
+  /** Runs an action on the checked threads in one bulk request, or on the selected thread. */
+  const runTargetsAction = useCallback(async (action: ThreadAction) => {
+    if (checkedThreads.length === 0) return runThreadAction(action);
+    const before = threadsRef.current;
+    const ids = new Set(checkedThreads.map((thread) => thread.id));
+    setThreads((previous) => previous.map((thread) => ids.has(thread.id) ? applyThreadAction(thread, action) : thread));
+    try {
+      const result = await api.bulkThreadAction(accountId, { action, threadIds: [...ids] });
+      setNotice({ text: `Updated ${result.threadsUpdated} ${result.threadsUpdated === 1 ? "conversation" : "conversations"}.`, tone: "info" });
+      // Threads that leave the view take their checks with them; label and flag changes keep them.
+      if (action.type !== "setLabels" && action.type !== "star" && action.type !== "unstar" && action.type !== "markRead" && action.type !== "markUnread") {
+        setChecked(new Set());
+      }
+      if (openThreadId && ids.has(openThreadId)) void loadDetail(openThreadId);
+    } catch (error) {
+      setThreads(before);
+      setNotice({ text: errorMessage(error), tone: "error" });
+    }
+    void loadThreads("refresh");
+  }, [checkedThreads, runThreadAction, accountId, openThreadId, loadDetail, loadThreads]);
+
+  const markAllRead = useCallback(async () => {
+    const scope = query ? `“${view?.name ?? viewId}” matching ${query}` : `“${view?.name ?? viewId}”`;
+    if (!confirm(`Mark every unread conversation in ${scope} as read?`)) return;
+    setThreads((previous) => previous.map((thread) => thread.isUnread ? applyThreadAction(thread, { type: "markRead" }) : thread));
+    try {
+      const result = await api.bulkThreadAction(accountId, { action: { type: "markRead" }, view: viewId, ...(query ? { q: query } : {}) });
+      setNotice({ text: result.threadsUpdated === 0 ? "Nothing was unread." : `Marked ${result.threadsUpdated} ${result.threadsUpdated === 1 ? "conversation" : "conversations"} as read.`, tone: "info" });
+    } catch (error) {
+      setNotice({ text: errorMessage(error), tone: "error" });
+    }
+    void loadThreads("refresh");
+  }, [query, view, viewId, accountId, loadThreads]);
+
+  const toggleChecked = useCallback((index: number, range = false) => {
+    const thread = threads[index];
+    if (!thread) return;
+    setChecked((previous) => {
+      const next = new Set(previous);
+      const check = !previous.has(thread.id);
+      // Shift-click checks (or unchecks) everything from the last toggled row.
+      const from = range && lastChecked.current !== null ? Math.min(lastChecked.current, index) : index;
+      const to = range && lastChecked.current !== null ? Math.max(lastChecked.current, index) : index;
+      for (const candidate of threads.slice(from, to + 1)) {
+        if (check) next.add(candidate.id);
+        else next.delete(candidate.id);
+      }
+      return next;
+    });
+    lastChecked.current = index;
+  }, [threads]);
+
+  const loadAccountAliases = useCallback((refresh: boolean) => {
+    setAccountAliases(null);
+    (refresh ? api.refreshAliases(accountId) : api.aliases(accountId)).then(
+      (aliases) => {
+        setAccountAliases(aliases);
+        if (refresh) setNotice({ text: `Loaded ${aliases.length} Send As ${aliases.length === 1 ? "alias" : "aliases"} from Gmail.`, tone: "info" });
+      },
+      (error) => {
+        setAccountAliases([]);
+        setNotice({ text: `Could not load aliases: ${errorMessage(error)}`, tone: "error" });
+      },
+    );
+  }, [accountId]);
+
+  const jumpToLabel = useCallback((label: string) => {
+    const dsl = formatFilterExpr({ _tag: "Label", value: label });
+    setSelection({ id: null, index: 0 });
+    setDraft(dsl);
+    setQuery(dsl);
+    setQueryError(null);
+    goTo({ viewId: "all", threadId: null });
+  }, [goTo]);
+
+  const createLabel = useCallback(async (name: string) => {
+    try {
+      await api.createLabel(accountId, name);
+      setNotice({ text: `Created label “${name}”.`, tone: "info" });
+      loadMeta();
+    } catch (error) {
+      setNotice({ text: errorMessage(error), tone: "error" });
+    }
+  }, [accountId, loadMeta]);
+
+  const renameLabel = useCallback(async (label: LabelRecordSummary) => {
+    const name = prompt(`Rename “${label.name}” to:`, label.name)?.trim();
+    if (!name || name === label.name) return;
+    try {
+      setLabels(await api.renameLabel(accountId, label.id, name));
+      setNotice({ text: `Renamed “${label.name}” to “${name}” (also in saved views and AI rules).`, tone: "info" });
+      void loadThreads("refresh");
+    } catch (error) {
+      setNotice({ text: errorMessage(error), tone: "error" });
+    }
+  }, [accountId, loadThreads]);
+
+  const deleteLabel = useCallback(async (label: LabelRecordSummary) => {
+    if (!confirm(`Delete the label “${label.name}”? Gmail removes it from every conversation; the conversations themselves stay.`)) return;
+    try {
+      await api.deleteLabel(accountId, label.id);
+      setNotice({ text: `Deleted label “${label.name}”.`, tone: "info" });
+      loadMeta();
+      void loadThreads("refresh");
+    } catch (error) {
+      setNotice({ text: errorMessage(error), tone: "error" });
+    }
+  }, [accountId, loadMeta, loadThreads]);
+
   // Which messages of the open conversation are folded (see threadFolding.ts).
   const [messageFold, setMessageFold] = useState<MessageFold | null>(null);
   const currentFold = detail ? (messageFold?.threadId === detail.id ? messageFold : initialFold(detail.id)) : null;
+  // The message [ and ] move between; it starts at the newest one.
+  const [messageCursor, setMessageCursor] = useState<{ readonly threadId: string; readonly index: number } | null>(null);
+  const cursorIndex = detail ? (messageCursor?.threadId === detail.id ? messageCursor.index : detail.messages.length - 1) : -1;
 
   // Copies an OTP-labelled thread's code (inside the user's click or key press, as clipboard
   // writes require) and then marks the thread read.
@@ -389,6 +546,7 @@ function Inbox({ accounts, route, navigate }: {
         subject: draft.subject,
         body: "",
         fromAlias: draft.fromAlias ?? draft.aliases[0]?.sendAsEmail ?? "",
+        attachments: [],
         sending: false,
         error: null,
       });
@@ -410,6 +568,7 @@ function Inbox({ accounts, route, navigate }: {
         subject: sending.subject,
         body: sending.body,
         fromAlias: sending.fromAlias,
+        attachments: outgoingAttachments(sending.attachments),
       });
       setComposer((current) => current?.threadId === sending.threadId ? null : current);
       setNotice({ text: `Reply sent as ${sending.fromAlias}.`, tone: "info" });
@@ -419,15 +578,16 @@ function Inbox({ accounts, route, navigate }: {
   }, [composer, accountId]);
 
   const discardReply = useCallback(() => {
-    if (composer?.body.trim() && !confirm("Discard this reply?")) return;
+    if ((composer?.body.trim() || composer?.attachments.length) && !confirm("Discard this reply?")) return;
     setComposer(null);
   }, [composer]);
 
   const [newMessage, setNewMessage] = useState<NewMessageState | null>(null);
-  const openNewMessage = useCallback(async () => {
+  const openNewMessage = useCallback(async (fromAlias?: string) => {
     if (newMessage) return;
     try {
-      setNewMessage(emptyNewMessage(await api.newMessageDraft(accountId)));
+      const message = emptyNewMessage(await api.newMessageDraft(accountId));
+      setNewMessage(fromAlias ? { ...message, fromAlias } : message);
     } catch (error) {
       setNotice({ text: `Could not start a message: ${errorMessage(error)}`, tone: "error" });
     }
@@ -438,23 +598,41 @@ function Inbox({ accounts, route, navigate }: {
     const sending = newMessage;
     setNewMessage({ ...sending, sending: true, error: null });
     try {
-      await api.sendMessage(accountId, {
+      const message = {
         to: splitAddressList(sending.to),
         cc: splitAddressList(sending.cc),
         bcc: splitAddressList(sending.bcc),
         subject: sending.subject,
         body: sending.body,
         fromAlias: sending.fromAlias,
-      });
+        attachments: outgoingAttachments(sending.attachments),
+      };
+      if (sending.forward) {
+        await api.sendForward(accountId, sending.forward.threadId, {
+          ...message, messageId: sending.forward.draft.messageId, excludeAttachments: sending.forward.excluded,
+        });
+      } else {
+        await api.sendMessage(accountId, message);
+      }
       setNewMessage(null);
-      setNotice({ text: "Message sent.", tone: "info" });
+      setNotice({ text: sending.forward ? "Forwarded." : "Message sent.", tone: "info" });
     } catch (error) {
       setNewMessage((current) => current ? { ...current, sending: false, error: errorMessage(error) } : current);
     }
   }, [newMessage, accountId]);
 
+  const openForward = useCallback(async () => {
+    const target = selectedThread;
+    if (newMessage || !target) return;
+    try {
+      setNewMessage(forwardMessage(target.id, await api.forwardDraft(accountId, target.id)));
+    } catch (error) {
+      setNotice({ text: `Could not start the forward: ${errorMessage(error)}`, tone: "error" });
+    }
+  }, [newMessage, selectedThread, accountId]);
+
   const discardNewMessage = useCallback(() => {
-    if (newMessage?.body.trim() && !confirm("Discard this message?")) return;
+    if ((newMessage?.body.trim() || newMessage?.attachments.length) && !confirm("Discard this message?")) return;
     setNewMessage(null);
   }, [newMessage]);
 
@@ -535,6 +713,55 @@ function Inbox({ accounts, route, navigate }: {
     views,
     viewId,
     selectedThread,
+    targets,
+    checkedCount: checkedThreads.length,
+    loadedCount: threads.length,
+    viewName: view?.name ?? "this view",
+    moveSelectionTo: (position) => {
+      const index = position === "first" ? 0 : threads.length - 1;
+      const thread = threads[index];
+      if (!thread) return;
+      setSelection({ id: thread.id, index });
+      if (openThreadId) goTo({ threadId: thread.id });
+    },
+    moveMessage: (delta) => {
+      if (!detail || !currentFold) return;
+      const index = Math.max(0, Math.min(detail.messages.length - 1, cursorIndex + delta));
+      setMessageFold(revealMessage(currentFold, detail.messages, index));
+      setMessageCursor({ threadId: detail.id, index });
+    },
+    toggleChecked: () => toggleChecked(selectedIndex),
+    checkAll: () => setChecked(new Set(threads.map((thread) => thread.id))),
+    clearChecked: () => setChecked(new Set()),
+    markAllRead: () => void markAllRead(),
+    openForward: () => void openForward(),
+    openInGmail: () => {
+      if (!selectedThread) return;
+      // Gmail's web URLs take the account's address and the (hex) thread id.
+      window.open(`https://mail.google.com/mail/u/${encodeURIComponent(account.email)}/#all/${encodeURIComponent(selectedThread.id)}`, "_blank", "noopener,noreferrer");
+    },
+    copyLink: () => {
+      if (!selectedThread) return;
+      copyText(`${location.origin}${routePath({ accountId, viewId, threadId: selectedThread.id })}`).then(
+        () => setNotice({ text: "Copied a link to this conversation.", tone: "info" }),
+        (error) => setNotice({ text: `Could not copy the link: ${errorMessage(error)}`, tone: "error" }),
+      );
+    },
+    openLabelJump: () => {
+      setPalettePage("labelJump");
+      setPaletteOpen(true);
+    },
+    openLabelManager: () => {
+      setPalettePage("labelManage");
+      setPaletteOpen(true);
+    },
+    openAliases: () => {
+      loadAccountAliases(false);
+      setPalettePage("accountAliases");
+      setPaletteOpen(true);
+    },
+    refreshAliases: () => loadAccountAliases(true),
+    toggleHelp: () => setHelpOpen((open) => !open),
     selectedOtpCode: selectedThread ? copyableOtp(selectedThread, otpLabels) : null,
     threadOpen: openThreadId !== null,
     canSelectNext: selectedIndex < threads.length - 1,
@@ -555,14 +782,15 @@ function Inbox({ accounts, route, navigate }: {
       if (openThreadId) goTo({ threadId: thread.id });
     },
     openSelectedThread: () => {
-      if (selectedThread) goTo({ threadId: selectedThread.id });
+      if (openThreadId) closeThread();
+      else if (selectedThread) goTo({ threadId: selectedThread.id });
     },
     closeThread,
     focusSearch: () => {
       searchRef.current?.focus();
       searchRef.current?.select();
     },
-    runThreadAction: (action) => void runThreadAction(action),
+    runThreadAction: (action) => void runTargetsAction(action),
     copyOtp: () => copyOtp(selectedThread),
     openMessageCount: openThreadId && detail?.id === openThreadId ? detail.messages.length : 0,
     allMessagesExpanded: detail !== null && currentFold !== null && allMessagesExpanded(currentFold, detail.messages),
@@ -629,22 +857,25 @@ function Inbox({ accounts, route, navigate }: {
     },
     sendReply: () => void sendReply(),
     discardReply,
-  }), [composerVisible, openComposer, sendReply, discardReply, accounts, accountId, views, view, viewId, savedViews, savedIndex, selectedThread, openThreadId, selectedIndex, threads, syncing, builderOpen, auditOpen, aiBusy, ruleSummaries, otpLabels, copyOtp, detail, currentFold, newMessage, openNewMessage, sendNewMessage, discardNewMessage, draft, query, goTo, closeThread, runThreadAction, navigate, sync, runAi, decideGhostLabels, undoAi, toggleRuleDryRun]);
+  }), [composerVisible, openComposer, sendReply, discardReply, accounts, account, accountId, views, view, viewId, savedViews, savedIndex, selectedThread, targets, checkedThreads, openThreadId, selectedIndex, threads, syncing, builderOpen, auditOpen, aiBusy, ruleSummaries, otpLabels, copyOtp, detail, currentFold, cursorIndex, newMessage, openNewMessage, openForward, sendNewMessage, discardNewMessage, draft, query, goTo, closeThread, runTargetsAction, markAllRead, toggleChecked, loadAccountAliases, navigate, sync, runAi, decideGhostLabels, undoAi, toggleRuleDryRun]);
 
-  useVimShortcuts(actions, !paletteOpen && viewDialog === null && rulesPanel === null && newMessage === null);
+  useVimShortcuts(actions, !paletteOpen && !helpOpen && viewDialog === null && rulesPanel === null && newMessage === null);
   const setupAction = actions.find((action) => action.id === "account.setup");
   const rulesAction = actions.find((action) => action.id === "ai.rules");
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
+      if ((event.metaKey || event.ctrlKey) && !event.altKey && !event.shiftKey && event.key.toLowerCase() === "k") {
+        // Capture phase plus stopImmediatePropagation: the palette gets Cmd+K before any extension's
+        // page listener (e.g. a password manager's own Cmd+K).
         event.preventDefault();
+        event.stopImmediatePropagation();
         setPalettePage("actions");
         setPaletteOpen((open) => !open);
       }
     };
-    addEventListener("keydown", onKeyDown);
-    return () => removeEventListener("keydown", onKeyDown);
+    addEventListener("keydown", onKeyDown, { capture: true });
+    return () => removeEventListener("keydown", onKeyDown, { capture: true });
   }, []);
 
   return (
@@ -680,6 +911,7 @@ function Inbox({ accounts, route, navigate }: {
       <div className="flex min-h-0 flex-1">
         <ViewSidebar views={views} activeViewId={viewId} actions={actions} />
         <div className={`min-h-0 overflow-y-auto ${openThreadId ? "hidden w-[26rem] shrink-0 border-r border-zinc-200 md:block dark:border-zinc-800" : "flex-1"}`}>
+          {checkedThreads.length > 0 && <SelectionBar count={checkedThreads.length} actions={actions} />}
           <ThreadList
             threads={threads}
             selectedIndex={selectedIndex}
@@ -688,6 +920,8 @@ function Inbox({ accounts, route, navigate }: {
             loading={listLoading}
             error={listError}
             hasMore={hasMore}
+            checked={checked}
+            onToggleChecked={toggleChecked}
             onSelect={(index) => setSelection({ id: threads[index]?.id ?? null, index })}
             onOpen={(index) => {
               const thread = threads[index];
@@ -706,7 +940,7 @@ function Inbox({ accounts, route, navigate }: {
         </div>
         {openThreadId && (
           <div className="min-h-0 flex-1 overflow-y-auto">
-            <ThreadReader thread={detail} loading={detailLoading} error={detailError} labelCatalog={labelCatalog} actions={actions} fold={currentFold} onFoldChange={setMessageFold} />
+            <ThreadReader accountId={accountId} cursorIndex={messageCursor?.threadId === detail?.id ? cursorIndex : -1} thread={detail} loading={detailLoading} error={detailError} labelCatalog={labelCatalog} actions={actions} fold={currentFold} onFoldChange={setMessageFold} />
             {composerVisible && composer && (
               <ReplyComposer
                 state={composer}
@@ -763,19 +997,27 @@ function Inbox({ accounts, route, navigate }: {
           onSaved={setRulesFile}
         />
       )}
+      {helpOpen && <ShortcutHelp actions={actions} onClose={() => setHelpOpen(false)} />}
       <CommandPalette
         open={paletteOpen}
         page={palettePage}
         actions={actions}
         labels={labels}
-        thread={selectedThread}
+        targets={targets}
+        accountAliases={accountAliases}
+        onJumpToLabel={jumpToLabel}
+        onCreateLabel={(name) => void createLabel(name)}
+        onRenameLabel={(label) => void renameLabel(label)}
+        onDeleteLabel={(label) => void deleteLabel(label)}
+        onComposeFromAlias={(sendAsEmail) => void openNewMessage(sendAsEmail)}
+        onRefreshAliases={() => loadAccountAliases(true)}
         onOpenChange={setPaletteOpen}
         onPageChange={setPalettePage}
         aliases={composer?.draft.aliases ?? []}
         currentAlias={composer?.fromAlias ?? null}
         onChooseAlias={(sendAsEmail) => setComposer((current) => current ? { ...current, fromAlias: sendAsEmail } : current)}
         onToggleLabel={(label, applied) => {
-          void runThreadAction({ type: "setLabels", add: applied ? [] : [label], remove: applied ? [label] : [] }).then(loadMeta);
+          void runTargetsAction({ type: "setLabels", add: applied ? [] : [label], remove: applied ? [label] : [] }).then(loadMeta);
         }}
       />
     </div>

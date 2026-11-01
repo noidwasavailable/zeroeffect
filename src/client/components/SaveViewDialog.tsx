@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { MAX_VIEW_NAME_LENGTH } from "../../shared/api";
 import { parseFilterDsl } from "../../shared/filterParser";
 import { toolbarButtonClass } from "./ActionToolbar";
+import { noAutofill } from "../noAutofill";
 import { FilterTreeEditor } from "./FilterBuilder";
 
 /**
@@ -61,7 +62,7 @@ export function SaveViewDialog({ title, submitLabel, initialName, initialDsl, la
         <h2 className="text-base font-semibold">{title}</h2>
         <label className="flex flex-col gap-1 text-sm">
           Name
-          <input ref={nameRef} value={name} maxLength={MAX_VIEW_NAME_LENGTH} onChange={(event) => setName(event.target.value)}
+          <input {...noAutofill} ref={nameRef} value={name} maxLength={MAX_VIEW_NAME_LENGTH} onChange={(event) => setName(event.target.value)}
             className="rounded border border-zinc-200 bg-transparent px-2 py-1.5 outline-none focus:border-zinc-400 dark:border-zinc-700" />
         </label>
         <fieldset className="flex flex-col gap-2 text-sm">

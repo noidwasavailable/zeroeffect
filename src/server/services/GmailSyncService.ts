@@ -6,7 +6,7 @@ import type { MessageRecord, ThreadRecord } from "./AccountDb";
 import { GmailClient } from "./GmailClient";
 import type { GmailMessage } from "./GmailClient";
 import { syncLabels } from "./GmailLabels";
-import { parseMimeBody } from "./MimeParser";
+import { collectAttachments, parseMimeBody } from "./MimeParser";
 import { isSendableAlias } from "./SendAsComposerService";
 
 export interface GmailSyncResult {
@@ -39,6 +39,8 @@ export interface GmailSyncOptions {
    * covered that change and this one returns immediately without calling Gmail.
    */
   readonly skipIfCursorAtLeast?: string;
+  /** Only run an incremental sync: an account that has never synced is skipped (catch-up polling). */
+  readonly incrementalOnly?: boolean;
 }
 
 export interface GmailSyncServiceApi {
@@ -118,6 +120,7 @@ export const GmailSyncServiceLive: Layer.Layer<GmailSyncService, never, AccountD
           bodyHtml: parsedBody.bodyHtml,
           rawHeaders: headers,
           labels,
+          attachments: collectAttachments(message.payload),
         };
         const threadRecord: ThreadRecord = {
           id: message.threadId,
@@ -193,7 +196,7 @@ export const GmailSyncServiceLive: Layer.Layer<GmailSyncService, never, AccountD
           throw new Error("Initial conversation limit must be a positive safe integer.");
         }
         const historyId = yield* accountDb.getHistoryId();
-        if (historyId && options.skipIfCursorAtLeast && isHistoryIdAtLeast(historyId, options.skipIfCursorAtLeast)) {
+        if ((!historyId && options.incrementalOnly) || (historyId && options.skipIfCursorAtLeast && isHistoryIdAtLeast(historyId, options.skipIfCursorAtLeast))) {
           return { mode: "incremental" as const, messagesUpserted: 0, messagesDeleted: 0, threadsWithNewMessages: [], skipped: true };
         }
         yield* Effect.logInfo(`Gmail sync started for ${accountDb.accountId}`);

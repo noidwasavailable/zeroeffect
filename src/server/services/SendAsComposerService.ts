@@ -22,13 +22,41 @@ export interface ComposeReplyInput {
   readonly references?: string | null;
   /** The message being answered, quoted below the reply as Gmail does. */
   readonly quote?: { readonly from: string; readonly dateTs: number; readonly text: string };
+  /** The message being forwarded, included below the text with Gmail's "Forwarded message" header. */
+  readonly forward?: ForwardedMessage;
+  readonly attachments?: ReadonlyArray<OutgoingFile>;
+}
+
+export interface ForwardedMessage {
+  readonly from: string;
+  readonly dateTs: number;
+  readonly subject: string;
+  readonly to: ReadonlyArray<string>;
+  readonly cc: ReadonlyArray<string>;
+  readonly text: string;
+  /** The original HTML, when it had any; the text is used otherwise. */
+  readonly html: string | null;
+}
+
+export interface OutgoingFile {
+  readonly filename: string;
+  readonly mimeType: string;
+  readonly data: Uint8Array;
+  /** Kept for forwarded inline images, so the forwarded HTML's `cid:` references still resolve. */
+  readonly contentId?: string | null;
 }
 
 export interface ComposedMessage {
   readonly from: string;
+  /** The RFC 2822 message, base64url-encoded for Gmail's `raw` field. */
   readonly raw: string;
+  /** The same message as bytes, for the upload endpoint. */
+  readonly mime: Uint8Array;
   readonly alias: SendAsAliasRecord;
 }
+
+/** Above this size (or with attachments) messages go through Gmail's upload endpoint rather than JSON `raw`. */
+const MAX_RAW_JSON_BYTES = 4 * 1024 * 1024;
 
 export interface SendAsComposerServiceApi {
   readonly compose: (input: ComposeReplyInput) => Effect.Effect<ComposedMessage, import("../../shared/errors").DatabaseError | SendAsComposeError>;
@@ -65,16 +93,31 @@ export const SendAsComposerServiceLive: Layer.Layer<SendAsComposerService, never
             ? `On ${new Date(input.quote.dateTs).toUTCString()}, ${input.quote.from} wrote:`
             : null;
           const ownText = [input.text.trim(), htmlToText(alias.signatureHtml ?? "")].filter(Boolean).join("\n\n");
+          const forwardHeaderLines = input.forward ? [
+            "---------- Forwarded message ---------",
+            `From: ${input.forward.from}`,
+            `Date: ${new Date(input.forward.dateTs).toUTCString()}`,
+            `Subject: ${input.forward.subject}`,
+            `To: ${input.forward.to.join(", ")}`,
+            ...(input.forward.cc.length > 0 ? [`Cc: ${input.forward.cc.join(", ")}`] : []),
+          ] : [];
           const bodyText = input.quote
             ? `${ownText}\n\n${quoteHeader}\n${input.quote.text.trim().split("\n").map((line) => `> ${line}`).join("\n")}`
-            : ownText;
+            : input.forward
+              ? `${ownText}${ownText ? "\n\n" : ""}${forwardHeaderLines.join("\n")}\n\n${input.forward.text.trim()}`
+              : ownText;
           const ownHtml = input.html
             ? appendSignature(input.html, alias.signatureHtml ?? "")
             : escapeHtml(ownText).replace(/\n/g, "<br>\n");
           const bodyHtml = input.quote
             ? `${ownHtml}<br><br><div>${escapeHtml(quoteHeader!)}</div><blockquote style="margin:0 0 0 .8ex;border-left:1px solid #ccc;padding-left:1ex">${escapeHtml(input.quote.text.trim()).replace(/\n/g, "<br>\n")}</blockquote>`
-            : ownHtml;
+            : input.forward
+              ? `${ownHtml}${ownText ? "<br><br>" : ""}<div>${forwardHeaderLines.map(escapeHtml).join("<br>\n")}</div><br>\n${
+                input.forward.html ? htmlBodyContent(input.forward.html) : escapeHtml(input.forward.text.trim()).replace(/\n/g, "<br>\n")}`
+              : ownHtml;
           const boundary = `zeroeffect_${crypto.randomUUID().replaceAll("-", "")}`;
+          const attachments = input.attachments ?? [];
+          const mixedBoundary = `zeroeffect_mixed_${crypto.randomUUID().replaceAll("-", "")}`;
           const headers = [
             `From: ${from}`,
             `To: ${to}`,
@@ -85,11 +128,11 @@ export const SendAsComposerServiceLive: Layer.Layer<SendAsComposerService, never
             ...(input.inReplyTo ? [`In-Reply-To: ${safeHeader(input.inReplyTo, "In-Reply-To")}`] : []),
             ...(input.references ? [`References: ${safeHeader(input.references, "References")}`] : []),
             "MIME-Version: 1.0",
-            `Content-Type: multipart/alternative; boundary="${boundary}"`,
+            attachments.length > 0
+              ? `Content-Type: multipart/mixed; boundary="${mixedBoundary}"`
+              : `Content-Type: multipart/alternative; boundary="${boundary}"`,
           ];
-          const raw = [
-            ...headers,
-            "",
+          const alternative = [
             `--${boundary}`,
             'Content-Type: text/plain; charset="UTF-8"',
             "Content-Transfer-Encoding: base64",
@@ -101,9 +144,17 @@ export const SendAsComposerServiceLive: Layer.Layer<SendAsComposerService, never
             "",
             Buffer.from(bodyHtml, "utf8").toString("base64").replace(/.{76}/g, "$&\r\n"),
             `--${boundary}--`,
+          ];
+          const body = attachments.length === 0 ? alternative : [
+            `--${mixedBoundary}`,
+            `Content-Type: multipart/alternative; boundary="${boundary}"`,
             "",
-          ].join("\r\n");
-          return { from, raw: Buffer.from(raw, "utf8").toString("base64url"), alias };
+            ...alternative,
+            ...attachments.flatMap((file) => attachmentPart(mixedBoundary, file)),
+            `--${mixedBoundary}--`,
+          ];
+          const mime = Buffer.from([...headers, "", ...body, ""].join("\r\n"), "utf8");
+          return { from, raw: mime.toString("base64url"), mime, alias };
         },
         catch: (cause) => new SendAsComposeError({ message: String(cause) }),
       });
@@ -111,7 +162,9 @@ export const SendAsComposerServiceLive: Layer.Layer<SendAsComposerService, never
 
     const send = (input: ComposeReplyInput) => Effect.gen(function* () {
       const message = yield* compose(input);
-      return yield* gmail.sendRaw(message.raw, input.threadId);
+      return (input.attachments?.length ?? 0) > 0 || message.mime.byteLength > MAX_RAW_JSON_BYTES
+        ? yield* gmail.sendMime(message.mime, input.threadId)
+        : yield* gmail.sendRaw(message.raw, input.threadId);
     });
     return { compose, send };
   }));
@@ -168,6 +221,26 @@ const htmlToText = (html: string): string => html
   .replace(/&lt;/gi, "<")
   .replace(/&gt;/gi, ">")
   .trim();
+
+/** One attachment of a multipart/mixed message (RFC 2183 / RFC 2231 file names). */
+const attachmentPart = (boundary: string, file: OutgoingFile): string[] => {
+  const filename = file.filename.replace(/[\r\n"\\]/g, "_").trim() || "attachment";
+  const mimeType = /^[\w.+-]+\/[\w.+-]+$/.test(file.mimeType) ? file.mimeType : "application/octet-stream";
+  const asciiName = /^[\x20-\x7e]*$/.test(filename);
+  const contentId = file.contentId?.replace(/[\r\n<>]/g, "");
+  return [
+    `--${boundary}`,
+    `Content-Type: ${mimeType}; name="${asciiName ? filename : encodeHeader(filename)}"`,
+    `Content-Disposition: ${contentId ? "inline" : "attachment"}; ${asciiName ? `filename="${filename}"` : `filename*=UTF-8''${encodeURIComponent(filename)}`}`,
+    "Content-Transfer-Encoding: base64",
+    ...(contentId ? [`Content-ID: <${contentId}>`] : []),
+    "",
+    Buffer.from(file.data).toString("base64").replace(/.{76}/g, "$&\r\n"),
+  ];
+};
+
+/** The inside of an HTML document's <body> (the whole input when it has none), for embedding. */
+const htmlBodyContent = (html: string): string => /<body\b[^>]*>([\s\S]*)<\/body\s*>/i.exec(html)?.[1] ?? html;
 
 const appendSignature = (html: string, signature: string): string =>
   `${html}${signature ? `<br><br>${signature}` : ""}`;

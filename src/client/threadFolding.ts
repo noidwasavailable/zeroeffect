@@ -77,3 +77,9 @@ export const foldLayout = (fold: MessageFold, messages: ReadonlyArray<ThreadMess
   }
   return items;
 };
+
+/** Expands one message (and reveals hidden runs), e.g. when moving to it with the keyboard. */
+export const revealMessage = (fold: MessageFold, messages: ReadonlyArray<ThreadMessage>, index: number): MessageFold => {
+  const revealed = { ...fold, revealed: true };
+  return isMessageExpanded(fold, messages, index) ? revealed : toggleMessage(revealed, messages, index);
+};

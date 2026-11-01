@@ -1,6 +1,8 @@
 import { useEffect, useRef, type Ref } from "react";
-import type { ReplyDraft } from "../../shared/api";
+import { MAX_ATTACHMENT_BYTES, type ReplyDraft } from "../../shared/api";
 import { toolbarButtonClass } from "./ActionToolbar";
+import { AttachmentField, fileDropHandlers, totalSize, type PickedFile } from "./AttachmentField";
+import { noAutofill } from "../noAutofill";
 import { Keycap } from "./Keycap";
 
 export interface ComposerState {
@@ -11,6 +13,7 @@ export interface ComposerState {
   readonly subject: string;
   readonly body: string;
   readonly fromAlias: string;
+  readonly attachments: ReadonlyArray<PickedFile>;
   readonly sending: boolean;
   readonly error: string | null;
 }
@@ -40,13 +43,15 @@ export function ReplyComposer({ state, onChange, onSend, onDiscard, aliasRef }: 
   useEffect(() => {
     bodyRef.current?.focus();
   }, [state.threadId]);
-  const canSend = !state.sending && Boolean(state.fromAlias) && splitAddressList(state.to).length > 0 && state.body.trim().length > 0;
+  const canSend = !state.sending && Boolean(state.fromAlias) && splitAddressList(state.to).length > 0 && state.body.trim().length > 0
+    && totalSize(state.attachments) <= MAX_ATTACHMENT_BYTES;
   const row = "flex items-center gap-2 border-b border-zinc-200 px-3 dark:border-zinc-800";
 
   return (
     <form
       aria-label="Reply"
       className="mx-4 mb-4 flex flex-col rounded-lg border border-zinc-300 shadow-sm dark:border-zinc-700"
+      {...fileDropHandlers(state.attachments, (attachments) => onChange({ attachments }))}
       onSubmit={(event) => {
         event.preventDefault();
         if (canSend) onSend();
@@ -75,11 +80,11 @@ export function ReplyComposer({ state, onChange, onSend, onDiscard, aliasRef }: 
       </label>
       <label className={row}>
         <span className="w-14 text-xs text-zinc-500">To</span>
-        <input className={fieldClass} value={state.to} onChange={(event) => onChange({ to: event.target.value })} />
+        <input {...noAutofill} className={fieldClass} value={state.to} onChange={(event) => onChange({ to: event.target.value })} />
       </label>
       <label className={row}>
         <span className="w-14 text-xs text-zinc-500">Cc</span>
-        <input className={fieldClass} value={state.cc} onChange={(event) => onChange({ cc: event.target.value })} />
+        <input {...noAutofill} className={fieldClass} value={state.cc} onChange={(event) => onChange({ cc: event.target.value })} />
         {state.draft.replyAllCc.length > 0 && !state.cc && (
           <button type="button" className="shrink-0 text-xs text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200" onClick={() => onChange({ cc: state.draft.replyAllCc.join(", ") })}>
             + everyone ({state.draft.replyAllCc.length})
@@ -88,8 +93,9 @@ export function ReplyComposer({ state, onChange, onSend, onDiscard, aliasRef }: 
       </label>
       <label className={row}>
         <span className="w-14 text-xs text-zinc-500">Subject</span>
-        <input className={fieldClass} value={state.subject} onChange={(event) => onChange({ subject: event.target.value })} />
+        <input {...noAutofill} className={fieldClass} value={state.subject} onChange={(event) => onChange({ subject: event.target.value })} />
       </label>
+      <AttachmentField files={state.attachments} onChange={(attachments) => onChange({ attachments })} />
       <textarea
         ref={bodyRef}
         aria-label="Message"

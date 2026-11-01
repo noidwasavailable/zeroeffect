@@ -1,4 +1,6 @@
 import { Database } from "bun:sqlite";
+import { Effect } from "effect";
+import type { GmailClientService } from "../../src/server/services/GmailClient";
 import { AccountDbTest } from "../../src/server/services/AccountDb";
 import { RegistryDbTest } from "../../src/server/services/RegistryDb";
 
@@ -18,4 +20,13 @@ export const makeTestLayers = () => {
       registryDatabase.close();
     },
   };
+};
+
+/** Gmail client methods most mock clients never call (bulk, attachments, uploads, label edits). */
+export const unusedGmailExtras: Pick<GmailClientService, "batchModify" | "getAttachment" | "sendMime" | "renameLabel" | "deleteLabel"> = {
+  batchModify: () => Effect.die("unused in this test"),
+  getAttachment: () => Effect.die("unused in this test"),
+  sendMime: () => Effect.die("unused in this test"),
+  renameLabel: () => Effect.die("unused in this test"),
+  deleteLabel: () => Effect.die("unused in this test"),
 };

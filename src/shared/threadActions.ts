@@ -9,6 +9,11 @@ export const threadActionLabels = (action: ThreadAction): { readonly add: Readon
     case "markUnread": return { add: ["UNREAD"], remove: [] };
     case "star": return { add: ["STARRED"], remove: [] };
     case "unstar": return { add: [], remove: ["STARRED"] };
+    // As in Gmail: trash and spam leave the inbox; restoring brings the thread back to it.
+    case "trash": return { add: ["TRASH"], remove: ["INBOX", "SPAM"] };
+    case "untrash": return { add: ["INBOX"], remove: ["TRASH"] };
+    case "spam": return { add: ["SPAM"], remove: ["INBOX", "TRASH"] };
+    case "notSpam": return { add: ["INBOX"], remove: ["SPAM"] };
     case "setLabels": return { add: action.add, remove: action.remove };
   }
 };

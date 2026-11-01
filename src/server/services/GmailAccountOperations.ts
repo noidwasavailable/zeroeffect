@@ -21,6 +21,8 @@ export interface GmailAccountSyncResult {
 export interface GmailAccountSyncOptions {
   /** Skip the sync when the account's stored history cursor has already reached this Pub/Sub historyId. */
   readonly skipIfCursorAtLeast?: string;
+  /** Skip accounts that have never synced (their first import is started from the setup page). */
+  readonly incrementalOnly?: boolean;
 }
 
 /** Send As aliases rarely change, so notification-driven syncs refresh them at most this often. */
@@ -45,6 +47,11 @@ export interface GmailAccountOperations {
   readonly ensureWatch: (accountId: GmailAccountId, topicName: string) => Promise<void>;
   readonly renewWatches: (topicName: string) => Promise<void>;
   readonly processNotification: (data: string) => Promise<"synced" | "ignored">;
+  /**
+   * Safety net for missed Pub/Sub notifications (lapsed watch, downtime, dropped delivery): an
+   * incremental sync of every connected account that has synced before. Failures are logged per account.
+   */
+  readonly catchUp: () => Promise<void>;
 }
 
 /** Centralizes account-scoped Gmail sync and watch operations for HTTP and background workers. */
@@ -73,7 +80,11 @@ export const createGmailAccountOperations = (config: GmailAccountOperationsConfi
   const startSync = (accountId: GmailAccountId, options: GmailAccountSyncOptions): Promise<GmailAccountSyncResult> => {
     const task = (async () => {
       const includeAliases = (Date.now() - (lastAliasSync.get(accountId) ?? 0)) >= ALIAS_REFRESH_INTERVAL_MS;
-      const syncOptions: GmailSyncOptions = { includeAliases, skipIfCursorAtLeast: options.skipIfCursorAtLeast };
+      const syncOptions: GmailSyncOptions = {
+        includeAliases,
+        skipIfCursorAtLeast: options.skipIfCursorAtLeast,
+        ...(options.incrementalOnly ? { incrementalOnly: true } : {}),
+      };
       const { accessToken } = await getUsableAccessToken(accountId);
       let result: GmailAccountSyncResult;
       try {
@@ -175,7 +186,19 @@ export const createGmailAccountOperations = (config: GmailAccountOperationsConfi
     return result.skipped ? "ignored" : "synced";
   };
 
-  return { sync, ensureWatch, renewWatches, processNotification };
+  const catchUp = async (): Promise<void> => {
+    const accounts = await Effect.runPromise(config.registry.listAccounts());
+    for (const account of accounts) {
+      if (account.id !== "personal" && account.id !== "work") continue;
+      try {
+        await sync(account.id, { incrementalOnly: true });
+      } catch (error) {
+        console.error(`Catch-up sync failed for ${account.id}; retrying on the next cycle.`, error);
+      }
+    }
+  };
+
+  return { sync, ensureWatch, renewWatches, processNotification, catchUp };
 };
 
 const isUnauthorized = (error: unknown): boolean =>

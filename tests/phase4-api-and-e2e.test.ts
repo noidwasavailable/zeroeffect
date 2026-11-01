@@ -30,7 +30,7 @@ import { parseFilterDsl } from "../src/shared/filterParser";
 import { copyableOtp, extractOtpCode, otpLabelNames } from "../src/shared/otp";
 import type { FilterExpr } from "../src/shared/schemas";
 import { applyThreadAction } from "../src/shared/threadActions";
-import { BUILT_IN_VIEWS } from "../src/shared/views";
+import { BUILT_IN_VIEWS, orderViews } from "../src/shared/views";
 
 const booleanFilter = Effect.runSync(Effect.gen(function* () { return yield* BooleanFilter; }).pipe(Effect.provide(BooleanFilterLive)));
 const parse = (dsl: string): FilterExpr => Effect.runSync(booleanFilter.parse(dsl));
@@ -213,7 +213,7 @@ describe("Phase 4: one-time codes", () => {
 describe("Phase 4: reading a conversation from its latest reply", () => {
   const message = (id: string, isUnread = false): ThreadMessage => ({
     id, fromAddress: `${id}@example.com`, toAddresses: [], ccAddresses: [], deliveredTo: null, dateTs: 1,
-    bodyMarkdown: id, bodyHtmlSanitized: "", bodyHtml: null, isUnread,
+    bodyMarkdown: id, bodyHtmlSanitized: "", bodyHtml: null, isUnread, attachments: [],
   });
   const shown = (items: ReadonlyArray<FoldItem>) =>
     items.map((item) => item.kind === "hidden" ? `+${item.count}` : `${item.index}${item.expanded ? "*" : ""}`);
@@ -264,6 +264,24 @@ describe("Phase 4: one action registry drives the palette, toolbar and Vim keys"
     views: BUILT_IN_VIEWS,
     viewId: "inbox",
     selectedThread: thread,
+    targets: [thread],
+    checkedCount: 0,
+    loadedCount: 3,
+    viewName: "Inbox",
+    moveSelectionTo: (position) => calls.push(`move-to:${position}`),
+    moveMessage: (delta) => calls.push(`message:${delta}`),
+    toggleChecked: () => calls.push("check"),
+    checkAll: () => calls.push("check-all"),
+    clearChecked: () => calls.push("clear-checked"),
+    markAllRead: () => calls.push("mark-all-read"),
+    openForward: () => calls.push("forward"),
+    openInGmail: () => calls.push("gmail"),
+    copyLink: () => calls.push("copy-link"),
+    openLabelJump: () => calls.push("label-jump"),
+    openLabelManager: () => calls.push("label-manage"),
+    openAliases: () => calls.push("aliases"),
+    refreshAliases: () => calls.push("refresh-aliases"),
+    toggleHelp: () => calls.push("help"),
     selectedOtpCode: null,
     threadOpen: true,
     canSelectNext: true,
@@ -319,8 +337,9 @@ describe("Phase 4: one action registry drives the palette, toolbar and Vim keys"
     // Only rare or destructive view management is palette + button only.
     expect(actions.filter((action) => !action.shortcut).map((action) => action.id).sort())
       .toEqual([
+        "account.aliases", "account.refreshAliases",
         "ai.createRule", "ai.dryRun.Newsletter", "compose.discardNew", "compose.sendNew", "composer.changeAlias", "composer.discard", "composer.send",
-        "views.delete", "views.edit", "views.moveDown", "views.moveUp",
+        "labels.manage", "views.delete", "views.edit", "views.go.spam", "views.go.trash", "views.moveDown", "views.moveUp",
       ]);
     const ids = new Set(actions.map((action) => action.id));
     for (const id of TOOLBAR_ACTION_IDS) expect(ids.has(id)).toBe(true);
@@ -712,7 +731,8 @@ describe("Phase 4: account-scoped HTTP API", () => {
 
     expect((await send("PUT", "/api/a/personal/views/order", { ids: [second.view.id] })).status).toBe(400);
     const reordered = await (await send("PUT", "/api/a/personal/views/order", { ids: [second.view.id, view.id] })).json() as { views: Array<{ id: string }> };
-    expect(reordered.views.map((entry) => entry.id).slice(-2)).toEqual([second.view.id, view.id]);
+    // Saved views sit between the primary built-ins and Trash / Spam.
+    expect(reordered.views.map((entry) => entry.id).slice(-4)).toEqual([second.view.id, view.id, "trash", "spam"]);
 
     // Saved views live in the account's own silo.
     const workViews = await (await env.call("/api/a/work/views")).json() as { views: Array<{ builtIn: boolean }> };
@@ -722,7 +742,7 @@ describe("Phase 4: account-scoped HTTP API", () => {
     expect((await send("DELETE", `/api/a/personal/views/${view.id}`)).status).toBe(200);
     expect((await send("DELETE", `/api/a/personal/views/${view.id}`)).status).toBe(404);
     const { views } = await (await env.call("/api/a/personal/views")).json() as { views: Array<{ id: string }> };
-    expect(views.map((entry) => entry.id)).toEqual([...BUILT_IN_VIEWS.map((entry) => entry.id), second.view.id]);
+    expect(views.map((entry) => entry.id)).toEqual(orderViews([{ id: second.view.id, name: "Needs reading", dsl: "is:unread", builtIn: false }]).map((entry) => entry.id));
     expect(events.filter((type) => type === "views-changed")).toHaveLength(5);
   });
 

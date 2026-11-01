@@ -1,5 +1,6 @@
 import type { Ref } from "react";
 import { parseFilterDsl } from "../../shared/filterParser";
+import { noAutofill } from "../noAutofill";
 import { Keycap } from "./Keycap";
 
 /** Boolean DSL query applied on top of the current view (Enter applies, Esc leaves the field). */
@@ -25,6 +26,7 @@ export function FilterBar({ draft, appliedError, onDraftChange, onApply, ref }: 
     >
       <div className="flex items-center gap-2 rounded-md border border-zinc-200 px-2 focus-within:border-zinc-400 dark:border-zinc-800 dark:focus-within:border-zinc-600">
         <input
+          {...noAutofill}
           ref={ref}
           value={draft}
           onChange={(event) => onDraftChange(event.target.value)}

@@ -1,3 +1,4 @@
+import { unusedGmailExtras } from "./helpers/TestLayers";
 import { afterAll, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { Effect, Layer } from "effect";
@@ -81,6 +82,7 @@ describe("Phase 2: Gmail sync, aliases and Pub/Sub", () => {
     const messages = new Map([["m1", mockMessage("m1")], ["m2", mockMessage("m2")]]);
     let historyCalls = 0;
     const gmail: GmailClientService = {
+    ...unusedGmailExtras,
       getProfile: () => Effect.succeed({ emailAddress: "personal@example.com", historyId: "h-2" }),
       listMessages: () => Effect.succeed({ messages: [{ id: "m1", threadId: "thread-m1" }] }),
       getMessage: (id) => Effect.succeed(messages.get(id)! ),
@@ -129,6 +131,7 @@ describe("Phase 2: Gmail sync, aliases and Pub/Sub", () => {
     const calls: string[] = [];
     const record = <A>(name: string, value: A) => Effect.sync(() => { calls.push(name); return value; });
     const gmail: GmailClientService = {
+    ...unusedGmailExtras,
       getProfile: () => record("getProfile", { emailAddress: "me@example.com", historyId: "1000" }),
       listMessages: () => record("listMessages", { messages: [] }),
       getMessage: (id) => record("getMessage", mockMessage(id)),
@@ -169,6 +172,7 @@ describe("Phase 2: Gmail sync, aliases and Pub/Sub", () => {
       ["t3", [mockMessage("t3-a", "t3")]],
     ]);
     const gmail: GmailClientService = {
+    ...unusedGmailExtras,
       getProfile: () => Effect.succeed({ emailAddress: "me@example.com", historyId: "initial-history" }),
       listMessages: (pageToken) => {
         pages.push({ ...(pageToken === undefined ? {} : { pageToken }) });
@@ -235,6 +239,7 @@ describe("Phase 2: Gmail sync, aliases and Pub/Sub", () => {
 
     const requestedThreads: string[] = [];
     const gmail: GmailClientService = {
+    ...unusedGmailExtras,
       getProfile: () => Effect.succeed({ emailAddress: "me@example.com", historyId: "initial-history" }),
       listMessages: () => Effect.succeed({ messages: [
         { id: "latest-saved-newest-message", threadId: "latest-saved" },
@@ -294,6 +299,7 @@ describe("Phase 2: Gmail sync, aliases and Pub/Sub", () => {
   test("keeps each successfully hydrated conversation when a later thread request fails", async () => {
     const { layer: accountLayer, service: accountDb, database } = makeAccountDb();
     const gmail: GmailClientService = {
+    ...unusedGmailExtras,
       getProfile: () => Effect.succeed({ emailAddress: "me@example.com", historyId: "initial-history" }),
       listMessages: () => Effect.succeed({ messages: [{ id: "m1", threadId: "t1" }, { id: "m2", threadId: "t2" }] }),
       getMessage: () => Effect.fail({} as never),
@@ -349,6 +355,7 @@ describe("Phase 2: Gmail sync, aliases and Pub/Sub", () => {
     ]];
     let labelListCalls = 0;
     const gmail: GmailClientService = {
+    ...unusedGmailExtras,
       getProfile: () => Effect.succeed({ emailAddress: "me@example.com", historyId: "h-1" }),
       listMessages: () => Effect.succeed({ messages: [{ id: "m1", threadId: "thread-m1" }] }),
       getMessage: () => Effect.succeed(mockMessage("m2", "thread-m2", ["INBOX", "Label_2"])),
@@ -408,6 +415,7 @@ describe("Phase 2: Gmail sync, aliases and Pub/Sub", () => {
     }
     await Effect.runPromise(accountDb.setHistoryId("h-1"));
     const gmail: GmailClientService = {
+    ...unusedGmailExtras,
       getProfile: () => Effect.succeed({ emailAddress: "me@example.com", historyId: "h-2" }),
       listMessages: () => Effect.succeed({ messages: [] }),
       getMessage: (id) => id === "kept"
@@ -446,6 +454,7 @@ describe("Phase 2: Gmail sync, aliases and Pub/Sub", () => {
     const { layer: accountLayer, service: accountDb } = makeAccountDb();
     await Effect.runPromise(accountDb.setHistoryId("expired"));
     const gmail: GmailClientService = {
+    ...unusedGmailExtras,
       getProfile: () => Effect.succeed({ emailAddress: "me@example.com", historyId: "fresh" }),
       listMessages: () => Effect.succeed({ messages: [{ id: "recovered", threadId: "recovered-thread" }] }),
       getMessage: () => Effect.succeed(mockMessage("recovered")),
@@ -616,6 +625,7 @@ describe("Phase 2: Gmail sync, aliases and Pub/Sub", () => {
       { sendAsEmail: "alias@example.com", displayName: "Support", replyToAddress: "reply@example.com", signatureHtml: "<b>Team</b>", isPrimary: false, isDefault: false, verificationStatus: "accepted" },
     ]));
     const gmailLayer = Layer.succeed(GmailClient, {
+      ...unusedGmailExtras,
       getProfile: () => Effect.fail({} as never), listMessages: () => Effect.fail({} as never),
       getMessage: () => Effect.fail({} as never), listThreads: () => Effect.fail({} as never),
       getThread: () => Effect.fail({} as never), listHistory: () => Effect.fail({} as never),
