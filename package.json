@@ -5,7 +5,7 @@
 	"private": true,
 	"scripts": {
 		"dev": "bun run src/server/main.ts",
-		"test": "bun test",
+		"test": "bun test --only-failures",
 		"typecheck": "bun check",
 		"demo": "bun run scripts/ui-demo.ts"
 	},
