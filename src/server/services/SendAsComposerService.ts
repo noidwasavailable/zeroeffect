@@ -7,6 +7,8 @@ import { SendAsComposeError } from "../../shared/errors";
 export interface ComposeReplyInput {
   readonly to: ReadonlyArray<string>;
   readonly cc?: ReadonlyArray<string>;
+  /** Gmail delivers to Bcc recipients and strips the header from what others receive. */
+  readonly bcc?: ReadonlyArray<string>;
   readonly subject: string;
   readonly text: string;
   readonly html?: string;
@@ -57,6 +59,7 @@ export const SendAsComposerServiceLive: Layer.Layer<SendAsComposerService, never
           const from = formatAddress(alias.displayName, alias.sendAsEmail);
           const to = input.to.map((address) => safeHeader(address, "To address")).join(", ");
           const cc = input.cc?.map((address) => safeHeader(address, "Cc address")).join(", ");
+          const bcc = input.bcc?.map((address) => safeHeader(address, "Bcc address")).join(", ");
           const subject = encodeHeader(safeHeader(input.subject, "Subject"));
           const quoteHeader = input.quote
             ? `On ${new Date(input.quote.dateTs).toUTCString()}, ${input.quote.from} wrote:`
@@ -76,6 +79,7 @@ export const SendAsComposerServiceLive: Layer.Layer<SendAsComposerService, never
             `From: ${from}`,
             `To: ${to}`,
             ...(cc ? [`Cc: ${cc}`] : []),
+            ...(bcc ? [`Bcc: ${bcc}`] : []),
             ...(alias.replyToAddress ? [`Reply-To: ${safeHeader(alias.replyToAddress, "Reply-To")}`] : []),
             `Subject: ${subject}`,
             ...(input.inReplyTo ? [`In-Reply-To: ${safeHeader(input.inReplyTo, "In-Reply-To")}`] : []),

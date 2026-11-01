@@ -5,6 +5,7 @@ import { createGmailAccountOperations } from "../src/server/services/GmailAccoun
 import { RegistryDb, RegistryDbTest } from "../src/server/services/RegistryDb";
 import { OAuthTokenVault } from "../src/server/services/OAuthTokenVault";
 import type { GoogleOAuth2Api } from "../src/server/services/GoogleOAuth2";
+import { GmailApiError } from "../src/shared/errors";
 
 const database = new Database(":memory:");
 afterAll(() => database.close());
@@ -113,5 +114,70 @@ describe("Gmail account watch and notification operations", () => {
       { accountId: "work", accessToken: "work-token" },
       { accountId: "work", accessToken: "work-token" },
     ]);
+  });
+
+  test("passes the notification's historyId, refreshes Send As hourly and reports skipped syncs as ignored", async () => {
+    await putAccount("work", "work@example.com");
+    const options: Array<{ includeAliases?: boolean; skipIfCursorAtLeast?: string }> = [];
+    let synced = 0;
+    const operations = createGmailAccountOperations({
+      registry,
+      oauth,
+      vault,
+      onSynced: () => { synced++; },
+      syncAccount: async (_accountId, _accessToken, syncOptions) => {
+        options.push(syncOptions);
+        return { mode: "incremental", messagesUpserted: 0, messagesDeleted: 0, skipped: syncOptions.skipIfCursorAtLeast === "5" };
+      },
+    });
+    await expect(operations.processNotification(JSON.stringify({ emailAddress: "work@example.com", historyId: 7 }))).resolves.toBe("synced");
+    await expect(operations.processNotification(JSON.stringify({ emailAddress: "work@example.com", historyId: "5" }))).resolves.toBe("ignored");
+    await operations.sync("work");
+    expect(options).toEqual([
+      { includeAliases: true, skipIfCursorAtLeast: "7" },
+      { includeAliases: false, skipIfCursorAtLeast: "5" },
+      { includeAliases: false, skipIfCursorAtLeast: undefined },
+    ]);
+    expect(synced).toBe(2);
+  });
+
+  test("retries once with a refreshed token when Gmail rejects the current one", async () => {
+    await putAccount("personal", "personal@example.com");
+    const refreshes: string[] = [];
+    const operations = createGmailAccountOperations({
+      registry,
+      vault,
+      oauth: {
+        ...oauth,
+        refreshAccessToken: (accountId, refreshToken) => {
+          refreshes.push(refreshToken);
+          return Effect.succeed({ accountId, tokens: { accessToken: "fresh-token", expiresIn: 3600 } });
+        },
+      },
+      syncAccount: async (_accountId, accessToken) => {
+        if (accessToken !== "fresh-token") throw new GmailApiError({ message: "revoked", status: 401, retryable: false });
+        return { mode: "incremental", messagesUpserted: 1, messagesDeleted: 0 };
+      },
+    });
+    await expect(operations.sync("personal")).resolves.toMatchObject({ messagesUpserted: 1 });
+    expect(refreshes).toEqual(["personal-token-refresh"]);
+  });
+
+  test("explains an expired or revoked Google grant", async () => {
+    await putAccount("personal", "personal@example.com");
+    const operations = createGmailAccountOperations({
+      registry,
+      vault,
+      oauth: {
+        ...oauth,
+        refreshAccessToken: () => Effect.fail(new GmailApiError({
+          message: 'Google OAuth token request failed (400): {"error": "invalid_grant"}', status: 400, retryable: false,
+        })),
+      },
+      syncAccount: async () => { throw new GmailApiError({ message: "revoked", status: 401, retryable: false }); },
+    });
+    const error = await operations.sync("personal").catch((caught: unknown) => caught);
+    expect(error).toMatchObject({ status: 401, retryable: false, reason: "invalid_grant" });
+    expect(String((error as Error).message)).toContain("Reconnect it from /setup");
   });
 });

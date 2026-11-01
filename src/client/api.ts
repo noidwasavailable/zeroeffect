@@ -5,7 +5,9 @@ import {
   type AiAuditSummary,
   type AiRunSummary,
   type LlmEndpointSummary,
+  type NewMessageDraft,
   type ReplyDraft,
+  type SendMessageRequest,
   type SendReplyRequest,
   type RulesProblemSummary,
   type RulesResponse,
@@ -96,6 +98,11 @@ export const api = {
     request<{ draft: ReplyDraft }>(accountPath(accountId, `/threads/${encodeURIComponent(threadId)}/reply`)).then((body) => body.draft),
   sendReply: (accountId: string, threadId: string, reply: SendReplyRequest) =>
     request<{ sent: { id: string; threadId: string } }>(accountPath(accountId, `/threads/${encodeURIComponent(threadId)}/reply`), { method: "POST", body: reply })
+      .then((body) => body.sent),
+  newMessageDraft: (accountId: string) =>
+    request<{ draft: NewMessageDraft }>(accountPath(accountId, "/compose")).then((body) => body.draft),
+  sendMessage: (accountId: string, message: SendMessageRequest) =>
+    request<{ sent: { id: string; threadId: string } }>(accountPath(accountId, "/messages"), { method: "POST", body: message })
       .then((body) => body.sent),
   rules: (accountId: string) => request<RulesResponse>(accountPath(accountId, "/rules")),
   saveRules: (accountId: string, rules: AiRulesFile) =>

@@ -72,7 +72,8 @@ export interface GmailClientService {
   readonly listHistory: (startHistoryId: string, pageToken?: string) => Effect.Effect<GmailHistoryPage, GmailApiError>;
   readonly listSendAs: () => Effect.Effect<ReadonlyArray<GmailSendAs>, GmailApiError>;
   readonly listLabels: () => Effect.Effect<ReadonlyArray<GmailLabel>, GmailApiError>;
-  readonly createLabel: (name: string) => Effect.Effect<GmailLabel, GmailApiError>;
+  /** `color` must come from Gmail's label palette (see GmailLabels.labelColorFor). */
+  readonly createLabel: (name: string, color?: { readonly backgroundColor: string; readonly textColor: string }) => Effect.Effect<GmailLabel, GmailApiError>;
   readonly watch: (topicName: string) => Effect.Effect<GmailWatchResponse, GmailApiError>;
   /** Sends an RFC 2822 message; with `threadId` Gmail files it in that conversation. */
   readonly sendRaw: (raw: string, threadId?: string) => Effect.Effect<{ readonly id: string; readonly threadId: string }, GmailApiError>;
@@ -190,10 +191,11 @@ const makeClient = (config: GmailClientConfig): GmailClientService => {
     listLabels: () => request<{ labels?: ReadonlyArray<GmailLabel> }>("/users/me/labels").pipe(
       Effect.map((result) => result.labels ?? []),
     ),
-    createLabel: (name) => request("/users/me/labels", {}, {
+    createLabel: (name, color) => request("/users/me/labels", {}, {
       name,
       labelListVisibility: "labelShow",
       messageListVisibility: "show",
+      ...(color ? { color } : {}),
     }),
     watch: (topicName) => request("/users/me/watch", {}, { topicName }),
     sendRaw: (raw, threadId) => request("/users/me/messages/send", {}, { raw, ...(threadId ? { threadId } : {}) }),

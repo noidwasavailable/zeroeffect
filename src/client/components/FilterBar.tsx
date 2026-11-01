@@ -35,7 +35,7 @@ export function FilterBar({ draft, appliedError, onDraftChange, onApply, ref }: 
           aria-label="Filter by Boolean DSL"
           aria-invalid={error !== null}
           placeholder='is:unread AND (label:"Label A" OR from:boss)'
-          className="min-w-0 flex-1 bg-transparent py-1.5 font-mono text-sm outline-none placeholder:text-zinc-400"
+          className="min-w-0 flex-1 bg-transparent py-1.5 font-mono text-sm outline-none"
         />
         {draft && (
           <button type="button" className="text-xs text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200" onClick={() => { onDraftChange(""); onApply(""); }}>

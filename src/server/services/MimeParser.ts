@@ -8,7 +8,13 @@ export interface GmailMimePart {
 
 export interface ParsedMimeBody {
   readonly bodyMarkdown: string;
+  /** Strictly reduced HTML (structure and links only); also the source of `bodyMarkdown` for HTML-only mail. */
   readonly bodyHtmlSanitized: string;
+  /**
+   * The message's original HTML (null for plain-text mail). Unsafe as is: the web client sanitizes it
+   * with DOMPurify, keeping styles and images, before rendering it in the Shadow DOM reader.
+   */
+  readonly bodyHtml: string | null;
 }
 
 const allowedTags = new Set([
@@ -21,10 +27,12 @@ const dangerousTags = "script|style|iframe|object|embed|svg|math|form|textarea|t
 export const parseMimeBody = (payload: GmailMimePart | null | undefined): ParsedMimeBody => {
   const collected = collectTextParts(payload);
   const plain = collected.plain.join("\n").trim();
-  const html = sanitizeHtml(collected.html.join("\n"));
+  const rawHtml = collected.html.join("\n");
+  const html = sanitizeHtml(rawHtml);
   return {
     bodyMarkdown: plain || htmlToMarkdown(html),
     bodyHtmlSanitized: html,
+    bodyHtml: rawHtml.trim() ? rawHtml : null,
   };
 };
 

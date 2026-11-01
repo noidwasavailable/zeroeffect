@@ -13,7 +13,7 @@ ZeroEffect is an in-progress self-hosted Gmail client. The current runnable UI i
    http://127.0.0.1:3838/auth/google/pubsub/callback
    ```
 
-   Configure the OAuth consent screen for testing and add the Google accounts you plan to connect as test users. Gmail binding requests Gmail modify, send, and basic settings access; Pub/Sub authorization separately requests the Pub/Sub scope.
+   Configure the OAuth consent screen for testing and add the Google accounts you plan to connect as test users. While the app's publishing status is **Testing**, Google expires its authorizations after 7 days: Gmail then answers 401 and the server logs `invalid_grant` with a prompt to reconnect from `/setup`. To keep accounts connected, set the publishing status to **In production** (an unverified personal app works for its own users after a one-time warning screen). Gmail binding requests Gmail modify, send, and basic settings access; Pub/Sub authorization separately requests the Pub/Sub scope.
 
 2. Copy `.env.example` to `.env`, then add the client ID and secret. Generate a private encryption key for persisted OAuth tokens:
 

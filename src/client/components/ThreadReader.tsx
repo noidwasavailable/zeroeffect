@@ -1,16 +1,19 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useMemo, useRef } from "react";
 import type { AppAction } from "../actions";
 import type { LabelSummary, ThreadDetail, ThreadMessage } from "../../shared/api";
-import { formatFullDate } from "../format";
+import { sanitizeEmailHtml } from "../emailHtml";
+import { displayName, formatFullDate, formatListDate } from "../format";
+import { allMessagesExpanded, foldLayout, initialFold, toggleMessage, type MessageFold } from "../threadFolding";
 import { toolbarButtonClass } from "./ActionToolbar";
 import { Keycap } from "./Keycap";
 import { LabelChips } from "./LabelChips";
 
-// Email HTML assumes a light page, so bodies render on white in both themes.
+// Email HTML assumes a light page, so bodies render on white in both themes. Paint containment
+// clips the email to its box: its CSS (e.g. position: fixed) cannot draw over the app.
 const SHADOW_STYLES = `
   :host { display: block; }
-  .body { background: #fff; color: #18181b; font: 14px/1.5 ui-sans-serif, system-ui, sans-serif; padding: 16px; border-radius: 8px; overflow-wrap: anywhere; }
-  .body table { max-width: 100%; }
+  .body { background: #fff; color: #18181b; font: 14px/1.5 ui-sans-serif, system-ui, sans-serif; padding: 16px; border-radius: 8px; overflow-wrap: anywhere; contain: paint; position: relative; overflow-x: auto; }
+  .body img { max-width: 100%; }
   .body a { color: #2563eb; }
   .body blockquote { margin: 0 0 0 8px; padding-left: 8px; border-left: 2px solid #d4d4d8; color: #52525b; }
 `;
@@ -36,10 +39,35 @@ function ShadowHtml({ html }: { readonly html: string }) {
   return <div ref={host} />;
 }
 
-function Message({ message }: { readonly message: ThreadMessage }) {
+/** A folded message: one clickable line with the sender, the start of the text and the date. */
+function CollapsedMessage({ message, onExpand }: { readonly message: ThreadMessage; readonly onExpand: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onExpand}
+      aria-expanded={false}
+      className="flex w-full items-baseline gap-3 rounded-lg border border-zinc-200 px-4 py-2 text-left text-sm hover:bg-zinc-50 dark:border-zinc-800 dark:hover:bg-zinc-900"
+    >
+      <span className={`shrink-0 ${message.isUnread ? "font-semibold" : "font-medium"}`}>{displayName(message.fromAddress)}</span>
+      <span className="min-w-0 flex-1 truncate text-zinc-500">{message.bodyMarkdown.replace(/\s+/g, " ").trim() || "(empty message)"}</span>
+      <span className="shrink-0 text-xs text-zinc-500">{formatListDate(message.dateTs)}</span>
+    </button>
+  );
+}
+
+function Message({ message, onCollapse }: { readonly message: ThreadMessage; readonly onCollapse: () => void }) {
+  const html = useMemo(
+    () => message.bodyHtml ? sanitizeEmailHtml(message.bodyHtml) : message.bodyHtmlSanitized,
+    [message.bodyHtml, message.bodyHtmlSanitized],
+  );
   return (
     <article className="rounded-lg border border-zinc-200 dark:border-zinc-800">
-      <header className="flex flex-wrap items-baseline gap-x-3 gap-y-0.5 border-b border-zinc-200 px-4 py-2 text-sm dark:border-zinc-800">
+      {/* Clicking the header folds the message back to one line. */}
+      <header
+        aria-expanded={true}
+        onClick={onCollapse}
+        className="flex cursor-pointer flex-wrap items-baseline gap-x-3 gap-y-0.5 border-b border-zinc-200 px-4 py-2 text-sm hover:bg-zinc-50 dark:border-zinc-800 dark:hover:bg-zinc-900"
+      >
         <span className="font-medium">{message.fromAddress}</span>
         <span className="ml-auto text-xs text-zinc-500">{formatFullDate(message.dateTs)}</span>
         <span className="w-full truncate text-xs text-zinc-500">
@@ -48,8 +76,8 @@ function Message({ message }: { readonly message: ThreadMessage }) {
         </span>
       </header>
       <div className="p-2">
-        {message.bodyHtmlSanitized
-          ? <ShadowHtml html={message.bodyHtmlSanitized} />
+        {html
+          ? <ShadowHtml html={html} />
           : <pre className="whitespace-pre-wrap p-2 font-sans text-sm">{message.bodyMarkdown || "(empty message)"}</pre>}
       </div>
     </article>
@@ -75,23 +103,68 @@ function SuggestionBar({ labels, actions }: { readonly labels: ReadonlyArray<str
   );
 }
 
-export function ThreadReader({ thread, loading, error, labelCatalog, actions }: {
+export function ThreadReader({ thread, loading, error, labelCatalog, actions, fold, onFoldChange }: {
   readonly thread: ThreadDetail | null;
   readonly loading: boolean;
   readonly error: string | null;
   readonly labelCatalog: ReadonlyMap<string, LabelSummary>;
   readonly actions: ReadonlyArray<AppAction>;
+  readonly fold: MessageFold | null;
+  readonly onFoldChange: (fold: MessageFold) => void;
 }) {
+  // Start at the latest reply: when a conversation opens with it below the fold (e.g. several
+  // unread messages expanded above it), scroll its top into view. Otherwise keep the subject visible.
+  const latestRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const latest = latestRef.current;
+    const pane = latest?.closest(".overflow-y-auto");
+    if (!latest || !pane) return;
+    if (latest.getBoundingClientRect().top > pane.getBoundingClientRect().bottom - 120) latest.scrollIntoView({ block: "start" });
+  }, [thread?.id]);
+
   if (error) return <p role="alert" className="p-6 text-sm text-red-600 dark:text-red-400">{error}</p>;
   if (!thread) return <p className="p-6 text-sm text-zinc-500">{loading ? "Loading conversation…" : "Select a conversation and press O to open it."}</p>;
+  const currentFold = fold?.threadId === thread.id ? fold : initialFold(thread.id);
+  const expandAll = actions.find((action) => action.id === "thread.toggleExpandAll");
+  const lastIndex = thread.messages.length - 1;
   return (
     <section aria-label="Conversation" className="flex flex-col gap-3 p-4">
-      <header className="flex flex-col gap-1">
-        <h2 className="text-lg font-semibold">{thread.subject}</h2>
-        <LabelChips labels={thread.labels} catalog={labelCatalog} />
+      <header className="flex items-start gap-3">
+        <div className="flex min-w-0 flex-1 flex-col gap-1">
+          <h2 className="text-lg font-semibold">{thread.subject}</h2>
+          <LabelChips labels={thread.labels} catalog={labelCatalog} />
+        </div>
+        {expandAll && thread.messages.length > 1 && (
+          <button type="button" className={`${toolbarButtonClass} shrink-0`} disabled={!expandAll.enabled} onClick={expandAll.run}>
+            {allMessagesExpanded(currentFold, thread.messages) ? "Collapse" : "Expand all"}
+            {expandAll.shortcut && <Keycap shortcut={expandAll.shortcut} />}
+          </button>
+        )}
       </header>
       {thread.ghostLabels.length > 0 && <SuggestionBar labels={thread.ghostLabels} actions={actions} />}
-      {thread.messages.map((message) => <Message key={message.id} message={message} />)}
+      {foldLayout(currentFold, thread.messages).map((item) => {
+        if (item.kind === "hidden") {
+          return (
+            <button
+              key="hidden"
+              type="button"
+              onClick={() => onFoldChange({ ...currentFold, revealed: true })}
+              className="flex items-center gap-3 text-xs text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200"
+            >
+              <span className="h-px flex-1 bg-zinc-200 dark:bg-zinc-800" />
+              {item.count} earlier {item.count === 1 ? "message" : "messages"}
+              <span className="h-px flex-1 bg-zinc-200 dark:bg-zinc-800" />
+            </button>
+          );
+        }
+        const message = thread.messages[item.index]!;
+        const toggle = () => onFoldChange(toggleMessage(currentFold, thread.messages, item.index));
+        return (
+          <div key={message.id} ref={item.index === lastIndex ? latestRef : undefined} className="scroll-mt-4">
+            {item.expanded ? <Message message={message} onCollapse={toggle} /> : <CollapsedMessage message={message} onExpand={toggle} />}
+          </div>
+        );
+      })}
     </section>
   );
 }

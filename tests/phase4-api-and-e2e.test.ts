@@ -8,6 +8,7 @@ import { formatRulesFile } from "../src/server/services/AiRules";
 import { createAiRunner } from "../src/server/services/AiRunner";
 import { AccountDb, AccountDbTest, type AccountDbService } from "../src/server/services/AccountDb";
 import { BooleanFilter, BooleanFilterLive } from "../src/server/services/BooleanFilter";
+import { labelColorFor } from "../src/server/services/GmailLabels";
 import { createGmailAccessTokenProvider, type StoredTokens } from "../src/server/services/GmailAccessTokens";
 import type { GoogleOAuth2Api } from "../src/server/services/GoogleOAuth2";
 import { OAuthTokenVault } from "../src/server/services/OAuthTokenVault";
@@ -21,9 +22,12 @@ import {
 } from "../src/client/actions";
 import { appendChild, fromBuilder, newCondition, removeNode, toBuilder, updateNode } from "../src/client/filterBuilderModel";
 import { parseRoute, routePath } from "../src/client/router";
-import { LOCAL_REQUEST_HEADER, type AccountId, type ThreadDetail, type ThreadPage, type ThreadSummary } from "../src/shared/api";
+import { keycapParts } from "../src/client/components/Keycap";
+import { allMessagesExpanded, foldLayout, initialFold, toggleAllMessages, toggleMessage, type FoldItem } from "../src/client/threadFolding";
+import { LOCAL_REQUEST_HEADER, type AccountId, type ThreadDetail, type ThreadMessage, type ThreadPage, type ThreadSummary } from "../src/shared/api";
 import { formatFilterExpr } from "../src/shared/filterDsl";
 import { parseFilterDsl } from "../src/shared/filterParser";
+import { copyableOtp, extractOtpCode, otpLabelNames } from "../src/shared/otp";
 import type { FilterExpr } from "../src/shared/schemas";
 import { applyThreadAction } from "../src/shared/threadActions";
 import { BUILT_IN_VIEWS } from "../src/shared/views";
@@ -163,10 +167,92 @@ describe("Phase 4: label renames reach saved views and AI rules", () => {
   });
 });
 
+describe("Phase 4: one-time codes", () => {
+  test("finds the code near an OTP keyword and ignores other numbers", () => {
+    expect(extractOtpCode("197565 - Your Spotify login code", "")).toBe("197565");
+    expect(extractOtpCode("Your sign-in code", "Enter this code to sign in: 1470. It expires in 15 minutes.")).toBe("1470");
+    expect(extractOtpCode("[네이버] 인증번호", "인증번호 [384 921]를 입력해 주세요.")).toBe("384921");
+    expect(extractOtpCode("Verify your account", "Your verification code is G-552190")).toBe("552190");
+    expect(extractOtpCode("Order 1123144770487302 shipped", "Total $1299. Track order 77812.")).toBeNull();
+    expect(extractOtpCode("Verify your email", "Click https://example.com/verify/123456 to continue.")).toBeNull();
+    // "pin" inside "shipping" is not a keyword.
+    expect(extractOtpCode("Shipping update", "Shipping 445566 arrives Friday.")).toBeNull();
+    expect(extractOtpCode("Your code", "Use code 2026 in your account settings.")).toBeNull();
+  });
+
+  test("only OTP-labelled threads offer a code; the label comes from the account's OTP rules", () => {
+    const rules = [{ systemType: "OTP", actions: [{ type: "LABEL", label: "Codes" }] }, { systemType: "NEWSLETTER", actions: [{ type: "LABEL", label: "News" }] }];
+    expect([...otpLabelNames(rules)]).toEqual(["Codes"]);
+    expect([...otpLabelNames([])]).toEqual(["OTP"]);
+    expect(copyableOtp({ otpCode: "123456", labels: ["INBOX", "Codes"] }, otpLabelNames(rules))).toBe("123456");
+    expect(copyableOtp({ otpCode: "123456", labels: ["INBOX"] }, otpLabelNames(rules))).toBeNull();
+    expect(copyableOtp({ otpCode: null, labels: ["Codes"] }, otpLabelNames(rules))).toBeNull();
+  });
+
+  test("stores the newest message's code on the thread and backfills databases from before it", async () => {
+    const database = new Database(":memory:");
+    const open = () => Effect.runSync(Effect.gen(function* () { return yield* AccountDb; }).pipe(Effect.provide(AccountDbTest("personal", database))));
+    const db = open();
+    const upsert = (id: string, at: number, otpCode: string | null, body: string) => Effect.runPromise(Effect.gen(function* () {
+      yield* db.upsertThread({ id: "t-otp", subject: "Your login code", senderSummary: "a@x.example", labels: ["INBOX", "OTP"], lastMessageAt: at, isUnread: true, isStarred: false, isArchived: false, otpCode });
+      yield* db.upsertMessage({ id, threadId: "t-otp", fromAddress: "a@x.example", toAddresses: [], ccAddresses: [], deliveredTo: null, dateTs: at, bodyMarkdown: body, bodyHtmlSanitized: "", rawHeaders: {} });
+    }));
+    await upsert("m2", 20, "222222", "Your code is 222222");
+    // An older message synced later must not replace the newest message's code.
+    await upsert("m1", 10, "111111", "Your code is 111111");
+    const filter = Effect.runSync(Effect.gen(function* () { return (yield* BooleanFilter).compile({ _tag: "Label", value: "OTP" }); }).pipe(Effect.provide(BooleanFilterLive)));
+    expect((await Effect.runPromise(db.listThreadSummaries(filter, { limit: 5, offset: 0 })))[0]?.otpCode).toBe("222222");
+
+    database.exec("ALTER TABLE threads DROP COLUMN otp_code");
+    const migrated = open();
+    expect((await Effect.runPromise(migrated.listThreadSummaries(filter, { limit: 5, offset: 0 })))[0]?.otpCode).toBe("222222");
+    database.close();
+  });
+});
+
+describe("Phase 4: reading a conversation from its latest reply", () => {
+  const message = (id: string, isUnread = false): ThreadMessage => ({
+    id, fromAddress: `${id}@example.com`, toAddresses: [], ccAddresses: [], deliveredTo: null, dateTs: 1,
+    bodyMarkdown: id, bodyHtmlSanitized: "", bodyHtml: null, isUnread,
+  });
+  const shown = (items: ReadonlyArray<FoldItem>) =>
+    items.map((item) => item.kind === "hidden" ? `+${item.count}` : `${item.index}${item.expanded ? "*" : ""}`);
+
+  test("only the newest and unread messages start expanded; long collapsed runs hide their middle", () => {
+    const messages = ["a", "b", "c", "d", "e", "f"].map((id) => message(id, id === "e"));
+    const fold = initialFold("t");
+    expect(shown(foldLayout(fold, messages))).toEqual(["0", "+2", "3", "4*", "5*"]);
+    expect(shown(foldLayout({ ...fold, revealed: true }, messages))).toEqual(["0", "1", "2", "3", "4*", "5*"]);
+    // Three or fewer collapsed messages are all listed.
+    expect(shown(foldLayout(fold, messages.slice(2)))).toEqual(["0", "1", "2*", "3*"]);
+  });
+
+  test("messages toggle one by one, expand all and back, and new replies still arrive expanded", () => {
+    const messages = [message("a"), message("b"), message("c")];
+    let fold = toggleMessage(initialFold("t"), messages, 0);
+    expect(shown(foldLayout(fold, messages))).toEqual(["0*", "1", "2*"]);
+    fold = toggleMessage(fold, messages, 2);
+    expect(shown(foldLayout(fold, messages))).toEqual(["0*", "1", "2"]);
+    fold = toggleAllMessages(fold, messages);
+    expect(allMessagesExpanded(fold, messages)).toBe(true);
+    expect(toggleAllMessages(fold, messages)).toEqual(initialFold("t"));
+    const withReply = [...messages, message("d")];
+    expect(shown(foldLayout(toggleMessage(initialFold("t"), messages, 0), withReply))).toEqual(["0*", "1", "2", "3*"]);
+  });
+
+  test("keycaps split modifiers from the key", () => {
+    expect(keycapParts("⌘K")).toEqual(["⌘", "K"]);
+    expect(keycapParts("⇧S")).toEqual(["⇧", "S"]);
+    expect(keycapParts("⌘↵")).toEqual(["⌘", "↵"]);
+    expect(keycapParts("Esc")).toEqual(["Esc"]);
+    expect(keycapParts("⇧")).toEqual(["⇧"]);
+  });
+});
+
 describe("Phase 4: one action registry drives the palette, toolbar and Vim keys", () => {
   const thread: ThreadSummary = {
     id: "t1", subject: "Hello", snippet: "", senderSummary: "a@example.com", lastMessageAt: 1,
-    labels: ["INBOX", "UNREAD"], ghostLabels: [], isUnread: true, isStarred: false, isArchived: false, aiStatus: "pending",
+    labels: ["INBOX", "UNREAD"], ghostLabels: [], isUnread: true, isStarred: false, isArchived: false, aiStatus: "pending", otpCode: null,
   };
   const calls: string[] = [];
   const context: ActionContext = {
@@ -178,6 +264,7 @@ describe("Phase 4: one action registry drives the palette, toolbar and Vim keys"
     views: BUILT_IN_VIEWS,
     viewId: "inbox",
     selectedThread: thread,
+    selectedOtpCode: null,
     threadOpen: true,
     canSelectNext: true,
     canSelectPrevious: false,
@@ -212,6 +299,15 @@ describe("Phase 4: one action registry drives the palette, toolbar and Vim keys"
     changeAlias: () => calls.push("alias"),
     sendReply: () => calls.push("send"),
     discardReply: () => calls.push("discard"),
+    copyOtp: () => calls.push("copy-otp"),
+    openMessageCount: 3,
+    allMessagesExpanded: false,
+    toggleExpandAll: () => calls.push("expand-all"),
+    newMessageOpen: false,
+    openNewMessage: () => calls.push("new-message"),
+    sendNewMessage: () => calls.push("send-new"),
+    discardNewMessage: () => calls.push("discard-new"),
+    openSetup: () => calls.push("setup"),
   };
   const actions = buildActions(context);
   const keyEvent = (key: string, extra: Partial<Pick<KeyboardEvent, "code" | "altKey" | "metaKey" | "ctrlKey">> = {}) =>
@@ -223,7 +319,7 @@ describe("Phase 4: one action registry drives the palette, toolbar and Vim keys"
     // Only rare or destructive view management is palette + button only.
     expect(actions.filter((action) => !action.shortcut).map((action) => action.id).sort())
       .toEqual([
-        "ai.createRule", "ai.dryRun.Newsletter", "composer.changeAlias", "composer.discard", "composer.send",
+        "ai.createRule", "ai.dryRun.Newsletter", "compose.discardNew", "compose.sendNew", "composer.changeAlias", "composer.discard", "composer.send",
         "views.delete", "views.edit", "views.moveDown", "views.moveUp",
       ]);
     const ids = new Set(actions.map((action) => action.id));
@@ -258,7 +354,26 @@ describe("Phase 4: one action registry drives the palette, toolbar and Vim keys"
     expect(byKey("R")).toBe("thread.replyAlias");
     expect(byKey("A")).toBe("thread.replyAll");
     expect(byKey("2", true)).toBe("account.switch.work");
+    expect(byKey("c")).toBe("compose.new");
+    expect(byKey("p")).toBe("thread.copyOtp");
+    expect(byKey("G")).toBe("account.setup");
+    expect(byKey(";")).toBe("thread.toggleExpandAll");
     expect(actions.find((action) => action.id === "thread.toggleRead")?.label).toBe("Mark as read");
+  });
+
+  test("new message, setup and copy-code actions reach the context; copying needs a code", () => {
+    calls.length = 0;
+    for (const id of ["compose.new", "account.setup"]) actions.find((action) => action.id === id)!.run();
+    expect(calls).toEqual(["new-message", "setup"]);
+    expect(actions.find((action) => action.id === "thread.copyOtp")?.enabled).toBe(false);
+    expect(actions.find((action) => action.id === "compose.sendNew")?.enabled).toBe(false);
+    const withCode = buildActions({ ...context, selectedOtpCode: "482913", newMessageOpen: true });
+    const copy = withCode.find((action) => action.id === "thread.copyOtp")!;
+    expect(copy).toMatchObject({ enabled: true, label: "Copy code 482913 and mark read" });
+    expect(withCode.find((action) => action.id === "compose.new")?.enabled).toBe(false);
+    expect(withCode.find((action) => action.id === "compose.sendNew")?.enabled).toBe(true);
+    copy.run();
+    expect(calls.at(-1)).toBe("copy-otp");
   });
 
   test("shortcuts ignore Cmd/Ctrl chords and Alt shortcuts match the physical key", () => {
@@ -351,6 +466,15 @@ const makeEnvironment = async (options: { readonly connectWork?: boolean; readon
       }
       if (url.pathname === "/gmail/v1/users/me/labels" && request.method === "POST") {
         return Response.json({ id: "Label_new", name: (body as { name: string }).name, type: "user" });
+      }
+      const messageMatch = /^\/gmail\/v1\/users\/me\/messages\/([^/]+)$/.exec(url.pathname);
+      if (messageMatch && request.method === "GET") {
+        // Original HTML for messages stored before it was kept (see the thread backfill test).
+        const html = `<html><head><style>.hero { color: #c00 }</style></head><body><p class="hero">Rich ${messageMatch[1]}</p><img src="https://img.example/${messageMatch[1]}.png"></body></html>`;
+        return Response.json({
+          id: messageMatch[1], threadId: "p-new",
+          payload: { mimeType: "text/html", body: { data: Buffer.from(html).toString("base64url") } },
+        });
       }
       return Response.json({ error: `unexpected ${url.pathname}` }, { status: 404 });
     },
@@ -486,6 +610,22 @@ describe("Phase 4: account-scoped HTTP API", () => {
     expect(views.map((view) => view.id)).toEqual(BUILT_IN_VIEWS.map((view) => view.id));
   });
 
+  test("fetches the original HTML of messages stored without it once, when the thread is opened", async () => {
+    const open = async () => ((await (await env.call("/api/a/personal/threads/p-new")).json()) as { thread: ThreadDetail }).thread;
+    const first = await open();
+    expect(first.messages[0]!.bodyHtml).toContain('<style>.hero { color: #c00 }</style>');
+    expect(first.messages[1]!.bodyHtml).toContain('<img src="https://img.example/p-new-2.png">');
+    expect(env.gmailCalls.map((call) => call.path).sort()).toEqual([
+      "/gmail/v1/users/me/messages/p-new-1",
+      "/gmail/v1/users/me/messages/p-new-2",
+    ]);
+    // Stored: opening it again needs no Gmail request, and the reduced copy is unchanged.
+    const second = await open();
+    expect(second.messages.map((message) => message.bodyHtml)).toEqual(first.messages.map((message) => message.bodyHtml));
+    expect(second.messages[0]).toMatchObject({ bodyHtmlSanitized: "<p>Body p-new-1</p>" });
+    expect(env.gmailCalls).toHaveLength(2);
+  });
+
   test("rejects mutations without the client header or from another site", async () => {
     expect((await env.post("/api/a/personal/threads/p-new/actions", { type: "archive" }, {})).status).toBe(403);
     expect((await env.post("/api/a/personal/threads/p-new/actions", { type: "archive" }, {
@@ -516,15 +656,20 @@ describe("Phase 4: account-scoped HTTP API", () => {
     unsubscribeWork();
   });
 
-  test("sends label IDs to Gmail and creates labels that do not exist yet", async () => {
+  test("sends label IDs to Gmail and creates labels that do not exist yet, colored from Gmail's palette", async () => {
     const response = await env.post("/api/a/personal/threads/p-old/actions", { type: "setLabels", add: ["Travel"], remove: ["Receipts"] });
     expect(response.status).toBe(200);
     expect(await response.json()).toMatchObject({ thread: { labels: ["INBOX", "Travel"] } });
     expect(env.gmailCalls.map((call) => [call.method, call.path, call.body])).toEqual([
-      ["POST", "/gmail/v1/users/me/labels", { name: "Travel", labelListVisibility: "labelShow", messageListVisibility: "show" }],
+      ["POST", "/gmail/v1/users/me/labels", {
+        name: "Travel", labelListVisibility: "labelShow", messageListVisibility: "show", color: labelColorFor("Travel"),
+      }],
       ["POST", "/gmail/v1/users/me/threads/p-old/modify", { addLabelIds: ["Label_new"], removeLabelIds: ["Label_1"] }],
     ]);
     expect((await Effect.runPromise(env.personal.listLabels())).map((label) => label.name)).toContain("Travel");
+    // Inbox Zero's colors for its rule labels; any other name always gets the same palette color.
+    expect(labelColorFor("Receipt")).toEqual({ backgroundColor: "#fdedc1", textColor: "#000000" });
+    expect(labelColorFor("Travel")).toEqual(labelColorFor("Travel"));
   });
 
   test("leaves the local thread untouched when Gmail rejects the change", async () => {
@@ -728,6 +873,35 @@ describe("Phase 4: account-scoped HTTP API", () => {
       .map((match) => Buffer.from(match[1]!.replace(/\r\n/g, ""), "base64").toString("utf8"))[0]!;
     expect(plain).toContain("Sure, call me.\n\n-- The team");
     expect(plain).toContain("Ann <ann@client.example> wrote:\n> Can you help?\n> Thanks");
+  });
+
+  test("sends a new message from the chosen alias as its own conversation, with Bcc", async () => {
+    await Effect.runPromise(env.personal.replaceSendAsAliases([
+      { sendAsEmail: "me@example.com", displayName: "Me", replyToAddress: null, signatureHtml: null, isPrimary: true, isDefault: true, verificationStatus: "unknown" },
+      { sendAsEmail: "support@example.com", displayName: "Support", replyToAddress: null, signatureHtml: "<p>-- The team</p>", isPrimary: false, isDefault: false, verificationStatus: "accepted" },
+      { sendAsEmail: "pending@example.com", displayName: "Pending", replyToAddress: null, signatureHtml: null, isPrimary: false, isDefault: false, verificationStatus: "pending" },
+    ]));
+    const { draft } = await (await env.call("/api/a/personal/compose")).json() as { draft: { fromAlias: string; aliases: Array<{ sendAsEmail: string }> } };
+    expect(draft.fromAlias).toBe("me@example.com");
+    expect(draft.aliases.map((alias) => alias.sendAsEmail)).toEqual(["me@example.com", "support@example.com"]);
+
+    expect((await env.post("/api/a/personal/messages", { to: [], cc: [], bcc: [], subject: "x", body: "hi", fromAlias: "me@example.com" })).status).toBe(400);
+    expect((await env.post("/api/a/personal/messages", { to: ["a@b.example"], subject: "x", body: "hi", fromAlias: "me@example.com" }, {})).status).toBe(403);
+
+    const sent = await env.post("/api/a/personal/messages", {
+      to: ["Ann <ann@client.example>"], cc: [], bcc: ["audit@example.com"], subject: "Kickoff", body: "Hello Ann.", fromAlias: "support@example.com",
+    });
+    expect(sent.status).toBe(200);
+    expect(env.repliesSent).toEqual(["personal"]);
+    const call = env.gmailCalls.find((entry) => entry.path === "/gmail/v1/users/me/messages/send")!;
+    expect((call.body as { threadId?: string }).threadId).toBeUndefined();
+    const raw = Buffer.from((call.body as { raw: string }).raw, "base64url").toString("utf8");
+    expect(raw).toContain("From: Support <support@example.com>");
+    expect(raw).toContain("To: Ann <ann@client.example>");
+    expect(raw).toContain("Bcc: audit@example.com");
+    expect(raw).toContain("Subject: Kickoff");
+    expect(raw).not.toContain("In-Reply-To");
+    expect(raw).not.toContain("Cc:");
   });
 
   test("a follow-up to your own message goes back to its recipients", async () => {

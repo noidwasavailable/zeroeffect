@@ -1,9 +1,12 @@
 import { useEffect, useRef } from "react";
+import type { AppAction } from "../actions";
 import type { LabelSummary, ThreadSummary } from "../../shared/api";
+import { copyableOtp } from "../../shared/otp";
 import { displayName, formatListDate } from "../format";
+import { Keycap } from "./Keycap";
 import { LabelChips } from "./LabelChips";
 
-export function ThreadList({ threads, selectedIndex, openThreadId, labelCatalog, loading, error, hasMore, onSelect, onOpen, onLoadMore }: {
+export function ThreadList({ threads, selectedIndex, openThreadId, labelCatalog, loading, error, hasMore, onSelect, onOpen, onLoadMore, otpLabels, copyOtpAction, onCopyOtp }: {
   readonly threads: ReadonlyArray<ThreadSummary>;
   readonly selectedIndex: number;
   readonly openThreadId: string | null;
@@ -14,6 +17,11 @@ export function ThreadList({ threads, selectedIndex, openThreadId, labelCatalog,
   readonly onSelect: (index: number) => void;
   readonly onOpen: (index: number) => void;
   readonly onLoadMore: () => void;
+  /** Labels that mark one-time-code mail; such rows get a copy button. */
+  readonly otpLabels: ReadonlySet<string>;
+  /** The "copy code" action, for its shortcut badge on the selected row. */
+  readonly copyOtpAction?: AppAction;
+  readonly onCopyOtp: (index: number) => void;
 }) {
   const selectedRef = useRef<HTMLLIElement>(null);
   useEffect(() => {
@@ -30,6 +38,7 @@ export function ThreadList({ threads, selectedIndex, openThreadId, labelCatalog,
     <ul role="listbox" aria-label="Conversations" className="divide-y divide-zinc-100 dark:divide-zinc-900">
       {threads.map((thread, index) => {
         const selected = index === selectedIndex;
+        const otp = copyableOtp(thread, otpLabels);
         return (
           <li
             key={thread.id}
@@ -45,13 +54,26 @@ export function ThreadList({ threads, selectedIndex, openThreadId, labelCatalog,
                 {displayName(thread.senderSummary)}
               </span>
               {thread.isStarred && <span aria-label="Starred" className="text-amber-500">★</span>}
-              <span className="ml-auto shrink-0 text-xs text-zinc-500">{formatListDate(thread.lastMessageAt)}</span>
+              {otp && (
+                <button
+                  type="button"
+                  title="Copy the code and mark as read"
+                  className="ml-auto flex shrink-0 items-center gap-1.5 rounded border border-zinc-300 px-1.5 font-mono text-xs leading-5 hover:bg-zinc-100 dark:border-zinc-700 dark:hover:bg-zinc-800"
+                  onClick={(event) => { event.stopPropagation(); onCopyOtp(index); }}
+                  onDoubleClick={(event) => event.stopPropagation()}
+                >
+                  Copy {otp}
+                  {selected && copyOtpAction?.shortcut && <Keycap shortcut={copyOtpAction.shortcut} />}
+                </button>
+              )}
+              <span className={`${otp ? "" : "ml-auto "}shrink-0 text-xs text-zinc-500`}>{formatListDate(thread.lastMessageAt)}</span>
             </div>
-            <div className={`truncate text-sm ${thread.isUnread ? "font-medium" : ""}`}>{thread.subject}</div>
-            <div className="flex items-center gap-2">
-              <span className="min-w-0 flex-1 truncate text-xs text-zinc-500">{thread.snippet}</span>
-              <LabelChips labels={thread.labels} ghost={thread.ghostLabels} catalog={labelCatalog} />
+            {/* Labels lead the subject, as in Gmail, so they stay readable however long the subject is. */}
+            <div className="flex min-w-0 items-center gap-1.5">
+              <LabelChips labels={thread.labels} ghost={thread.ghostLabels} catalog={labelCatalog} className="max-w-[60%] shrink-0 overflow-hidden" />
+              <span className={`min-w-0 truncate text-sm ${thread.isUnread ? "font-medium" : ""}`}>{thread.subject}</span>
             </div>
+            <div className="truncate text-xs text-zinc-500">{thread.snippet}</div>
           </li>
         );
       })}

@@ -31,6 +31,8 @@ export interface ActionContext {
   readonly views: ReadonlyArray<ViewSummary>;
   readonly viewId: string;
   readonly selectedThread: ThreadSummary | null;
+  /** The selected thread's one-time code, when it carries an OTP label (see shared/otp.ts). */
+  readonly selectedOtpCode: string | null;
   readonly threadOpen: boolean;
   readonly canSelectNext: boolean;
   readonly canSelectPrevious: boolean;
@@ -48,6 +50,17 @@ export interface ActionContext {
   readonly closeThread: () => void;
   readonly focusSearch: () => void;
   readonly runThreadAction: (action: ThreadAction) => void;
+  readonly copyOtp: () => void;
+  /** The open conversation's message count and whether every message is expanded. */
+  readonly openMessageCount: number;
+  readonly allMessagesExpanded: boolean;
+  readonly toggleExpandAll: () => void;
+  readonly newMessageOpen: boolean;
+  readonly openNewMessage: () => void;
+  readonly sendNewMessage: () => void;
+  readonly discardNewMessage: () => void;
+  /** Leaves the client for the account setup page (connect Gmail accounts, Pub/Sub). */
+  readonly openSetup: () => void;
   readonly openLabelPicker: () => void;
   readonly switchAccount: (accountId: string) => void;
   readonly goToView: (viewId: string) => void;
@@ -71,6 +84,7 @@ export interface ActionContext {
 
 /** Action ids shown as buttons in the persistent toolbar, in order. */
 export const TOOLBAR_ACTION_IDS = [
+  "compose.new",
   "navigation.previous",
   "navigation.next",
   "thread.archive",
@@ -153,6 +167,14 @@ export const buildActions = (context: ActionContext): ReadonlyArray<AppAction> =
       run: () => context.runThreadAction({ type: thread?.isStarred ? "unstar" : "star" }),
     },
     {
+      id: "thread.toggleExpandAll", label: context.allMessagesExpanded ? "Collapse older messages" : "Expand all messages",
+      group: "Thread", shortcut: { key: ";" }, enabled: context.openMessageCount > 1, run: context.toggleExpandAll,
+    },
+    {
+      id: "thread.copyOtp", label: context.selectedOtpCode ? `Copy code ${context.selectedOtpCode} and mark read` : "Copy one-time code",
+      group: "Thread", shortcut: { key: "p" }, enabled: context.selectedOtpCode !== null, run: context.copyOtp,
+    },
+    {
       id: "thread.reply", label: "Reply", group: "Thread", shortcut: { key: "r" },
       enabled: thread !== null && !context.composerOpen, run: () => context.openComposer({ replyAll: false, pickAlias: false }),
     },
@@ -175,6 +197,22 @@ export const buildActions = (context: ActionContext): ReadonlyArray<AppAction> =
     {
       id: "composer.discard", label: "Discard reply", group: "Thread",
       enabled: context.composerOpen, run: context.discardReply,
+    },
+    {
+      id: "compose.new", label: "New message", group: "Thread", shortcut: { key: "c" },
+      enabled: !context.newMessageOpen, run: context.openNewMessage,
+    },
+    {
+      id: "compose.sendNew", label: "Send new message", group: "Thread",
+      enabled: context.newMessageOpen, run: context.sendNewMessage,
+    },
+    {
+      id: "compose.discardNew", label: "Discard new message", group: "Thread",
+      enabled: context.newMessageOpen, run: context.discardNewMessage,
+    },
+    {
+      id: "account.setup", label: "Account setup (connect Gmail, Pub/Sub)", group: "Account", shortcut: { key: "G" },
+      enabled: true, run: context.openSetup,
     },
     {
       id: "account.sync", label: context.syncing ? "Syncing…" : "Trigger sync", group: "Account", shortcut: { key: "S" },

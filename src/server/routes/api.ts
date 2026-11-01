@@ -7,6 +7,8 @@ import {
   type ApiErrorBody,
   type ReplyDraft,
   type ThreadAction,
+  type NewMessageDraft,
+  type ThreadDetail,
   type ThreadPage,
   type ViewSummary,
 } from "../../shared/api";
@@ -14,7 +16,7 @@ import { DatabaseError, FilterParseError, GmailApiError, LlmEndpointError, SendA
 import type { FilterExpr } from "../../shared/schemas";
 import { threadActionLabels } from "../../shared/threadActions";
 import { BUILT_IN_VIEWS } from "../../shared/views";
-import { AccountDb, AccountDbLive, type AccountDbService } from "../services/AccountDb";
+import { AccountDb, AccountDbLive, type AccountDbService, type SendAsAliasRecord } from "../services/AccountDb";
 import { formatRulesFile, importInboxZeroRules, parseRulesFile } from "../services/AiRules";
 import type { OAuthTokenVault } from "../services/OAuthTokenVault";
 import type { AiRunner } from "../services/AiRunner";
@@ -22,6 +24,7 @@ import { BooleanFilter, BooleanFilterLive } from "../services/BooleanFilter";
 import type { GmailAccessTokenProvider } from "../services/GmailAccessTokens";
 import { GmailClient, GmailClientLive, type GmailClientService } from "../services/GmailClient";
 import { resolveLabelIds } from "../services/GmailLabels";
+import { parseMimeBody } from "../services/MimeParser";
 import type { RegistryDbService } from "../services/RegistryDb";
 import { chooseAlias, isSendableAlias, SendAsComposerService, SendAsComposerServiceLive } from "../services/SendAsComposerService";
 import { accountEventStream, type AccountEventBus } from "./sse";
@@ -50,6 +53,8 @@ export interface ApiHandler {
 
 const DEFAULT_PAGE_SIZE = 50;
 const MAX_PAGE_SIZE = 200;
+/** Upper bound on Gmail fetches when one opened conversation needs its original HTML backfilled. */
+const MAX_HTML_BACKFILL = 25;
 
 const json = (value: unknown, status = 200): Response => Response.json(value, {
   status,
@@ -97,6 +102,10 @@ const failureResponse = (error: unknown): Response => {
 const isStringArray = (value: unknown): value is string[] =>
   Array.isArray(value) && value.every((item) => typeof item === "string" && item.trim().length > 0);
 
+/** Trimmed, non-empty strings from a JSON array of addresses, or null if it is not one. */
+const addressList = (value: unknown): string[] | null =>
+  Array.isArray(value) && value.every((item) => typeof item === "string") ? (value as string[]).map((item) => item.trim()).filter(Boolean) : null;
+
 const parseThreadAction = (body: unknown): ThreadAction | null => {
   if (typeof body !== "object" || body === null) return null;
   const { type, add, remove } = body as { type?: unknown; add?: unknown; remove?: unknown };
@@ -133,6 +142,30 @@ export const createApiHandler = (config: ApiConfig): ApiHandler => {
     return Effect.runSync(Effect.gen(function* () { return yield* GmailClient; }).pipe(
       Effect.provide(GmailClientLive({ accessToken, apiBaseUrl: config.gmailApiBaseUrl })),
     ));
+  };
+
+  /**
+   * Messages synced before original HTML was kept only have the reduced copy. Fetch their HTML from
+   * Gmail once, when the conversation is opened; on failure the reduced copy is shown as before.
+   */
+  const withOriginalHtml = async (accountId: AccountId, thread: ThreadDetail): Promise<ThreadDetail> => {
+    const missing = thread.messages.filter((message) => message.bodyHtml === null && message.bodyHtmlSanitized !== "");
+    if (missing.length === 0) return thread;
+    try {
+      const db = await accountDb(accountId);
+      const gmail = await gmailClient(accountId);
+      const fetched = new Map<string, string>();
+      await Promise.all(missing.slice(0, MAX_HTML_BACKFILL).map(async (message) => {
+        const bodyHtml = parseMimeBody((await Effect.runPromise(gmail.getMessage(message.id))).payload).bodyHtml;
+        if (bodyHtml === null) return;
+        await Effect.runPromise(db.setMessageBodyHtml(message.id, bodyHtml));
+        fetched.set(message.id, bodyHtml);
+      }));
+      return { ...thread, messages: thread.messages.map((message) => ({ ...message, bodyHtml: fetched.get(message.id) ?? message.bodyHtml })) };
+    } catch (error) {
+      console.warn(`Could not fetch original HTML for ${accountId} thread ${thread.id}; showing the stored copy.`, error);
+      return thread;
+    }
   };
 
   const listViews = async (db: AccountDbService): Promise<ReadonlyArray<ViewSummary>> =>
@@ -375,16 +408,46 @@ export const createApiHandler = (config: ApiConfig): ApiHandler => {
         subject: /^re:/i.test(subject) ? subject : `Re: ${subject}`,
         fromAlias: target.choice?.alias.sendAsEmail ?? null,
         aliasMatch: target.choice && target.choice.match !== "requested" ? target.choice.match : null,
-        aliases: target.aliases.filter(isSendableAlias).map(({ sendAsEmail, displayName, isDefault, isPrimary }) => ({ sendAsEmail, displayName, isDefault, isPrimary })),
+        aliases: sendableAliases(target.aliases),
       } satisfies ReplyDraft,
     });
   };
 
+  const composerFor = (db: AccountDbService, gmail: GmailClientService) =>
+    Effect.runSync(Effect.gen(function* () { return yield* SendAsComposerService; }).pipe(
+      Effect.provide(Layer.provide(SendAsComposerServiceLive, Layer.merge(Layer.succeed(AccountDb, db), Layer.succeed(GmailClient, gmail)))),
+    ));
+
+  const sendableAliases = (aliases: ReadonlyArray<SendAsAliasRecord>) =>
+    aliases.filter(isSendableAlias).map(({ sendAsEmail, displayName, isDefault, isPrimary }) => ({ sendAsEmail, displayName, isDefault, isPrimary }));
+
+  const newMessageDraft = async (accountId: AccountId): Promise<Response> => {
+    const aliases = await Effect.runPromise((await accountDb(accountId)).listSendAsAliases());
+    const choice = chooseAlias(aliases, { to: [], cc: [] });
+    return json({ draft: { fromAlias: choice?.alias.sendAsEmail ?? null, aliases: sendableAliases(aliases) } satisfies NewMessageDraft });
+  };
+
+  /** Sends a new message (not a reply): its own Gmail thread, no quote or threading headers. */
+  const sendMessage = async (accountId: AccountId, request: Request): Promise<Response> => {
+    const body = await readJson(request);
+    const to = addressList(body?.to);
+    const cc = addressList(body?.cc ?? []);
+    const bcc = addressList(body?.bcc ?? []);
+    if (!body || !to || !cc || !bcc || to.length + cc.length + bcc.length === 0 || typeof body.body !== "string" || !body.body.trim() || typeof body.subject !== "string" || typeof body.fromAlias !== "string") {
+      return apiError(400, { error: "A message needs at least one recipient, a sender alias and a message." });
+    }
+    const db = await accountDb(accountId);
+    const sent = await Effect.runPromise(composerFor(db, await gmailClient(accountId)).send({
+      to, cc, bcc, subject: body.subject, text: body.body, fromAlias: body.fromAlias,
+    }));
+    config.onReplySent?.(accountId);
+    return json({ sent });
+  };
+
   const sendReply = async (accountId: AccountId, threadId: string, request: Request): Promise<Response> => {
     const body = await readJson(request);
-    const strings = (value: unknown) => Array.isArray(value) && value.every((item) => typeof item === "string") ? (value as string[]).map((item) => item.trim()).filter(Boolean) : null;
-    const to = strings(body?.to);
-    const cc = strings(body?.cc ?? []);
+    const to = addressList(body?.to);
+    const cc = addressList(body?.cc ?? []);
     if (!body || !to || to.length === 0 || !cc || typeof body.body !== "string" || !body.body.trim() || typeof body.subject !== "string" || typeof body.fromAlias !== "string") {
       return apiError(400, { error: "A reply needs recipients, a subject, a sender alias and a message." });
     }
@@ -393,11 +456,7 @@ export const createApiHandler = (config: ApiConfig): ApiHandler => {
     const original = target.context.messages.find((message) => message.id === body.messageId) ?? target.target;
     const headers = original.id === target.target.id ? target.headers : await Effect.runPromise(target.db.getMessageHeaders(original.id)) ?? {};
     const messageIdHeader = headers["message-id"] ?? null;
-    const gmail = await gmailClient(accountId);
-    const composer = Effect.runSync(Effect.gen(function* () { return yield* SendAsComposerService; }).pipe(
-      Effect.provide(Layer.provide(SendAsComposerServiceLive, Layer.merge(Layer.succeed(AccountDb, target.db), Layer.succeed(GmailClient, gmail)))),
-    ));
-    const sent = await Effect.runPromise(composer.send({
+    const sent = await Effect.runPromise(composerFor(target.db, await gmailClient(accountId)).send({
       to,
       cc,
       subject: body.subject,
@@ -440,6 +499,8 @@ export const createApiHandler = (config: ApiConfig): ApiHandler => {
       }
     }
 
+    if (request.method === "GET" && rest === "/compose") return newMessageDraft(accountId);
+    if (request.method === "POST" && rest === "/messages") return sendMessage(accountId, request);
     if (request.method === "GET" && rest === "/rules") {
       const loaded = parseRulesFile(await Effect.runPromise((await accountDb(accountId)).readRulesFile()));
       return json({ rules: loaded.file, problems: loaded.problems });
@@ -474,7 +535,7 @@ export const createApiHandler = (config: ApiConfig): ApiHandler => {
       const threadId = decodeURIComponent(threadMatch[1]!);
       if (request.method === "GET" && !threadMatch[2]) {
         const thread = await Effect.runPromise((await accountDb(accountId)).getThreadDetail(threadId));
-        return thread ? json({ thread }) : apiError(404, { error: "Thread not found." });
+        return thread ? json({ thread: await withOriginalHtml(accountId, thread) }) : apiError(404, { error: "Thread not found." });
       }
       if (request.method === "POST" && threadMatch[2]) return applyThreadAction(accountId, threadId, request);
     }

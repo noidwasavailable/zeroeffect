@@ -9,6 +9,41 @@ const SYSTEM_LABEL_IDS = new Set([
   "CATEGORY_PERSONAL", "CATEGORY_SOCIAL", "CATEGORY_PROMOTIONS", "CATEGORY_UPDATES", "CATEGORY_FORUMS",
 ]);
 
+// Inbox Zero's label colors (all from Gmail's fixed label palette), so labels created for AI rules
+// look the same as when Inbox Zero creates them.
+const blue = "#b6cff5";
+const cyan = "#98d7e4";
+const purple = "#e3d7ff";
+const pink = "#fcdee8";
+const red = "#f2b2a8";
+const coral = "#ffc8af";
+const orange = "#ffdeb5";
+const yellow = "#fdedc1";
+const green = "#b3efd3";
+const rose = "#fbc8d9";
+const LABEL_COLORS = [blue, cyan, purple, pink, red, coral, orange, yellow, green, rose] as const;
+const RULE_LABEL_COLORS: Readonly<Record<string, string>> = {
+  "Marketing": red,
+  "Newsletter": coral,
+  "Notification": orange,
+  "Receipt": yellow,
+  "To Reply": green,
+  "Actioned": cyan,
+  "Awaiting Reply": blue,
+  "Calendar": purple,
+  "OTP": cyan,
+  "Cold Email": pink,
+  "FYI": rose,
+  "Follow-up": yellow,
+};
+
+/** The color for a label ZeroEffect creates: Inbox Zero's for its rule labels, otherwise stable per name. */
+export const labelColorFor = (name: string): { readonly backgroundColor: string; readonly textColor: string } => {
+  let hash = 0;
+  for (const character of name) hash = (hash * 31 + character.codePointAt(0)!) >>> 0;
+  return { backgroundColor: RULE_LABEL_COLORS[name] ?? LABEL_COLORS[hash % LABEL_COLORS.length]!, textColor: "#000000" };
+};
+
 export const toLabelRecord = (label: GmailLabel): LabelRecord => ({
   id: label.id,
   name: label.name,
@@ -50,7 +85,7 @@ export const resolveLabelIds = (
       yield* Effect.logWarning(`Gmail label "${name}" is not in the local catalog; skipping it.`);
       continue;
     }
-    const created = yield* gmail.createLabel(name).pipe(
+    const created = yield* gmail.createLabel(name, labelColorFor(name)).pipe(
       Effect.map(toLabelRecord),
       Effect.tap((label) => accountDb.upsertLabel(label)),
       // 409: the label exists in Gmail but not locally yet; refresh the catalog and use it.

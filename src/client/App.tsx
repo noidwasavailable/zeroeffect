@@ -10,8 +10,12 @@ import {
   type ThreadSummary,
   type ViewSummary,
 } from "../shared/api";
+import type { AiRulesFile } from "../shared/aiRules";
 import { formatFilterExpr } from "../shared/filterDsl";
 import { parseFilterDsl } from "../shared/filterParser";
+import { copyableOtp, otpLabelNames } from "../shared/otp";
+import { copyText } from "./clipboard";
+import { allMessagesExpanded, initialFold, toggleAllMessages, type MessageFold } from "./threadFolding";
 import { applyThreadAction } from "../shared/threadActions";
 import { BUILT_IN_VIEWS } from "../shared/views";
 import { buildActions } from "./actions";
@@ -20,6 +24,7 @@ import { AccountSwitcher } from "./components/AccountSwitcher";
 import { ActionToolbar, toolbarButtonClass } from "./components/ActionToolbar";
 import { AiAuditDrawer } from "./components/AiAuditDrawer";
 import { Keycap } from "./components/Keycap";
+import { canSendNewMessage, emptyNewMessage, NewMessageDialog, type NewMessageState } from "./components/NewMessageDialog";
 import { ReplyComposer, splitAddressList, type ComposerState } from "./components/ReplyComposer";
 import { RulesPanel } from "./components/RulesPanel";
 import { CommandPalette, type PalettePage } from "./components/CommandPalette";
@@ -122,7 +127,9 @@ function Inbox({ accounts, route, navigate }: {
   const [audits, setAudits] = useState<{ readonly threadId: string | null; readonly entries: ReadonlyArray<AiAuditSummary>; readonly loading: boolean; readonly error: string | null }>({ threadId: null, entries: [], loading: false, error: null });
   const [rulesPanel, setRulesPanel] = useState<{ readonly newRule: boolean } | null>(null);
   const [composer, setComposer] = useState<ComposerState | null>(null);
-  const [ruleSummaries, setRuleSummaries] = useState<ReadonlyArray<{ readonly name: string; readonly automate: boolean }>>([]);
+  const [rulesFile, setRulesFile] = useState<AiRulesFile | null>(null);
+  const ruleSummaries = useMemo(() => (rulesFile?.rules ?? []).map(({ name, automate }) => ({ name, automate })), [rulesFile]);
+  const otpLabels = useMemo(() => otpLabelNames(rulesFile?.rules ?? []), [rulesFile]);
   const searchRef = useRef<HTMLInputElement>(null);
 
   const threadsRef = useRef(threads);
@@ -151,8 +158,8 @@ function Inbox({ accounts, route, navigate }: {
 
   const loadRuleSummaries = useCallback(() => {
     api.rules(accountId).then(
-      (loaded) => setRuleSummaries(loaded.rules.rules.map(({ name, automate }) => ({ name, automate }))),
-      () => setRuleSummaries([]),
+      (loaded) => setRulesFile(loaded.rules),
+      () => setRulesFile(null),
     );
   }, [accountId]);
 
@@ -244,6 +251,21 @@ function Inbox({ accounts, route, navigate }: {
     }
   }, [selectedThread, accountId, openThreadId, closeThread, loadThreads]);
 
+  // Which messages of the open conversation are folded (see threadFolding.ts).
+  const [messageFold, setMessageFold] = useState<MessageFold | null>(null);
+  const currentFold = detail ? (messageFold?.threadId === detail.id ? messageFold : initialFold(detail.id)) : null;
+
+  // Copies an OTP-labelled thread's code (inside the user's click or key press, as clipboard
+  // writes require) and then marks the thread read.
+  const copyOtp = useCallback((target: ThreadSummary | null) => {
+    const code = target ? copyableOtp(target, otpLabels) : null;
+    if (!target || !code) return;
+    copyText(code).then(() => {
+      setNotice({ text: `Copied ${code}.`, tone: "info" });
+      if (target.isUnread) void runThreadAction({ type: "markRead" }, target);
+    }, (error) => setNotice({ text: `Could not copy the code: ${errorMessage(error)}`, tone: "error" }));
+  }, [otpLabels, runThreadAction]);
+
   // Opening an unread thread marks it read, as in Gmail.
   const markedRead = useRef(new Set<string>());
   useEffect(() => {
@@ -332,7 +354,7 @@ function Inbox({ accounts, route, navigate }: {
       }
       const rules = loaded.rules.rules.map((rule) => rule.name === ruleName ? { ...rule, automate: !rule.automate } : rule);
       const saved = await api.saveRules(accountId, { ...loaded.rules, rules });
-      setRuleSummaries(saved.rules.rules.map(({ name, automate }) => ({ name, automate })));
+      setRulesFile(saved.rules);
       const automate = saved.rules.rules.find((rule) => rule.name === ruleName)?.automate;
       setNotice({ text: `${ruleName}: ${automate ? "applies automatically" : "dry run (suggestions only)"}.`, tone: "info" });
     } catch (error) {
@@ -401,6 +423,44 @@ function Inbox({ accounts, route, navigate }: {
     setComposer(null);
   }, [composer]);
 
+  const [newMessage, setNewMessage] = useState<NewMessageState | null>(null);
+  const openNewMessage = useCallback(async () => {
+    if (newMessage) return;
+    try {
+      setNewMessage(emptyNewMessage(await api.newMessageDraft(accountId)));
+    } catch (error) {
+      setNotice({ text: `Could not start a message: ${errorMessage(error)}`, tone: "error" });
+    }
+  }, [newMessage, accountId]);
+
+  const sendNewMessage = useCallback(async () => {
+    if (!newMessage || !canSendNewMessage(newMessage)) return;
+    const sending = newMessage;
+    setNewMessage({ ...sending, sending: true, error: null });
+    try {
+      await api.sendMessage(accountId, {
+        to: splitAddressList(sending.to),
+        cc: splitAddressList(sending.cc),
+        bcc: splitAddressList(sending.bcc),
+        subject: sending.subject,
+        body: sending.body,
+        fromAlias: sending.fromAlias,
+      });
+      setNewMessage(null);
+      setNotice({ text: "Message sent.", tone: "info" });
+    } catch (error) {
+      setNewMessage((current) => current ? { ...current, sending: false, error: errorMessage(error) } : current);
+    }
+  }, [newMessage, accountId]);
+
+  const discardNewMessage = useCallback(() => {
+    if (newMessage?.body.trim() && !confirm("Discard this message?")) return;
+    setNewMessage(null);
+  }, [newMessage]);
+
+  // A draft belongs to the account it was started in.
+  useEffect(() => setNewMessage(null), [accountId]);
+
   const refreshTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   useAccountEvents(accountId, (event: AccountEvent) => {
     if (event.type === "threads-changed") {
@@ -408,6 +468,8 @@ function Inbox({ accounts, route, navigate }: {
       clearTimeout(refreshTimer.current);
       refreshTimer.current = setTimeout(() => {
         void loadThreads("refresh");
+        // Syncs and AI runs can create labels or pick up color changes made in Gmail.
+        api.labels(accountId).then(setLabels, () => undefined);
         if (openThreadId && (!event.threadIds || event.threadIds.includes(openThreadId))) void loadDetail(openThreadId);
         if (auditThreadId && (!event.threadIds || event.threadIds.includes(auditThreadId))) void loadAudits(auditThreadId);
       }, 300);
@@ -473,6 +535,7 @@ function Inbox({ accounts, route, navigate }: {
     views,
     viewId,
     selectedThread,
+    selectedOtpCode: selectedThread ? copyableOtp(selectedThread, otpLabels) : null,
     threadOpen: openThreadId !== null,
     canSelectNext: selectedIndex < threads.length - 1,
     canSelectPrevious: selectedIndex > 0,
@@ -500,6 +563,17 @@ function Inbox({ accounts, route, navigate }: {
       searchRef.current?.select();
     },
     runThreadAction: (action) => void runThreadAction(action),
+    copyOtp: () => copyOtp(selectedThread),
+    openMessageCount: openThreadId && detail?.id === openThreadId ? detail.messages.length : 0,
+    allMessagesExpanded: detail !== null && currentFold !== null && allMessagesExpanded(currentFold, detail.messages),
+    toggleExpandAll: () => {
+      if (detail && currentFold) setMessageFold(toggleAllMessages(currentFold, detail.messages));
+    },
+    newMessageOpen: newMessage !== null,
+    openNewMessage: () => void openNewMessage(),
+    sendNewMessage: () => void sendNewMessage(),
+    discardNewMessage,
+    openSetup: () => window.location.assign("/setup"),
     openLabelPicker: () => {
       setPalettePage("labels");
       setPaletteOpen(true);
@@ -555,9 +629,10 @@ function Inbox({ accounts, route, navigate }: {
     },
     sendReply: () => void sendReply(),
     discardReply,
-  }), [composerVisible, openComposer, sendReply, discardReply, accounts, accountId, views, view, viewId, savedViews, savedIndex, selectedThread, openThreadId, selectedIndex, threads, syncing, builderOpen, auditOpen, aiBusy, ruleSummaries, draft, query, goTo, closeThread, runThreadAction, navigate, sync, runAi, decideGhostLabels, undoAi, toggleRuleDryRun]);
+  }), [composerVisible, openComposer, sendReply, discardReply, accounts, accountId, views, view, viewId, savedViews, savedIndex, selectedThread, openThreadId, selectedIndex, threads, syncing, builderOpen, auditOpen, aiBusy, ruleSummaries, otpLabels, copyOtp, detail, currentFold, newMessage, openNewMessage, sendNewMessage, discardNewMessage, draft, query, goTo, closeThread, runThreadAction, navigate, sync, runAi, decideGhostLabels, undoAi, toggleRuleDryRun]);
 
-  useVimShortcuts(actions, !paletteOpen && viewDialog === null && rulesPanel === null);
+  useVimShortcuts(actions, !paletteOpen && viewDialog === null && rulesPanel === null && newMessage === null);
+  const setupAction = actions.find((action) => action.id === "account.setup");
   const rulesAction = actions.find((action) => action.id === "ai.rules");
 
   useEffect(() => {
@@ -577,6 +652,12 @@ function Inbox({ accounts, route, navigate }: {
       <header className="flex items-center gap-3 border-b border-zinc-200 px-3 py-2 dark:border-zinc-800">
         <span className="font-semibold tracking-tight">ZeroEffect</span>
         <AccountSwitcher accounts={accounts} activeAccountId={accountId} actions={actions} />
+        {setupAction && (
+          <button type="button" title={setupAction.label} className={toolbarButtonClass} onClick={setupAction.run}>
+            Setup
+            {setupAction.shortcut && <Keycap shortcut={setupAction.shortcut} />}
+          </button>
+        )}
         <FilterBar ref={searchRef} draft={draft} appliedError={queryError} onDraftChange={setDraft} onApply={applyQuery} />
         {rulesAction && (
           <button type="button" className={toolbarButtonClass} onClick={rulesAction.run}>
@@ -613,11 +694,19 @@ function Inbox({ accounts, route, navigate }: {
               if (thread) goTo({ threadId: thread.id });
             }}
             onLoadMore={() => void loadThreads("more")}
+            otpLabels={otpLabels}
+            copyOtpAction={actions.find((action) => action.id === "thread.copyOtp")}
+            onCopyOtp={(index) => {
+              const thread = threads[index];
+              if (!thread) return;
+              setSelection({ id: thread.id, index });
+              copyOtp(thread);
+            }}
           />
         </div>
         {openThreadId && (
           <div className="min-h-0 flex-1 overflow-y-auto">
-            <ThreadReader thread={detail} loading={detailLoading} error={detailError} labelCatalog={labelCatalog} actions={actions} />
+            <ThreadReader thread={detail} loading={detailLoading} error={detailError} labelCatalog={labelCatalog} actions={actions} fold={currentFold} onFoldChange={setMessageFold} />
             {composerVisible && composer && (
               <ReplyComposer
                 state={composer}
@@ -646,12 +735,21 @@ function Inbox({ accounts, route, navigate }: {
           {notice.text}
         </div>
       )}
+      {newMessage && (
+        <NewMessageDialog
+          state={newMessage}
+          onChange={(update) => setNewMessage((current) => current ? { ...current, ...update, error: null } : current)}
+          onSend={() => void sendNewMessage()}
+          onDiscard={discardNewMessage}
+        />
+      )}
       {viewDialog && (
         <SaveViewDialog
           title={viewDialog.mode === "create" ? "Save as Split View" : "Edit split view"}
           submitLabel={viewDialog.mode === "create" ? "Save view" : "Save changes"}
           initialName={viewDialog.name}
           initialDsl={viewDialog.dsl}
+          labelNames={labels.map((label) => label.name)}
           onSubmit={(name, dsl) => submitView(viewDialog.mode, name, dsl)}
           onClose={() => setViewDialog(null)}
         />
@@ -662,7 +760,7 @@ function Inbox({ accounts, route, navigate }: {
           accountName={account.displayName}
           startWithNewRule={rulesPanel.newRule}
           onClose={() => setRulesPanel(null)}
-          onSaved={(file) => setRuleSummaries(file.rules.map(({ name, automate }) => ({ name, automate })))}
+          onSaved={setRulesFile}
         />
       )}
       <CommandPalette

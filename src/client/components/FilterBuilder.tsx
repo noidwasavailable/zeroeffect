@@ -33,20 +33,18 @@ const treeFromDsl = (dsl: string): BuilderGroup | null => {
 };
 
 /**
- * Visual AND / OR / NOT editor bound to the DSL draft. Edits here rewrite the DSL; typing in the
- * DSL box rebuilds this tree (when it parses). Incomplete conditions are flagged and keep the
- * last valid DSL until they are filled in.
+ * Visual AND / OR / NOT editor bound to a DSL string. Edits here rewrite the DSL; outside DSL
+ * changes rebuild the tree (when they parse). Incomplete conditions are flagged and keep the last
+ * valid DSL until they are filled in; `onCompleteChange` reports whether the tree converts.
  */
-export function FilterBuilder({ dsl, labelNames, onDslChange, onApply, onSave, onClose }: {
+export function FilterTreeEditor({ dsl, labelNames, onDslChange, onCompleteChange }: {
   readonly dsl: string;
   readonly labelNames: ReadonlyArray<string>;
   readonly onDslChange: (dsl: string) => void;
-  readonly onApply: () => void;
-  readonly onSave: () => void;
-  readonly onClose: () => void;
+  readonly onCompleteChange?: (complete: boolean) => void;
 }) {
   const [tree, setTree] = useState<BuilderGroup>(() => treeFromDsl(dsl) ?? toBuilder(null));
-  // The DSL this builder last emitted; other DSL changes came from the text box.
+  // The DSL this editor last emitted; other DSL changes came from outside (e.g. the DSL box).
   const emitted = useRef(dsl);
   const [syncedDsl, setSyncedDsl] = useState(dsl);
   if (dsl !== syncedDsl) {
@@ -58,11 +56,11 @@ export function FilterBuilder({ dsl, labelNames, onDslChange, onApply, onSave, o
   }
   const datalistId = useId();
   const result = fromBuilder(tree);
-  const dslInvalid = dsl.trim() !== "" && !parseFilterDsl(dsl).ok;
 
   const edit = (next: BuilderGroup) => {
     setTree(next);
     const built = fromBuilder(next);
+    onCompleteChange?.(built.ok);
     if (!built.ok) return;
     const nextDsl = built.expression ? formatFilterExpr(built.expression) : "";
     emitted.current = nextDsl;
@@ -153,17 +151,36 @@ export function FilterBuilder({ dsl, labelNames, onDslChange, onApply, onSave, o
   };
 
   return (
-    <section aria-label="Filter builder" className="flex flex-col gap-3 border-b border-zinc-200 bg-zinc-50/60 px-4 py-3 dark:border-zinc-800 dark:bg-zinc-900/40">
-      {dslInvalid && (
-        <p className="text-xs text-amber-700 dark:text-amber-400">The DSL above has a syntax error; the builder shows the last valid filter.</p>
-      )}
+    <>
       {renderNode(tree, 0)}
       <datalist id={datalistId}>
         {labelNames.map((name) => <option key={name} value={name} />)}
       </datalist>
+    </>
+  );
+}
+
+/** The filter bar's builder panel: the tree editor plus apply / save, bound to the DSL draft. */
+export function FilterBuilder({ dsl, labelNames, onDslChange, onApply, onSave, onClose }: {
+  readonly dsl: string;
+  readonly labelNames: ReadonlyArray<string>;
+  readonly onDslChange: (dsl: string) => void;
+  readonly onApply: () => void;
+  readonly onSave: () => void;
+  readonly onClose: () => void;
+}) {
+  // A tree built from DSL is always complete; only edits can leave a condition unfinished.
+  const [complete, setComplete] = useState(true);
+  const dslInvalid = dsl.trim() !== "" && !parseFilterDsl(dsl).ok;
+  return (
+    <section aria-label="Filter builder" className="flex flex-col gap-3 border-b border-zinc-200 bg-zinc-50/60 px-4 py-3 dark:border-zinc-800 dark:bg-zinc-900/40">
+      {dslInvalid && (
+        <p className="text-xs text-amber-700 dark:text-amber-400">The DSL above has a syntax error; the builder shows the last valid filter.</p>
+      )}
+      <FilterTreeEditor dsl={dsl} labelNames={labelNames} onDslChange={onDslChange} onCompleteChange={setComplete} />
       <div className="flex flex-wrap gap-2">
-        <button type="button" className={toolbarButtonClass} disabled={!result.ok || dslInvalid} onClick={onApply}>Apply filter</button>
-        <button type="button" className={toolbarButtonClass} disabled={!result.ok || dslInvalid} onClick={onSave}>Save as Split View…</button>
+        <button type="button" className={toolbarButtonClass} disabled={!complete || dslInvalid} onClick={onApply}>Apply filter</button>
+        <button type="button" className={toolbarButtonClass} disabled={!complete || dslInvalid} onClick={onSave}>Save as Split View…</button>
         <button type="button" className={`${toolbarButtonClass} ml-auto`} onClick={onClose}>Close builder</button>
       </div>
     </section>

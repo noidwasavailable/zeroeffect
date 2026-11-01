@@ -1,5 +1,6 @@
 import { Context, Effect, Layer } from "effect";
 import { GmailApiError } from "../../shared/errors";
+import { extractOtpCode } from "../../shared/otp";
 import { AccountDb } from "./AccountDb";
 import type { MessageRecord, ThreadRecord } from "./AccountDb";
 import { GmailClient } from "./GmailClient";
@@ -17,6 +18,8 @@ export interface GmailSyncResult {
    * Always empty for initial imports, which backfill history and are not auto-classified.
    */
   readonly threadsWithNewMessages: ReadonlyArray<string>;
+  /** True when the stored history cursor already covered `skipIfCursorAtLeast`, so nothing was fetched. */
+  readonly skipped?: boolean;
 }
 
 export interface GmailSyncProgress {
@@ -29,6 +32,13 @@ export interface GmailSyncProgress {
 export interface GmailSyncOptions {
   readonly initialConversationLimit?: number;
   readonly onProgress?: (progress: GmailSyncProgress) => void;
+  /** Also refresh Send As aliases (default true). Notification-driven syncs skip it; aliases rarely change. */
+  readonly includeAliases?: boolean;
+  /**
+   * A Pub/Sub notification's historyId. If the stored cursor has already reached it, an earlier sync
+   * covered that change and this one returns immediately without calling Gmail.
+   */
+  readonly skipIfCursorAtLeast?: string;
 }
 
 export interface GmailSyncServiceApi {
@@ -105,6 +115,7 @@ export const GmailSyncServiceLive: Layer.Layer<GmailSyncService, never, AccountD
           dateTs: Number.isFinite(dateTs) ? dateTs : 0,
           bodyMarkdown: parsedBody.bodyMarkdown,
           bodyHtmlSanitized: parsedBody.bodyHtmlSanitized,
+          bodyHtml: parsedBody.bodyHtml,
           rawHeaders: headers,
           labels,
         };
@@ -119,6 +130,7 @@ export const GmailSyncServiceLive: Layer.Layer<GmailSyncService, never, AccountD
           snippet: message.snippet ?? "",
           lastMessageAt: msgRecord.dateTs,
           deliveredToAlias: matchedAlias,
+          otpCode: extractOtpCode(headers.subject ?? "", parsedBody.bodyMarkdown),
         };
         yield* accountDb.upsertThread(threadRecord);
         yield* accountDb.upsertMessage(msgRecord);
@@ -180,16 +192,26 @@ export const GmailSyncServiceLive: Layer.Layer<GmailSyncService, never, AccountD
         if (!Number.isSafeInteger(initialConversationLimit) || initialConversationLimit < 1) {
           throw new Error("Initial conversation limit must be a positive safe integer.");
         }
+        const historyId = yield* accountDb.getHistoryId();
+        if (historyId && options.skipIfCursorAtLeast && isHistoryIdAtLeast(historyId, options.skipIfCursorAtLeast)) {
+          return { mode: "incremental" as const, messagesUpserted: 0, messagesDeleted: 0, threadsWithNewMessages: [], skipped: true };
+        }
         yield* Effect.logInfo(`Gmail sync started for ${accountDb.accountId}`);
-        yield* syncAliases;
+        if (options.includeAliases ?? true) yield* syncAliases;
         yield* refreshLabels;
         labelsRefreshedThisSync = false;
-        const profile = yield* gmail.getProfile();
-        const historyId = yield* accountDb.getHistoryId();
+        // The profile's historyId is only needed to start a cursor (initial or expired history) or as a fallback.
+        let profile: { readonly historyId: string } | undefined;
+        const currentProfile = Effect.gen(function* () {
+          profile ??= yield* gmail.getProfile();
+          return profile;
+        });
         if (!historyId) {
           yield* Effect.logInfo(`Gmail initial hydration started for ${accountDb.accountId}: up to ${initialConversationLimit} conversations`);
+          // Read the cursor before importing so changes made during the import are picked up next time.
+          const { historyId: startHistoryId } = yield* currentProfile;
           const { messagesUpserted, conversationsImported } = yield* hydrateLatest(initialConversationLimit, options.onProgress);
-          yield* accountDb.setHistoryId(profile.historyId);
+          yield* accountDb.setHistoryId(startHistoryId);
           yield* Effect.logInfo(`Gmail initial sync completed for ${accountDb.accountId}: ${conversationsImported} conversations, ${messagesUpserted} messages upserted`);
           return { mode: "initial" as const, messagesUpserted, messagesDeleted: 0, threadsWithNewMessages: [] };
         }
@@ -228,8 +250,9 @@ export const GmailSyncServiceLive: Layer.Layer<GmailSyncService, never, AccountD
 
         if (historyExpired) {
           yield* Effect.logWarning(`Gmail history expired for ${accountDb.accountId}; re-importing up to ${initialConversationLimit} recent conversations`);
+          const { historyId: startHistoryId } = yield* currentProfile;
           const { messagesUpserted, conversationsImported } = yield* hydrateLatest(initialConversationLimit, options.onProgress);
-          yield* accountDb.setHistoryId(profile.historyId);
+          yield* accountDb.setHistoryId(startHistoryId);
           yield* Effect.logInfo(`Gmail re-import completed for ${accountDb.accountId}: ${conversationsImported} conversations, ${messagesUpserted} messages upserted`);
           return { mode: "initial" as const, messagesUpserted, messagesDeleted: 0, threadsWithNewMessages: [] };
         }
@@ -255,7 +278,7 @@ export const GmailSyncServiceLive: Layer.Layer<GmailSyncService, never, AccountD
             if (added.has(id) && !(message.labelIds ?? []).includes("DRAFT")) threadsWithNewMessages.add(message.threadId);
           }
         }
-        yield* accountDb.setHistoryId(latestHistoryId ?? profile.historyId);
+        yield* accountDb.setHistoryId(latestHistoryId ?? (yield* currentProfile).historyId);
         yield* Effect.logInfo(`Gmail incremental sync completed for ${accountDb.accountId}: ${messagesUpserted} upserted, ${messagesDeleted} deleted`);
         return { mode: "incremental" as const, messagesUpserted, messagesDeleted, threadsWithNewMessages: [...threadsWithNewMessages] };
       }).pipe(Effect.tapError((error) => Effect.logError(
@@ -267,6 +290,15 @@ export const GmailSyncServiceLive: Layer.Layer<GmailSyncService, never, AccountD
       return { sync, syncAliases: () => syncAliases, watch: (topicName) => gmail.watch(topicName) };
     }),
   );
+
+/** Gmail history IDs are decimal strings that can exceed Number.MAX_SAFE_INTEGER. */
+export const isHistoryIdAtLeast = (cursor: string, target: string): boolean => {
+  try {
+    return BigInt(cursor) >= BigInt(target);
+  } catch {
+    return false;
+  }
+};
 
 const splitAddresses = (value?: string): ReadonlyArray<string> => value
   ? value.split(/,(?=(?:[^\"]*\"[^\"]*\")*[^\"]*$)/).map((address) => address.trim()).filter(Boolean)

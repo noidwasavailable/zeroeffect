@@ -55,6 +55,25 @@ describe("Phase 2: Gmail sync, aliases and Pub/Sub", () => {
     });
     expect(parsed.bodyMarkdown).toBe("Plain body");
     expect(parsed.bodyHtmlSanitized).toBe("<p>HTML body</p>");
+    expect(parsed.bodyHtml).toBe("<p>HTML body</p>");
+  });
+
+  test("keeps the original HTML for the reader and none for plain-text mail", () => {
+    const rich = '<html><head><style>td { color: red }</style></head><body><table bgcolor="#eee"><tr><td><img src="https://img.example/a.png"></td></tr></table></body></html>';
+    const parsed = parseMimeBody({
+      mimeType: "multipart/mixed",
+      parts: [
+        { mimeType: "multipart/alternative", parts: [
+          { mimeType: "text/plain", body: { data: Buffer.from("Plain").toString("base64url") } },
+          { mimeType: "text/html", body: { data: Buffer.from(rich).toString("base64url") } },
+        ] },
+        { mimeType: "image/png", filename: "a.png", body: { attachmentId: "att-1" } },
+      ],
+    });
+    // The client sanitizes this copy itself (DOMPurify); the strict copy keeps structure only.
+    expect(parsed.bodyHtml).toBe(rich);
+    expect(parsed.bodyHtmlSanitized).toBe("<table><tr><td></td></tr></table>");
+    expect(parseMimeBody({ mimeType: "text/plain", body: { data: Buffer.from("Just text").toString("base64url") } }).bodyHtml).toBeNull();
   });
 
   test("performs initial hydration, Send As sync and incremental history updates", async () => {
@@ -102,6 +121,42 @@ describe("Phase 2: Gmail sync, aliases and Pub/Sub", () => {
     expect(await Effect.runPromise(accountDb.getHistoryId())).toBe("h-3");
     expect(await Effect.runPromise(accountDb.getThread("thread-m2"))).not.toBeNull();
     expect(historyCalls).toBe(1);
+  });
+
+  test("skips notifications the stored cursor already covers and can leave Send As alone", async () => {
+    const { layer: accountLayer, service: accountDb } = makeAccountDb();
+    await Effect.runPromise(accountDb.setHistoryId("1000"));
+    const calls: string[] = [];
+    const record = <A>(name: string, value: A) => Effect.sync(() => { calls.push(name); return value; });
+    const gmail: GmailClientService = {
+      getProfile: () => record("getProfile", { emailAddress: "me@example.com", historyId: "1000" }),
+      listMessages: () => record("listMessages", { messages: [] }),
+      getMessage: (id) => record("getMessage", mockMessage(id)),
+      listThreads: () => record("listThreads", { threads: [] }),
+      getThread: (id) => record("getThread", { id, messages: [] }),
+      listHistory: () => record("listHistory", { historyId: "1005", history: [{ id: "1005", messagesAdded: [{ message: { id: "m9" } }] }] }),
+      listSendAs: () => record("listSendAs", []),
+      watch: () => record("watch", { historyId: "1", expiration: "1" }),
+      modifyMessage: () => Effect.void,
+      modifyThread: () => Effect.void,
+      listLabels: () => record("listLabels", [{ id: "INBOX", name: "INBOX", type: "system" }, { id: "UNREAD", name: "UNREAD", type: "system" }]),
+      createLabel: (name) => Effect.succeed({ id: name, name, type: "user" }),
+      sendRaw: () => Effect.succeed({ id: "sent", threadId: "thread-sent" }),
+    };
+    const syncLayer = Layer.provide(GmailSyncServiceLive, Layer.merge(accountLayer, Layer.succeed(GmailClient, gmail)));
+    const sync = Effect.runSync(Effect.gen(function* () { return yield* GmailSyncService; }).pipe(Effect.provide(syncLayer)));
+
+    // A backlog notification older than the cursor costs no Gmail request at all.
+    expect(await Effect.runPromise(sync.sync({ skipIfCursorAtLeast: "999" }))).toMatchObject({ skipped: true });
+    expect(await Effect.runPromise(sync.sync({ skipIfCursorAtLeast: "1000" }))).toMatchObject({ skipped: true });
+    expect(calls).toEqual([]);
+
+    // A newer one syncs history without Send As or a profile lookup.
+    const result = await Effect.runPromise(sync.sync({ skipIfCursorAtLeast: "1005", includeAliases: false }));
+    expect(result).toMatchObject({ mode: "incremental", messagesUpserted: 1, threadsWithNewMessages: ["thread-m9"] });
+    expect(calls).toEqual(["listLabels", "listHistory", "getMessage"]);
+    expect(await Effect.runPromise(accountDb.getHistoryId())).toBe("1005");
+    expect(await Effect.runPromise(sync.sync({ skipIfCursorAtLeast: "1005" }))).toMatchObject({ skipped: true });
   });
 
   test("bounds initial hydration by conversation count and reports progress", async () => {

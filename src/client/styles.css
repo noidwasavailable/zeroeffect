@@ -15,9 +15,16 @@ body {
   font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
 }
 
+/* One placeholder color for every input and textarea, so hints never read as entered text. */
+@layer base {
+  ::placeholder {
+    @apply text-zinc-400 opacity-100 dark:text-zinc-500;
+  }
+}
+
 /* cmdk exposes its parts as data attributes rather than class names. */
 [cmdk-input] {
-  @apply w-full border-b border-zinc-200 bg-transparent px-4 py-3 text-sm outline-none placeholder:text-zinc-400 dark:border-zinc-800;
+  @apply w-full border-b border-zinc-200 bg-transparent px-4 py-3 text-sm outline-none dark:border-zinc-800;
 }
 
 [cmdk-list] {

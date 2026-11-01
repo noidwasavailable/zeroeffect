@@ -4,7 +4,7 @@ import type { GoogleOAuth2Api } from "./GoogleOAuth2";
 import { createGmailAccessTokenProvider, type GmailAccessTokenProvider } from "./GmailAccessTokens";
 import { AccountDbLive } from "./AccountDb";
 import { GmailClient, GmailClientLive } from "./GmailClient";
-import { GmailSyncService, GmailSyncServiceLive } from "./GmailSyncService";
+import { GmailSyncService, GmailSyncServiceLive, type GmailSyncOptions } from "./GmailSyncService";
 import { OAuthTokenVault } from "./OAuthTokenVault";
 
 export type GmailAccountId = "personal" | "work";
@@ -14,7 +14,17 @@ export interface GmailAccountSyncResult {
   readonly messagesUpserted: number;
   readonly messagesDeleted: number;
   readonly threadsWithNewMessages?: ReadonlyArray<string>;
+  /** The stored history cursor already covered the triggering notification; nothing was fetched. */
+  readonly skipped?: boolean;
 }
+
+export interface GmailAccountSyncOptions {
+  /** Skip the sync when the account's stored history cursor has already reached this Pub/Sub historyId. */
+  readonly skipIfCursorAtLeast?: string;
+}
+
+/** Send As aliases rarely change, so notification-driven syncs refresh them at most this often. */
+const ALIAS_REFRESH_INTERVAL_MS = 60 * 60 * 1000;
 
 export interface GmailAccountOperationsConfig {
   readonly registry: RegistryDbService;
@@ -27,11 +37,11 @@ export interface GmailAccountOperationsConfig {
   readonly tokens?: GmailAccessTokenProvider;
   /** Called after each successful account sync (e.g. to notify connected web clients). */
   readonly onSynced?: (accountId: GmailAccountId, result: GmailAccountSyncResult) => void;
-  readonly syncAccount?: (accountId: GmailAccountId, accessToken: string) => Promise<GmailAccountSyncResult>;
+  readonly syncAccount?: (accountId: GmailAccountId, accessToken: string, options: GmailSyncOptions) => Promise<GmailAccountSyncResult>;
 }
 
 export interface GmailAccountOperations {
-  readonly sync: (accountId: GmailAccountId) => Promise<GmailAccountSyncResult>;
+  readonly sync: (accountId: GmailAccountId, options?: GmailAccountSyncOptions) => Promise<GmailAccountSyncResult>;
   readonly ensureWatch: (accountId: GmailAccountId, topicName: string) => Promise<void>;
   readonly renewWatches: (topicName: string) => Promise<void>;
   readonly processNotification: (data: string) => Promise<"synced" | "ignored">;
@@ -41,27 +51,42 @@ export interface GmailAccountOperations {
 export const createGmailAccountOperations = (config: GmailAccountOperationsConfig): GmailAccountOperations => {
   const inFlightSyncs = new Map<GmailAccountId, Promise<GmailAccountSyncResult>>();
 
-  const getUsableAccessToken = (config.tokens ?? createGmailAccessTokenProvider(config)).get;
+  const tokens = config.tokens ?? createGmailAccessTokenProvider(config);
+  const getUsableAccessToken = tokens.get;
+  const lastAliasSync = new Map<GmailAccountId, number>();
 
-  const sync = (accountId: GmailAccountId): Promise<GmailAccountSyncResult> => {
-    const active = inFlightSyncs.get(accountId);
-    if (active) return active;
+  const runSync = async (accountId: GmailAccountId, accessToken: string, options: GmailSyncOptions): Promise<GmailAccountSyncResult> => {
+    if (config.syncAccount) return await config.syncAccount(accountId, accessToken, options);
+    const dependencies = Layer.merge(
+      AccountDbLive(accountId, config.accountDataDirectory),
+      GmailClientLive({ accessToken, apiBaseUrl: config.gmailApiBaseUrl }),
+    );
+    const runtime = ManagedRuntime.make(Layer.provide(GmailSyncServiceLive, dependencies));
+    try {
+      const service = await runtime.runPromise(Effect.gen(function* () { return yield* GmailSyncService; }));
+      return await runtime.runPromise(service.sync(options));
+    } finally {
+      await runtime.dispose();
+    }
+  };
+
+  const startSync = (accountId: GmailAccountId, options: GmailAccountSyncOptions): Promise<GmailAccountSyncResult> => {
     const task = (async () => {
+      const includeAliases = (Date.now() - (lastAliasSync.get(accountId) ?? 0)) >= ALIAS_REFRESH_INTERVAL_MS;
+      const syncOptions: GmailSyncOptions = { includeAliases, skipIfCursorAtLeast: options.skipIfCursorAtLeast };
       const { accessToken } = await getUsableAccessToken(accountId);
-      if (config.syncAccount) return await config.syncAccount(accountId, accessToken);
-      const dependencies = Layer.merge(
-        AccountDbLive(accountId, config.accountDataDirectory),
-        GmailClientLive({ accessToken, apiBaseUrl: config.gmailApiBaseUrl }),
-      );
-      const runtime = ManagedRuntime.make(Layer.provide(GmailSyncServiceLive, dependencies));
+      let result: GmailAccountSyncResult;
       try {
-        const service = await runtime.runPromise(Effect.gen(function* () { return yield* GmailSyncService; }));
-        return await runtime.runPromise(service.sync());
-      } finally {
-        await runtime.dispose();
+        result = await runSync(accountId, accessToken, syncOptions);
+      } catch (error) {
+        // A token Google revoked before its stated expiry: refresh once and retry.
+        if (!isUnauthorized(error) || !tokens.refresh) throw error;
+        result = await runSync(accountId, (await tokens.refresh(accountId)).accessToken, syncOptions);
       }
+      if (includeAliases && !result.skipped) lastAliasSync.set(accountId, Date.now());
+      return result;
     })().then((result) => {
-      config.onSynced?.(accountId, result);
+      if (!result.skipped) config.onSynced?.(accountId, result);
       return result;
     });
     inFlightSyncs.set(accountId, task);
@@ -69,6 +94,18 @@ export const createGmailAccountOperations = (config: GmailAccountOperationsConfi
       if (inFlightSyncs.get(accountId) === task) inFlightSyncs.delete(accountId);
     }).catch(() => undefined);
     return task;
+  };
+
+  const sync = async (accountId: GmailAccountId, options: GmailAccountSyncOptions = {}): Promise<GmailAccountSyncResult> => {
+    const active = inFlightSyncs.get(accountId);
+    if (active) {
+      // Manual syncs share the running one. A notification may describe a change the running sync
+      // has already passed, so wait for it and then sync again (skipped if its cursor covered the change).
+      if (options.skipIfCursorAtLeast === undefined) return active;
+      await active.catch(() => undefined);
+      return sync(accountId, options);
+    }
+    return startSync(accountId, options);
   };
 
   const ensureWatch = async (accountId: GmailAccountId, topicName: string): Promise<void> => {
@@ -115,7 +152,7 @@ export const createGmailAccountOperations = (config: GmailAccountOperationsConfi
       return "ignored";
     }
     // Gmail documents historyId as a string, but some Pub/Sub payloads encode it as a JSON number.
-    // We only use it to validate the notification; sync reads the authoritative cursor from this account's DB.
+    // Sync reads the authoritative cursor from this account's DB and skips notifications it already covers.
     const hasHistoryId = typeof notification.historyId === "string"
       ? notification.historyId.trim().length > 0
       : typeof notification.historyId === "number" &&
@@ -134,9 +171,13 @@ export const createGmailAccountOperations = (config: GmailAccountOperationsConfi
       console.warn(`Ignoring Gmail Pub/Sub notification for an unbound account (${notification.emailAddress}).`);
       return "ignored";
     }
-    await sync(matching.id);
-    return "synced";
+    const result = await sync(matching.id, { skipIfCursorAtLeast: String(notification.historyId).trim() });
+    return result.skipped ? "ignored" : "synced";
   };
 
   return { sync, ensureWatch, renewWatches, processNotification };
 };
+
+const isUnauthorized = (error: unknown): boolean =>
+  typeof error === "object" && error !== null &&
+  (error as { _tag?: unknown })._tag === "GmailApiError" && (error as { status?: unknown }).status === 401;

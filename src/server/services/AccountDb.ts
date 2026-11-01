@@ -5,6 +5,7 @@ import { Context, Effect, Layer } from "effect";
 import { Database } from "bun:sqlite";
 import { AccountIsolationError, DatabaseError } from "../../shared/errors";
 import type { ConversationStatus } from "../../shared/aiRules";
+import { extractOtpCode } from "../../shared/otp";
 import { formatFilterExpr, renameFilterLabels } from "../../shared/filterDsl";
 import { applyLabelChange } from "../../shared/threadActions";
 import type { FilterExpr, FilterThread } from "../../shared/schemas";
@@ -18,6 +19,8 @@ export interface ThreadRecord extends FilterThread {
   readonly deliveredToAlias?: string | null;
   readonly ghostLabels?: ReadonlyArray<string>;
   readonly aiStatus?: "pending" | "processed" | "skipped" | "error";
+  /** One-time code found in the newest message (see shared/otp.ts); shown for OTP-labelled threads. */
+  readonly otpCode?: string | null;
 }
 
 export interface LabelRecord {
@@ -48,6 +51,8 @@ export interface MessageRecord {
   readonly dateTs: number;
   readonly bodyMarkdown: string;
   readonly bodyHtmlSanitized: string;
+  /** Original message HTML; null for plain-text mail (and for messages stored before it was kept). */
+  readonly bodyHtml?: string | null;
   readonly rawHeaders: Readonly<Record<string, string>>;
   /** This message's Gmail label names; a thread's labels are the union over its messages. */
   readonly labels?: ReadonlyArray<string>;
@@ -123,6 +128,8 @@ export interface AccountDbService {
   readonly reorderSavedViews: (ids: ReadonlyArray<string>) => Effect.Effect<void, DatabaseError>;
   readonly upsertMessage: (message: MessageRecord) => Effect.Effect<void, DatabaseError>;
   readonly deleteMessage: (id: string) => Effect.Effect<void, DatabaseError>;
+  /** Stores a message's original HTML (backfill for messages synced before it was kept). */
+  readonly setMessageBodyHtml: (id: string, bodyHtml: string) => Effect.Effect<void, DatabaseError>;
   /** Replaces the label catalog and rewrites stored thread labels for renamed (or legacy ID-valued) labels. */
   readonly replaceLabels: (labels: ReadonlyArray<LabelRecord>) => Effect.Effect<void, DatabaseError>;
   readonly upsertLabel: (label: LabelRecord) => Effect.Effect<void, DatabaseError>;
@@ -165,6 +172,7 @@ interface ThreadRow {
   ghost_labels_json: string;
   ai_status: "pending" | "processed" | "skipped" | "error";
   ai_evaluated_through: number | null;
+  otp_code: string | null;
 }
 
 interface AuditRow {
@@ -256,6 +264,25 @@ const migrateAiStorage = (database: Database): void => {
     if (!columnNames(database, "threads").includes("ai_evaluated_through")) {
       database.exec("ALTER TABLE threads ADD COLUMN ai_evaluated_through INTEGER");
     }
+    if (!columnNames(database, "threads").includes("otp_code")) {
+      database.exec("ALTER TABLE threads ADD COLUMN otp_code TEXT");
+      // Backfill from each thread's newest message, as sync does for new mail.
+      const newest = database.prepare(`
+        SELECT threads.id, threads.subject, messages.body_markdown FROM threads
+        JOIN messages ON messages.id = (
+          SELECT id FROM messages WHERE thread_id = threads.id ORDER BY date_ts DESC, id DESC LIMIT 1
+        )
+      `).all() as Array<{ id: string; subject: string; body_markdown: string }>;
+      const update = database.prepare("UPDATE threads SET otp_code = ? WHERE id = ?");
+      for (const row of newest) {
+        const code = extractOtpCode(row.subject, row.body_markdown);
+        if (code) update.run(code, row.id);
+      }
+    }
+    if (!columnNames(database, "messages").includes("body_html")) {
+      // NULL marks messages stored before original HTML was kept; the API refetches those on open.
+      database.exec("ALTER TABLE messages ADD COLUMN body_html TEXT");
+    }
     if (!columnNames(database, "messages").includes("labels_json")) {
       database.exec("ALTER TABLE messages ADD COLUMN labels_json TEXT NOT NULL DEFAULT '[]'");
       // Best available history: each message gets its thread's labels as of this migration.
@@ -310,7 +337,8 @@ const initialize = (database: Database): void => {
       ghost_labels_json TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(ghost_labels_json)),
       ai_status TEXT NOT NULL DEFAULT 'pending'
         CHECK (ai_status IN ('pending', 'processed', 'skipped', 'error')),
-      ai_evaluated_through INTEGER
+      ai_evaluated_through INTEGER,
+      otp_code TEXT
     );
     CREATE TABLE IF NOT EXISTS messages (
       id TEXT PRIMARY KEY,
@@ -323,7 +351,8 @@ const initialize = (database: Database): void => {
       body_markdown TEXT NOT NULL,
       body_html_sanitized TEXT NOT NULL,
       raw_headers_json TEXT NOT NULL,
-      labels_json TEXT NOT NULL DEFAULT '[]'
+      labels_json TEXT NOT NULL DEFAULT '[]',
+      body_html TEXT
     );
     CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
       thread_id UNINDEXED, subject, from_address, body_markdown
@@ -392,6 +421,7 @@ const toThreadSummary = (row: ThreadRow): ThreadSummary => ({
   lastMessageAt: row.last_message_at,
   ghostLabels: JSON.parse(row.ghost_labels_json) as string[],
   aiStatus: row.ai_status,
+  otpCode: row.otp_code ?? null,
 });
 
 const makeService = (accountId: string, database: Database, rulesStore: RulesStore): AccountDbService => ({
@@ -402,14 +432,15 @@ const makeService = (accountId: string, database: Database, rulesStore: RulesSto
         database.prepare(`
           INSERT INTO threads (
             id, subject, snippet, last_message_at, is_unread, is_starred, is_archived,
-            sender_summary, delivered_to_alias, labels_json, ghost_labels_json, ai_status
-          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, COALESCE(?11, '[]'), COALESCE(?12, 'pending'))
+            sender_summary, delivered_to_alias, labels_json, ghost_labels_json, ai_status, otp_code
+          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, COALESCE(?11, '[]'), COALESCE(?12, 'pending'), ?13)
           ON CONFLICT(id) DO UPDATE SET
             -- Display fields follow the newest message; updating an older message must not roll them back.
             subject = CASE WHEN excluded.last_message_at >= threads.last_message_at THEN excluded.subject ELSE threads.subject END,
             snippet = CASE WHEN excluded.last_message_at >= threads.last_message_at THEN excluded.snippet ELSE threads.snippet END,
             sender_summary = CASE WHEN excluded.last_message_at >= threads.last_message_at THEN excluded.sender_summary ELSE threads.sender_summary END,
             delivered_to_alias = CASE WHEN excluded.last_message_at >= threads.last_message_at THEN excluded.delivered_to_alias ELSE threads.delivered_to_alias END,
+            otp_code = CASE WHEN excluded.last_message_at >= threads.last_message_at THEN excluded.otp_code ELSE threads.otp_code END,
             last_message_at = MAX(threads.last_message_at, excluded.last_message_at),
             is_unread = excluded.is_unread,
             is_starred = excluded.is_starred,
@@ -431,6 +462,7 @@ const makeService = (accountId: string, database: Database, rulesStore: RulesSto
           JSON.stringify(thread.labels),
           thread.ghostLabels ? JSON.stringify(thread.ghostLabels) : null,
           thread.aiStatus ?? null,
+          thread.otpCode ?? null,
         );
       },
       catch: (cause) => new DatabaseError({ message: "Failed to upsert thread.", operation: "upsertThread", cause }),
@@ -481,11 +513,11 @@ const makeService = (accountId: string, database: Database, rulesStore: RulesSto
         const row = database.prepare("SELECT * FROM threads WHERE id = ?").get(id) as ThreadRow | null;
         if (!row) return null;
         const messages = (database.prepare(`
-          SELECT id, from_address, to_addresses_json, cc_addresses_json, delivered_to, date_ts, body_markdown, body_html_sanitized
+          SELECT id, from_address, to_addresses_json, cc_addresses_json, delivered_to, date_ts, body_markdown, body_html_sanitized, body_html, labels_json
           FROM messages WHERE thread_id = ? ORDER BY date_ts ASC, id ASC
         `).all(id) as Array<{
           id: string; from_address: string; to_addresses_json: string; cc_addresses_json: string;
-          delivered_to: string | null; date_ts: number; body_markdown: string; body_html_sanitized: string;
+          delivered_to: string | null; date_ts: number; body_markdown: string; body_html_sanitized: string; body_html: string | null; labels_json: string;
         }>).map((message) => ({
           id: message.id,
           fromAddress: message.from_address,
@@ -495,6 +527,8 @@ const makeService = (accountId: string, database: Database, rulesStore: RulesSto
           dateTs: message.date_ts,
           bodyMarkdown: message.body_markdown,
           bodyHtmlSanitized: message.body_html_sanitized,
+          bodyHtml: message.body_html,
+          isUnread: (JSON.parse(message.labels_json) as string[]).includes("UNREAD"),
         }));
         return { ...toThreadSummary(row), messages };
       },
@@ -583,8 +617,8 @@ const makeService = (accountId: string, database: Database, rulesStore: RulesSto
           database.prepare(`
             INSERT INTO messages (
               id, thread_id, from_address, to_addresses_json, cc_addresses_json,
-              delivered_to, date_ts, body_markdown, body_html_sanitized, raw_headers_json, labels_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              delivered_to, date_ts, body_markdown, body_html_sanitized, raw_headers_json, labels_json, body_html
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
               thread_id = excluded.thread_id,
               from_address = excluded.from_address,
@@ -595,7 +629,8 @@ const makeService = (accountId: string, database: Database, rulesStore: RulesSto
               body_markdown = excluded.body_markdown,
               body_html_sanitized = excluded.body_html_sanitized,
               raw_headers_json = excluded.raw_headers_json,
-              labels_json = excluded.labels_json
+              labels_json = excluded.labels_json,
+              body_html = excluded.body_html
           `).run(
             message.id,
             message.threadId,
@@ -608,6 +643,7 @@ const makeService = (accountId: string, database: Database, rulesStore: RulesSto
             message.bodyHtmlSanitized,
             JSON.stringify(message.rawHeaders),
             JSON.stringify(message.labels ?? []),
+            message.bodyHtml ?? null,
           );
           database.prepare("DELETE FROM messages_fts WHERE thread_id = ?").run(message.threadId);
           database.prepare(`
@@ -620,6 +656,11 @@ const makeService = (accountId: string, database: Database, rulesStore: RulesSto
       },
       catch: (cause) => new DatabaseError({ message: "Failed to save message.", operation: "upsertMessage", cause }),
     }).pipe(Effect.asVoid),
+  setMessageBodyHtml: (id, bodyHtml) =>
+    Effect.try({
+      try: () => { database.prepare("UPDATE messages SET body_html = ? WHERE id = ?").run(bodyHtml, id); },
+      catch: (cause) => new DatabaseError({ message: "Failed to save message HTML.", operation: "setMessageBodyHtml", cause }),
+    }),
   deleteMessage: (id) =>
     Effect.try({
       try: () => {

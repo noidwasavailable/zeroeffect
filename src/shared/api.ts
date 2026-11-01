@@ -28,6 +28,8 @@ export interface ThreadSummary {
   readonly isStarred: boolean;
   readonly isArchived: boolean;
   readonly aiStatus: "pending" | "processed" | "skipped" | "error";
+  /** One-time code found in the newest message; the client offers "copy" on OTP-labelled threads. */
+  readonly otpCode: string | null;
 }
 
 export interface ThreadMessage {
@@ -39,6 +41,10 @@ export interface ThreadMessage {
   readonly dateTs: number;
   readonly bodyMarkdown: string;
   readonly bodyHtmlSanitized: string;
+  /** Original HTML, sanitized by the client before rendering; null for plain-text mail. */
+  readonly bodyHtml: string | null;
+  /** Unread messages start expanded in the reader, like the newest one. */
+  readonly isUnread: boolean;
 }
 
 export interface ThreadDetail extends ThreadSummary {
@@ -160,6 +166,22 @@ export interface ReplyDraft {
   readonly fromAlias: string | null;
   readonly aliasMatch: "recipient" | "default" | "primary" | "first" | null;
   readonly aliases: ReadonlyArray<SendAsAliasSummary>;
+}
+
+/** Defaults for a new (non-reply) message. */
+export interface NewMessageDraft {
+  /** The default (else primary, else first) alias that can send, or null when none can. */
+  readonly fromAlias: string | null;
+  readonly aliases: ReadonlyArray<SendAsAliasSummary>;
+}
+
+export interface SendMessageRequest {
+  readonly to: ReadonlyArray<string>;
+  readonly cc: ReadonlyArray<string>;
+  readonly bcc: ReadonlyArray<string>;
+  readonly subject: string;
+  readonly body: string;
+  readonly fromAlias: string;
 }
 
 export interface SendReplyRequest {
