@@ -49,7 +49,7 @@ describe("local account setup", () => {
     const oauthLayer = GoogleOAuth2Live({
       clientId: "local-client",
       clientSecret: "local-secret",
-      redirectUri: "http://127.0.0.1:3000/auth/google/pubsub/callback",
+      redirectUri: "http://127.0.0.1:3838/auth/google/pubsub/callback",
       authorizationEndpoint: `${provider.url}authorize`,
       tokenEndpoint: `${provider.url}token`,
     });
@@ -64,8 +64,8 @@ describe("local account setup", () => {
       pubsubSubscription: "gmail-notifications",
       pubsubTopicId: "gmail-topic",
       encryptionKey: new Uint8Array(32).fill(19),
-      redirectUri: "http://127.0.0.1:3000/auth/google/callback",
-      pubsubRedirectUri: "http://127.0.0.1:3000/auth/google/pubsub/callback",
+      redirectUri: "http://127.0.0.1:3838/auth/google/callback",
+      pubsubRedirectUri: "http://127.0.0.1:3838/auth/google/pubsub/callback",
       port: 0,
     });
     servers.push(app);
@@ -110,7 +110,7 @@ describe("local account setup", () => {
       });
       expect(callback.status).toBe(303);
       expect(callback.headers.get("location")).toContain("pubsub_connected=1");
-      expect(tokenRequests[1]?.get("redirect_uri")).toBe("http://127.0.0.1:3000/auth/google/pubsub/callback");
+      expect(tokenRequests[1]?.get("redirect_uri")).toBe("http://127.0.0.1:3838/auth/google/pubsub/callback");
       expect(authorizations).toEqual(["pubsub-refresh-secret"]);
 
       const saved = Effect.runSync(registry.getServiceCredential("google_pubsub"));
@@ -165,7 +165,7 @@ describe("local account setup", () => {
     const oauthLayer = GoogleOAuth2Live({
       clientId: "local-client",
       clientSecret: "local-secret",
-      redirectUri: "http://127.0.0.1:3000/auth/google/callback",
+      redirectUri: "http://127.0.0.1:3838/auth/google/callback",
       authorizationEndpoint: `${provider.url}authorize`,
       tokenEndpoint: `${provider.url}token`,
     });
@@ -174,7 +174,7 @@ describe("local account setup", () => {
       registry,
       oauth,
       encryptionKey: new Uint8Array(32).fill(9),
-      redirectUri: "http://127.0.0.1:3000/auth/google/callback",
+      redirectUri: "http://127.0.0.1:3838/auth/google/callback",
       accountDataDirectory: workDirectory,
       gmailApiBaseUrl: `${provider.url}gmail/v1`,
       port: 0,

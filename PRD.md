@@ -20,7 +20,7 @@ Incoming emails are ingested in real time via outbound Google Cloud Pub/Sub stre
 ```text
 +-----------------------------------------------------------------------------------+
 |                        PRIVATE TAILNET (tailscale serve)                          |
-|                Web Browser (HTTPS -> 127.0.0.1:3000 via Tailscale)                |
+|                Web Browser (HTTPS -> 127.0.0.1:3838 via Tailscale)                |
 +-----------------------------------------+-----------------------------------------+
                                           |
                                           v
@@ -120,7 +120,7 @@ Incoming emails are ingested in real time via outbound Google Cloud Pub/Sub stre
   - Each button displays its shortcut as a subtle keycap badge:
     `[ Archive [E] ]` `[ Label [L] ]` `[ Reply [R] ]` `[ Run AI [A] ]` `[ AI Audit [W] ]`
 - **FR-UI-03 (Tailscale Service Integration):**
-  - Server binds to `127.0.0.1:3000` and is exposed to the private Tailnet via `tailscale serve --bg 3000`.
+  - Server binds to `127.0.0.1:3838` and is exposed to the private Tailnet via `tailscale serve --bg 3838`.
   - Reads `Tailscale-User-Login` / `Tailscale-User-Name` headers injected by `tailscale serve` for zero-password authentication across trusted Tailnet devices.
 
 ---
@@ -286,4 +286,4 @@ CREATE TABLE ai_audit_logs (
   - Tailscale `WhoIs` / header authentication middleware and `tailscale serve` scripts.
 - **🛑 HARD CHECKPOINT 4:**
   - Run full `bun test` suite across Phases 1–4.
-  - Expose via `tailscale serve --bg 3000` and perform end-to-end manual acceptance across Personal and Work accounts.
+  - Expose via `tailscale serve --bg 3838` and perform end-to-end manual acceptance across Personal and Work accounts.

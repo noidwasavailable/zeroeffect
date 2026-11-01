@@ -782,7 +782,7 @@ describe("Phase 4: web client hosting", () => {
       api: env.api,
       events: env.events,
       encryptionKey: new Uint8Array(32).fill(9),
-      redirectUri: "http://127.0.0.1:3000/auth/google/callback",
+      redirectUri: "http://127.0.0.1:3838/auth/google/callback",
       port: 0,
     });
     servers.push(app);

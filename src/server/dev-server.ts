@@ -165,7 +165,7 @@ export const createDevServer = (config: DevServerConfig): Bun.Server<unknown> =>
 
   return Bun.serve({
     hostname,
-    port: config.port ?? 3000,
+    port: config.port ?? 3838,
     // Initial hydration fetches Gmail messages one at a time and can exceed Bun's 10s default.
     idleTimeout: 255,
     development: process.env.NODE_ENV !== "production",
@@ -502,7 +502,7 @@ export const devServerConfigFromEnvironment = (): Omit<DevServerConfig, "registr
 } => {
   const clientId = process.env.GOOGLE_CLIENT_ID;
   const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
-  const redirectUri = process.env.GOOGLE_REDIRECT_URI ?? "http://127.0.0.1:3000/auth/google/callback";
+  const redirectUri = process.env.GOOGLE_REDIRECT_URI ?? "http://127.0.0.1:3838/auth/google/callback";
   const encryptionKey = process.env.OAUTH_ENCRYPTION_KEY;
   if (!clientId || !clientSecret) throw new Error("Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET before starting the local server.");
   if (!encryptionKey || !/^(?:[0-9a-fA-F]{64}|[A-Za-z0-9+/]{43}=)$/.test(encryptionKey)) {
@@ -512,7 +512,7 @@ export const devServerConfigFromEnvironment = (): Omit<DevServerConfig, "registr
     ? Buffer.from(encryptionKey, "hex")
     : Buffer.from(encryptionKey, "base64");
   if (keyBytes.byteLength !== 32) throw new Error("OAUTH_ENCRYPTION_KEY must decode to exactly 32 bytes.");
-  const port = Number(process.env.PORT ?? 3000);
+  const port = Number(process.env.PORT ?? 3838);
   if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error("PORT must be an integer between 0 and 65535.");
   return {
     clientId,
