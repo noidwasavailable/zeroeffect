@@ -14,6 +14,7 @@ export interface AgentPaths {
   readonly repoDir: string;
   readonly bunPath: string;
   readonly plistPath: string;
+  /** Must be on the internal disk: launchd opens these files and cannot create them on external volumes. */
   readonly logDir: string;
   /** Directories of the tools the server spawns (docker for the local Valkey container). */
   readonly toolDirs: ReadonlyArray<string>;
@@ -26,7 +27,10 @@ export const defaultPaths = (): AgentPaths => {
     repoDir,
     bunPath: process.execPath,
     plistPath: join(homedir(), "Library", "LaunchAgents", `${LABEL}.plist`),
-    logDir: join(repoDir, "data", "logs"),
+    // launchd opens the log files itself, and macOS privacy protection stops it from creating files on
+    // external volumes (the job then fails with EX_CONFIG before it starts), so logs stay on the
+    // internal disk even when the repo is on an external drive. The server itself may use the drive.
+    logDir: join(homedir(), "Library", "Logs", "zeroeffect"),
     toolDirs: docker ? [dirname(docker)] : [],
   };
 };

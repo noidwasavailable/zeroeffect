@@ -1,15 +1,15 @@
 import { describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { agentDefinition, LABEL, renderPlist, runCli, type AgentPaths, type System } from "../scripts/zeroeffect";
+import { agentDefinition, defaultPaths, LABEL, renderPlist, runCli, type AgentPaths, type System } from "../scripts/zeroeffect";
 import type { ServerStatus } from "../src/shared/api";
 
 const PATHS: AgentPaths = {
   repoDir: "/Volumes/EVO990/Developer/zero effect & co",
   bunPath: "/Users/me/.bun/bin/bun",
   plistPath: `/Users/me/Library/LaunchAgents/${LABEL}.plist`,
-  logDir: "/Volumes/EVO990/Developer/zero effect & co/data/logs",
+  logDir: "/Users/me/Library/Logs/zeroeffect",
   toolDirs: ["/opt/homebrew/bin"],
 };
 const TARGET = `gui/501/${LABEL}`;
@@ -79,6 +79,12 @@ describe("background server agent definition", () => {
     expect(definition.KeepAlive).toEqual({ PathState: { [PATHS.repoDir]: true } });
     expect(definition).toMatchObject({ RunAtLoad: true, ThrottleInterval: 30, ExitTimeOut: 30 });
     expect(definition.StandardErrorPath).toBe(`${PATHS.logDir}/server.error.log`);
+  });
+
+  test("keeps launchd's log files on the internal disk even when the repo is on an external volume", () => {
+    const paths = defaultPaths();
+    expect(paths.logDir.startsWith("/Volumes/")).toBe(false);
+    expect(paths.logDir).toBe(join(homedir(), "Library", "Logs", "zeroeffect"));
   });
 
   test("renders a plist that escapes paths and passes plutil", async () => {
