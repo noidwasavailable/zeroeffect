@@ -79,6 +79,9 @@ Before writing Gmail API synchronization, MIME parsing, or LLM prompt constructi
   1. Via the **`Cmd+K` Command Palette** (`src/client/components/CommandPalette.tsx`).
   2. Via an explicit, clickable **Button** in the UI (`src/client/components/ActionToolbar.tsx`) that displays its keyboard shortcut badge (e.g., `[ Archive [E] ]`).
   3. Via a single-key **Vim shortcut** (`src/client/hooks/useVimShortcuts.ts`) when focus is not inside an `<input>`, `<textarea>`, or `[contenteditable]`.
+- Declare every action once in `src/client/actions.ts` (`buildActions`); the palette, buttons and keys all read that registry. Buttons may live in the toolbar, the view sidebar, or a contextual bar (selection bar, reader header). Rare or destructive actions may skip the key (palette + button only); `tests/phase4-api-and-e2e.test.ts` lists those exceptions, and every key must stay unique.
+- Thread actions apply to the checked threads when any are checked (bulk, `POST /threads/bulk`), otherwise to the selected thread.
+- Text inputs spread `noAutofill` (`src/client/noAutofill.ts`) so password managers do not hijack them.
 
 ---
 
@@ -94,26 +97,29 @@ Every feature must be accompanied by fast, deterministic, offline-capable tests 
 3. **Boolean AST Equivalence Law:**
    - Any modification to `BooleanFilter.ts` must run the AST equivalence test matrix proving that for every test expression $E$ and every synthetic thread $T$:
      $$\text{evaluateInMemory}(E, T) \equiv \text{querySqliteWithCompiledAst}(E, T)$$
+   - The same applies to changes in the shared DSL parser and formatter (`src/shared/filterParser.ts`, `src/shared/filterDsl.ts`). New `FilterExpr` nodes (e.g. Phase 6's full-text `Text` node) must be added to the matrix with one matching rule defined for both targets (see PRD FR-FILTER-04).
 
 ---
 
 ## 4. Mandatory Phase Execution & Hard Checkpoint Protocol
 
-> **STOP RULE:** The project is structured into **4 sequential phases** (defined in `./PRD.md` Section 5). You must **NEVER** proceed from Phase $N$ to Phase $N+1$ in a single turn or without explicit human approval.
+> **STOP RULE:** The project is structured into **6 sequential phases** (defined in `./PRD.md` Section 5; Phases 1–5 are complete, Phase 6 is next). You must **NEVER** proceed from Phase $N$ to Phase $N+1$ in a single turn or without explicit human approval.
 
 At the end of each phase, you must:
 
 1. Run `bun test` and ensure **0 failures**.
-2. Run `bun run typecheck` (`tsc --noEmit`) and ensure **0 type errors**.
+2. Run `bun run typecheck` (`bun check`) and ensure **0 type errors**.
 3. Present a concise summary of completed files and print the exact **Hard Checkpoint Verification Commands** for the user to run manually.
 4. **STOP and wait** for the user to reply `"Approved, proceed to Phase N+1"` (or provide feedback).
 
-### Quick Summary of the 4 Hard Checkpoints
+### Quick Summary of the 6 Hard Checkpoints
 
 - **🛑 Checkpoint 1 (After Phase 1):** `AccountDb` physical isolation + `BooleanFilter` recursive `AND`/`OR`/`NOT` DSL parser, SQLite compiler, and in-memory evaluator + `tests/phase1-db-and-filter.test.ts`.
 - **🛑 Checkpoint 2 (After Phase 2):** Gmail OAuth2, `history.list` delta sync, MIME parser, `sendAs` alias sync, RFC 2822 alias composer, and outbound GCP Pub/Sub `StreamingPull` listener + `tests/phase2-gmail-sync.test.ts`.
 - **🛑 Checkpoint 3 (After Phase 3):** Dual `/v1/responses` & `/v1/chat/completions` `LlmProvider`, `AiRuleWorker` with `FilterExpr` pre-conditions, Ghost Labels (`dry_run`), `ai_audit_logs`, and Undo + `tests/phase3-llm-labeller.test.ts`.
-- **🛑 Checkpoint 4 (After Phase 4):** React 19 Web UI (`Cmd+K` palette, Action Toolbar buttons with Vim badges, Account Switcher, Visual/DSL Filter Builder, Shadow-DOM reader, Alias Reply Composer) + Tailscale auth middleware + `tests/phase4-api-and-e2e.test.ts`.
+- **🛑 Checkpoint 4 (After Phase 4):** React 19 Web UI (`Cmd+K` palette, Action Toolbar buttons with Vim badges, Account Switcher, Visual/DSL Filter Builder, Shadow-DOM reader, Alias Reply Composer) + `tests/phase4-api-and-e2e.test.ts`. Tailscale exposure and authentication are managed outside this app (no auth middleware).
+- **🛑 Checkpoint 5 (After Phase 5):** Catch-up `history.list` sync, attachments in and out (download route, inline `cid:` images, upload-endpoint sending), Forward, Trash & Spam, bulk actions + "Mark all as read", label management, Send As aliases page, and the extra palette commands/keys + `tests/phase5-mail-features.test.ts`.
+- **🛑 Checkpoint 6 (After Phase 6):** Full-text search: `Text` `FilterExpr` node in the shared parser/formatter/builder, `messages_fts MATCH` compilation with bound prefix queries, identical in-memory tokenizer, and the extended AST equivalence matrix + `tests/phase6-search.test.ts`.
 
 ---
 
@@ -130,16 +136,19 @@ zero-effect/
 │   └── cli-filter-demo.ts          # CLI inspector for Checkpoint 1
 ├── src/
 │   ├── server/
-│   │   ├── main.ts                 # Bun.serve() entry + Effect Layer assembly
-│   │   ├── middleware/
-│   │   │   └── tailscale-auth.ts   # Tailscale headers / WhoIs verification
+│   │   ├── main.ts                 # Bun.serve() entry, background workers, catch-up sync timer
+│   │   ├── dev-server.ts           # HTTP server: setup/OAuth pages, client bundle, sync jobs
 │   │   ├── services/
 │   │   │   ├── RegistryDb.ts
 │   │   │   ├── AccountDb.ts
 │   │   │   ├── RedisQueue.ts
 │   │   │   ├── BooleanFilter.ts
 │   │   │   ├── GmailClient.ts
-│   │   │   ├── PubSubStream.ts
+│   │   │   ├── GmailSyncService.ts
+│   │   │   ├── GmailAccountOperations.ts # Per-account sync, watches, catch-up
+│   │   │   ├── MimeParser.ts       # Bodies + attachment metadata
+│   │   │   ├── SendAsComposerService.ts # RFC 2822 replies, forwards, attachments
+│   │   │   ├── PubSubListenerService.ts
 │   │   │   ├── LlmProvider.ts
 │   │   │   └── AiRuleWorker.ts
 │   │   └── routes/
@@ -147,6 +156,8 @@ zero-effect/
 │   │       └── sse.ts
 │   ├── client/
 │   │   ├── App.tsx
+│   │   ├── actions.ts              # The single action registry (palette, buttons, keys)
+│   │   ├── noAutofill.ts
 │   │   ├── components/
 │   │   │   ├── CommandPalette.tsx
 │   │   │   ├── ActionToolbar.tsx
@@ -154,10 +165,16 @@ zero-effect/
 │   │   │   ├── FilterBuilder.tsx
 │   │   │   ├── ThreadList.tsx
 │   │   │   ├── ThreadReader.tsx
+│   │   │   ├── ReplyComposer.tsx
+│   │   │   ├── NewMessageDialog.tsx # New messages and forwards
+│   │   │   ├── AttachmentField.tsx
+│   │   │   ├── ShortcutHelp.tsx
 │   │   │   └── AiAuditDrawer.tsx
 │   │   └── hooks/
 │   │       └── useVimShortcuts.ts
 │   └── shared/
+│       ├── api.ts                  # Wire types shared by server and client
+│       ├── filterParser.ts         # DSL parser shared by server and browser
 │       ├── schemas.ts              # Effect Schema definitions
 │       └── errors.ts               # Data.TaggedError definitions
 ├── tests/
@@ -166,7 +183,9 @@ zero-effect/
 │   ├── phase1-db-and-filter.test.ts
 │   ├── phase2-gmail-sync.test.ts
 │   ├── phase3-llm-labeller.test.ts
-│   └── phase4-api-and-e2e.test.ts
+│   ├── phase4-api-and-e2e.test.ts
+│   ├── phase5-mail-features.test.ts
+│   └── phase6-search.test.ts       # (Phase 6)
 ├── package.json
 └── tsconfig.json
 ```
