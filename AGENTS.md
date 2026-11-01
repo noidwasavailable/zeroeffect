@@ -134,6 +134,7 @@ zero-effect/
 ├── scripts/
 │   ├── setup-repos.sh              # Clones effect and inbox-zero into ./repos/
 │   ├── generate-unicode61-table.ts # Regenerates the search tokenizer table from SQLite
+│   ├── zeroeffect.ts               # Background server CLI (launchd agent): bun run zeroeffect
 │   └── cli-filter-demo.ts          # CLI inspector for Checkpoint 1
 ├── src/
 │   ├── server/

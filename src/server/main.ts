@@ -341,6 +341,11 @@ const main = async (): Promise<void> => {
 
 if (import.meta.main) {
   main().catch((error) => {
+    if ((error as { code?: unknown })?.code === "EADDRINUSE") {
+      console.error(`${error instanceof Error ? error.message : error}\nIs the background server running? Stop it with: bun run zeroeffect stop`);
+      // Background workers (Pub/Sub, sync timers) started before the port was bound; do not leave them running.
+      process.exit(1);
+    }
     console.error(error instanceof Error ? error.message : error);
     process.exitCode = 1;
   });
