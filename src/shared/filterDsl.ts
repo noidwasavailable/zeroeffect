@@ -35,6 +35,23 @@ export const formatFilterExpr = (expression: FilterExpr): string => {
       return `label:${formatValue(expression.value)}`;
     case "Contains":
       return `${expression.field}:${formatValue(expression.value)}`;
+    case "Text":
+      return `text:${formatValue(expression.value)}`;
+  }
+};
+
+/** Whether an expression searches message text, so evaluating it needs the thread's search documents. */
+export const containsTextSearch = (expression: FilterExpr): boolean => {
+  switch (expression._tag) {
+    case "And":
+    case "Or":
+      return expression.expressions.some(containsTextSearch);
+    case "Not":
+      return containsTextSearch(expression.expression);
+    case "Text":
+      return true;
+    default:
+      return false;
   }
 };
 

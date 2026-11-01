@@ -1,10 +1,11 @@
 import type { FilterExpr } from "../shared/schemas";
+import { tokenizeSearchText } from "../shared/searchText";
 
 // The visual filter builder edits a tree of groups and conditions. NOT is a flag on any node,
 // so `NOT (a OR b)` is a negated Or group. Converting to and from FilterExpr keeps the builder
 // and the DSL text box editing the same AST.
 
-export type ConditionField = "is" | "label" | "from" | "subject";
+export type ConditionField = "is" | "label" | "from" | "subject" | "text";
 export const IS_VALUES = ["unread", "read", "starred", "archived"] as const;
 
 export interface BuilderCondition {
@@ -50,6 +51,8 @@ const convert = (expression: FilterExpr, negated: boolean): BuilderNode => {
       return { kind: "condition", id: nextId(), negated, field: "label", value: expression.value };
     case "Contains":
       return { kind: "condition", id: nextId(), negated, field: expression.field, value: expression.value };
+    case "Text":
+      return { kind: "condition", id: nextId(), negated, field: "text", value: expression.value };
   }
 };
 
@@ -80,6 +83,9 @@ const build = (node: BuilderNode): FilterExpr => {
     } else if (!value) {
       // Empty values have no DSL form, so incomplete conditions block the conversion.
       throw new IncompleteNode(node.id, "Enter a value.");
+    } else if (node.field === "text") {
+      if (tokenizeSearchText(value).length === 0) throw new IncompleteNode(node.id, "Enter a letter or digit to search for.");
+      expression = { _tag: "Text", value };
     } else {
       expression = node.field === "label" ? { _tag: "Label", value } : { _tag: "Contains", field: node.field, value };
     }

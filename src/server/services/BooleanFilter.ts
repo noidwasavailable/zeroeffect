@@ -2,6 +2,7 @@ import { Context, Effect, Layer } from "effect";
 import { FilterParseError } from "../../shared/errors";
 import { parseFilterDsl } from "../../shared/filterParser";
 import type { FilterExpr, FilterThread } from "../../shared/schemas";
+import { threadMatchesSearch, toFtsMatchQuery } from "../../shared/searchText";
 
 export interface CompiledFilter {
   readonly sql: string;
@@ -64,6 +65,13 @@ const compileExpression = (expression: FilterExpr): CompiledFilter => {
         params: [`%${escapeLike(expression.value)}%`],
       };
     }
+    case "Text": {
+      // The query is bound, never interpolated; values without tokens match nothing (as in memory).
+      const query = toFtsMatchQuery(expression.value);
+      return query === null
+        ? { sql: "(0)", params: [] }
+        : { sql: "(threads.id IN (SELECT thread_id FROM messages_fts WHERE messages_fts MATCH ?))", params: [query] };
+    }
   }
 };
 
@@ -88,6 +96,8 @@ const evaluateExpression = (expression: FilterExpr, thread: FilterThread): boole
       const source = expression.field === "from" ? thread.senderSummary : thread.subject;
       return source.toLowerCase().includes(expression.value.toLowerCase());
     }
+    case "Text":
+      return threadMatchesSearch(expression.value, thread.searchDocuments ?? []);
   }
 };
 

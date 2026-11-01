@@ -97,13 +97,13 @@ Every feature must be accompanied by fast, deterministic, offline-capable tests 
 3. **Boolean AST Equivalence Law:**
    - Any modification to `BooleanFilter.ts` must run the AST equivalence test matrix proving that for every test expression $E$ and every synthetic thread $T$:
      $$\text{evaluateInMemory}(E, T) \equiv \text{querySqliteWithCompiledAst}(E, T)$$
-   - The same applies to changes in the shared DSL parser and formatter (`src/shared/filterParser.ts`, `src/shared/filterDsl.ts`). New `FilterExpr` nodes (e.g. Phase 6's full-text `Text` node) must be added to the matrix with one matching rule defined for both targets (see PRD FR-FILTER-04).
+   - The same applies to changes in the shared DSL parser and formatter (`src/shared/filterParser.ts`, `src/shared/filterDsl.ts`) and the search tokenizer (`src/shared/searchText.ts`). If `messages_fts`'s tokenizer changes, regenerate `src/shared/unicode61Table.ts` with `bun scripts/generate-unicode61-table.ts`. New `FilterExpr` nodes (e.g. Phase 6's full-text `Text` node) must be added to the matrix with one matching rule defined for both targets (see PRD FR-FILTER-04).
 
 ---
 
 ## 4. Mandatory Phase Execution & Hard Checkpoint Protocol
 
-> **STOP RULE:** The project is structured into **6 sequential phases** (defined in `./PRD.md` Section 5; Phases 1–5 are complete, Phase 6 is next). You must **NEVER** proceed from Phase $N$ to Phase $N+1$ in a single turn or without explicit human approval.
+> **STOP RULE:** The project is structured into **6 sequential phases** (defined in `./PRD.md` Section 5; all six phases are complete). You must **NEVER** proceed from Phase $N$ to Phase $N+1$ in a single turn or without explicit human approval.
 
 At the end of each phase, you must:
 
@@ -133,6 +133,7 @@ zero-effect/
 ├── data/                           # Git-ignored SQLite databases (registry + accounts/)
 ├── scripts/
 │   ├── setup-repos.sh              # Clones effect and inbox-zero into ./repos/
+│   ├── generate-unicode61-table.ts # Regenerates the search tokenizer table from SQLite
 │   └── cli-filter-demo.ts          # CLI inspector for Checkpoint 1
 ├── src/
 │   ├── server/
@@ -175,6 +176,9 @@ zero-effect/
 │   └── shared/
 │       ├── api.ts                  # Wire types shared by server and client
 │       ├── filterParser.ts         # DSL parser shared by server and browser
+│       ├── filterDsl.ts            # DSL formatter (FilterExpr → canonical DSL)
+│       ├── searchText.ts           # Full-text tokenizer and matcher (both targets)
+│       ├── unicode61Table.ts       # Generated: SQLite unicode61 per-code-point table
 │       ├── schemas.ts              # Effect Schema definitions
 │       └── errors.ts               # Data.TaggedError definitions
 ├── tests/
@@ -185,7 +189,7 @@ zero-effect/
 │   ├── phase3-llm-labeller.test.ts
 │   ├── phase4-api-and-e2e.test.ts
 │   ├── phase5-mail-features.test.ts
-│   └── phase6-search.test.ts       # (Phase 6)
+│   └── phase6-search.test.ts
 ├── package.json
 └── tsconfig.json
 ```

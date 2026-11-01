@@ -90,10 +90,10 @@ Incoming emails are ingested in real time via outbound Google Cloud Pub/Sub stre
   - **In-Memory Predicate:** Evaluates `FilterExpr` directly against a hydrated `Thread` object in memory before deciding whether to invoke an LLM rule.
 - **FR-FILTER-03 (Synchronized Visual & Text DSL Builder):**
   - Users can either type the query in a text bar with syntax highlighting/autocomplete OR build nested groups visually (`[+ Add Condition]`, `[+ Add AND/OR Group]`). Both views read/write the exact same `FilterExpr` AST.
-- **FR-FILTER-04 (Full-Text Search):** _(planned, Phase 6)_
-  - **Syntax:** bare words and quoted phrases in the DSL are search terms, combinable with every other condition: `invoice AND from:"acme" AND NOT label:Paid`, `"quarterly report" OR budget`. `text:"…"` is the explicit form (and what the formatter writes back). A new `FilterExpr` node, `{ _tag: "Text", value }`, carries them; the visual builder offers it as a "Text contains" condition.
-  - **Scope:** a thread matches when any of its messages matches, across subject, sender and body (`messages_fts`, which sync already maintains). Attachment file names are included; attachment contents are not.
-  - **Matching rule (one definition, both targets):** the value is split into tokens with FTS5's `unicode61` rules (case- and diacritic-insensitive, split on non-alphanumerics). Every token must be the **prefix of a word** in the thread's text, in any order; a quoted phrase additionally requires its tokens consecutively. Prefix matching lets Korean words match with particles attached (`보고서` matches `보고서를`).
+- **FR-FILTER-04 (Full-Text Search):** _(implemented, Phase 6)_
+  - **Syntax:** bare words and quoted phrases in the DSL are search terms, combinable with every other condition: `invoice AND from:"acme" AND NOT label:Paid`, `"quarterly report" OR budget`. Conditions side by side are ANDed (`invoice from:acme`); quoted keywords and colons are search text (`"not"`, `"from:x"`); search text needs at least one letter or digit. `text:"…"` is the explicit form (and what the formatter writes back). A new `FilterExpr` node, `{ _tag: "Text", value }`, carries them; the visual builder offers it as a "Text contains" condition.
+  - **Scope:** a thread matches when any of its messages matches, across subject, sender and body (`messages_fts`, which sync already maintains). Attachment file names are included (inline images excluded); attachment contents are not.
+  - **Matching rule (one definition, both targets):** the value is split into tokens with FTS5's `unicode61 remove_diacritics 2` rules (case-insensitive, diacritics dropped from Latin letters, split on non-alphanumerics). The browser and server use a per-code-point table generated from SQLite itself (`scripts/generate-unicode61-table.ts` → `src/shared/unicode61Table.ts`); a test fails if it drifts from the running SQLite. Every token must be the **prefix of a word** in the thread's text, in any order; a quoted phrase additionally requires its tokens consecutively. Prefix matching lets Korean words match with particles attached (`보고서` matches `보고서를`).
   - **SQLite compiler:** `threads.id IN (SELECT thread_id FROM messages_fts WHERE messages_fts MATCH ?)`, with each token bound as a quoted prefix query (`"invoi"*`), never interpolated.
   - **In-memory evaluator:** AI rule pre-conditions evaluate the same rule against the thread's message text, tokenized identically (`FilterThread` gains the thread's text, loaded only when a pre-condition contains a `Text` node).
   - **Equivalence law:** the AGENTS.md §3.3 matrix gains `Text` expressions (single words, prefixes, phrases, Hangul, accented and mixed-case text, `NOT` and nested combinations); `evaluateInMemory(E, T) ≡ querySqliteWithCompiledAst(E, T)` must keep holding for all of them.
@@ -122,7 +122,7 @@ Incoming emails are ingested in real time via outbound Google Cloud Pub/Sub stre
   - Exposes every action in the system with fuzzy search and nested sub-menus:
     - _Account_: Switch to Personal, Switch to Work, Trigger Sync, Manage "Send As" Aliases.
     - _Thread_: Archive (`e`), Apply/Remove Label (`l`), Run AI Labeller (`a`), Accept Ghost Label (`y`), Reject Ghost Label (`n`), Reply (`r`), Reply Switching Alias (`Shift+r`), Mark Read/Unread (`u`), Undo Last AI Action (`z`).
-    - _Filter & Views_: Filter by Boolean DSL, Create New Saved Split View, Jump to Label.
+    - _Filter & Views_: Search or Filter by Boolean DSL (`/`), Create New Saved Split View, Jump to Label.
     - _AI Rules_: Create Rule, Toggle Rule Dry-Run, Inspect Thread AI Audit Log (`w`).
 - **FR-UI-02 (First-Class Action Buttons + Vim Keybindings):**
   - Every major action is represented by a physical, clickable UI button in the persistent Action Toolbar AND a single-key Vim shortcut when not typing in an input.
@@ -322,7 +322,7 @@ CREATE TABLE ai_audit_logs (
   - Run `bun test` (including `tests/phase5-mail-features.test.ts`) and `bun run typecheck`.
   - Manually: open a thread with attachments and inline images, forward it with one attachment left out, trash and restore a thread, check several threads and archive them, and run "Mark all as read" on a view.
 
-### Phase 6: Full-Text Search _(planned)_
+### Phase 6: Full-Text Search _(implemented)_
 
 - **Scope:**
   - `Text` node in `FilterExpr` (bare words, quoted phrases, `text:"…"`) in the shared parser, formatter and visual builder (FR-FILTER-04).

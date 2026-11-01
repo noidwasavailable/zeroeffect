@@ -21,6 +21,7 @@ const FIELDS: ReadonlyArray<{ readonly value: ConditionField; readonly label: st
   { value: "label", label: "Label" },
   { value: "from", label: "From contains" },
   { value: "subject", label: "Subject contains" },
+  { value: "text", label: "Text contains" },
   { value: "is", label: "Is" },
 ];
 
@@ -107,7 +108,7 @@ export function FilterTreeEditor({ dsl, labelNames, onDslChange, onCompleteChang
               list={node.field === "label" ? datalistId : undefined}
               className={`${inputClass} w-56 ${invalid ? "border-red-500 dark:border-red-500" : ""}`}
               value={node.value}
-              placeholder={node.field === "label" ? "Label name" : "Text"}
+              placeholder={node.field === "label" ? "Label name" : node.field === "text" ? "Words or a phrase" : "Text"}
               onChange={(event) => edit(updateNode(tree, node.id, (current) => ({ ...current, value: event.target.value })))}
             />
           )}

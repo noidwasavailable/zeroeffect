@@ -9,6 +9,7 @@ import { extractOtpCode } from "../../shared/otp";
 import { formatFilterExpr, renameFilterLabels } from "../../shared/filterDsl";
 import { applyLabelChange } from "../../shared/threadActions";
 import type { FilterExpr, FilterThread } from "../../shared/schemas";
+import type { SearchDocument } from "../../shared/searchText";
 import type { ThreadDetail, ThreadSummary, ViewSummary } from "../../shared/api";
 import { renameLabelsInRulesFile } from "./AiRules";
 import type { AttachmentRecord } from "./MimeParser";
@@ -135,6 +136,8 @@ export interface AccountDbService {
   /** A message's attachments; null when it was stored before attachments were recorded (or is unknown). */
   readonly getMessageAttachments: (id: string) => Effect.Effect<ReadonlyArray<AttachmentRecord> | null, DatabaseError>;
   readonly setMessageAttachments: (id: string, attachments: ReadonlyArray<AttachmentRecord>) => Effect.Effect<void, DatabaseError>;
+  /** A thread's `messages_fts` rows (subject, sender, body, attachment names), for in-memory `Text` evaluation. */
+  readonly getThreadSearchDocuments: (threadId: string) => Effect.Effect<ReadonlyArray<SearchDocument>, DatabaseError>;
   /** Messages of a thread stored before attachments were recorded (backfilled when the thread is opened). */
   readonly listMessagesWithoutAttachmentInfo: (threadId: string) => Effect.Effect<ReadonlyArray<string>, DatabaseError>;
   /** Applies one label change to many threads in a single transaction (bulk actions). */
@@ -318,6 +321,46 @@ const migrateAiStorage = (database: Database): void => {
   })();
 };
 
+// Full-text search over every message (FR-FILTER-04). The tokenizer is shared with the in-memory
+// evaluator (src/shared/searchText.ts), so changing it means regenerating src/shared/unicode61Table.ts.
+const MESSAGES_FTS_TABLE = `
+  CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+    thread_id UNINDEXED, subject, from_address, body_markdown, attachment_names,
+    tokenize = 'unicode61 remove_diacritics 2'
+  );
+`;
+const SEARCH_INDEX_MIGRATION_ID = "messages-fts-v2";
+
+/** Rewrites a thread's search rows from its messages: one row per message, with the thread subject. */
+const reindexThreadText = (database: Database, threadId: string): void => {
+  database.prepare("DELETE FROM messages_fts WHERE thread_id = ?").run(threadId);
+  database.prepare(`
+    INSERT INTO messages_fts (thread_id, subject, from_address, body_markdown, attachment_names)
+    SELECT messages.thread_id, threads.subject, messages.from_address, messages.body_markdown,
+      COALESCE((
+        SELECT group_concat(json_extract(attachment.value, '$.filename'), ' ')
+        FROM json_each(messages.attachments_json) AS attachment
+        WHERE NOT json_extract(attachment.value, '$.inline')
+      ), '')
+    FROM messages JOIN threads ON threads.id = messages.thread_id
+    WHERE messages.thread_id = ?
+  `).run(threadId);
+};
+
+/** The v1 index used FTS5's default tokenizer and had no attachment names: rebuild it once. */
+const migrateSearchIndex = (database: Database): void => {
+  if (database.prepare("SELECT 1 FROM schema_migrations WHERE id = ?").get(SEARCH_INDEX_MIGRATION_ID)) return;
+  database.transaction(() => {
+    if (!columnNames(database, "messages_fts").includes("attachment_names")) {
+      database.exec("DROP TABLE messages_fts");
+      database.exec(MESSAGES_FTS_TABLE);
+      const threadIds = database.prepare("SELECT DISTINCT thread_id FROM messages").all() as Array<{ thread_id: string }>;
+      for (const row of threadIds) reindexThreadText(database, row.thread_id);
+    }
+    database.prepare("INSERT INTO schema_migrations (id) VALUES (?)").run(SEARCH_INDEX_MIGRATION_ID);
+  })();
+};
+
 const initialize = (database: Database): void => {
   database.exec("PRAGMA journal_mode = WAL;");
   database.exec("PRAGMA foreign_keys = ON;");
@@ -374,9 +417,7 @@ const initialize = (database: Database): void => {
       body_html TEXT,
       attachments_json TEXT
     );
-    CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
-      thread_id UNINDEXED, subject, from_address, body_markdown
-    );
+    ${MESSAGES_FTS_TABLE}
     CREATE TABLE IF NOT EXISTS gmail_hydrated_threads (
       thread_id TEXT PRIMARY KEY REFERENCES threads(id) ON DELETE CASCADE
     );
@@ -393,6 +434,7 @@ const initialize = (database: Database): void => {
   `);
 
   migrateAiStorage(database);
+  migrateSearchIndex(database);
 
   const migrationId = "gmail-hydrated-threads-v1";
   const migrationExists = database.prepare("SELECT 1 FROM schema_migrations WHERE id = ?").get(migrationId);
@@ -448,8 +490,9 @@ const makeService = (accountId: string, database: Database, rulesStore: RulesSto
   accountId,
   upsertThread: (thread) =>
     Effect.try({
-      try: () => {
-        database.prepare(`
+      try: () => database.transaction(() => {
+        const previous = database.prepare("SELECT subject FROM threads WHERE id = ?").get(thread.id) as { subject: string } | null;
+        const saved = database.prepare(`
           INSERT INTO threads (
             id, subject, snippet, last_message_at, is_unread, is_starred, is_archived,
             sender_summary, delivered_to_alias, labels_json, ghost_labels_json, ai_status, otp_code
@@ -469,7 +512,8 @@ const makeService = (accountId: string, database: Database, rulesStore: RulesSto
             -- AI state is owned by the AI worker; sync only sets it when explicitly given.
             ghost_labels_json = COALESCE(?11, threads.ghost_labels_json),
             ai_status = COALESCE(?12, threads.ai_status)
-        `).run(
+          RETURNING subject
+        `).get(
           thread.id,
           thread.subject,
           thread.snippet ?? "",
@@ -483,8 +527,10 @@ const makeService = (accountId: string, database: Database, rulesStore: RulesSto
           thread.ghostLabels ? JSON.stringify(thread.ghostLabels) : null,
           thread.aiStatus ?? null,
           thread.otpCode ?? null,
-        );
-      },
+        ) as { subject: string };
+        // Search rows carry the thread subject.
+        if (previous && previous.subject !== saved.subject) reindexThreadText(database, thread.id);
+      })(),
       catch: (cause) => new DatabaseError({ message: "Failed to upsert thread.", operation: "upsertThread", cause }),
     }).pipe(Effect.asVoid),
   getThread: (id) =>
@@ -670,13 +716,7 @@ const makeService = (accountId: string, database: Database, rulesStore: RulesSto
             message.bodyHtml ?? null,
             message.attachments ? JSON.stringify(message.attachments) : null,
           );
-          database.prepare("DELETE FROM messages_fts WHERE thread_id = ?").run(message.threadId);
-          database.prepare(`
-            INSERT INTO messages_fts (thread_id, subject, from_address, body_markdown)
-            SELECT messages.thread_id, threads.subject, messages.from_address, messages.body_markdown
-            FROM messages JOIN threads ON threads.id = messages.thread_id
-            WHERE messages.thread_id = ?
-          `).run(message.threadId);
+          reindexThreadText(database, message.threadId);
         })();
       },
       catch: (cause) => new DatabaseError({ message: "Failed to save message.", operation: "upsertMessage", cause }),
@@ -696,8 +736,20 @@ const makeService = (accountId: string, database: Database, rulesStore: RulesSto
     }),
   setMessageAttachments: (id, attachments) =>
     Effect.try({
-      try: () => { database.prepare("UPDATE messages SET attachments_json = ? WHERE id = ?").run(JSON.stringify(attachments), id); },
+      try: () => database.transaction(() => {
+        const row = database.prepare("UPDATE messages SET attachments_json = ? WHERE id = ? RETURNING thread_id")
+          .get(JSON.stringify(attachments), id) as { thread_id: string } | null;
+        if (row) reindexThreadText(database, row.thread_id);
+      })(),
       catch: (cause) => new DatabaseError({ message: "Failed to save attachments.", operation: "setMessageAttachments", cause }),
+    }),
+  getThreadSearchDocuments: (threadId) =>
+    Effect.try({
+      try: () => (database.prepare(`
+        SELECT subject, from_address, body_markdown, attachment_names FROM messages_fts WHERE thread_id = ? ORDER BY rowid
+      `).all(threadId) as Array<{ subject: string; from_address: string; body_markdown: string; attachment_names: string }>)
+        .map((row) => [row.subject, row.from_address, row.body_markdown, row.attachment_names]),
+      catch: (cause) => new DatabaseError({ message: "Failed to load search text.", operation: "getThreadSearchDocuments", cause }),
     }),
   listMessagesWithoutAttachmentInfo: (threadId) =>
     Effect.try({
@@ -764,13 +816,7 @@ const makeService = (accountId: string, database: Database, rulesStore: RulesSto
           const row = database.prepare("SELECT thread_id FROM messages WHERE id = ?").get(id) as { thread_id: string } | null;
           database.prepare("DELETE FROM messages WHERE id = ?").run(id);
           if (row) {
-            database.prepare("DELETE FROM messages_fts WHERE thread_id = ?").run(row.thread_id);
-            database.prepare(`
-              INSERT INTO messages_fts (thread_id, subject, from_address, body_markdown)
-              SELECT messages.thread_id, threads.subject, messages.from_address, messages.body_markdown
-              FROM messages JOIN threads ON threads.id = messages.thread_id
-              WHERE messages.thread_id = ?
-            `).run(row.thread_id);
+            reindexThreadText(database, row.thread_id);
             // Gmail has no empty threads, so drop the thread (and its cascaded rows) with its last message.
             database.prepare(`
               DELETE FROM threads WHERE id = ? AND NOT EXISTS (SELECT 1 FROM messages WHERE thread_id = ?)

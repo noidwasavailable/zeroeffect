@@ -3,7 +3,10 @@ import { parseFilterDsl } from "../../shared/filterParser";
 import { noAutofill } from "../noAutofill";
 import { Keycap } from "./Keycap";
 
-/** Boolean DSL query applied on top of the current view (Enter applies, Esc leaves the field). */
+/**
+ * Boolean DSL query applied on top of the current view (Enter applies, Esc leaves the field).
+ * Plain words search message text, so it doubles as the search box.
+ */
 export function FilterBar({ draft, appliedError, onDraftChange, onApply, ref }: {
   readonly draft: string;
   /** A server-side rejection of the last applied query. */
@@ -34,9 +37,9 @@ export function FilterBar({ draft, appliedError, onDraftChange, onApply, ref }: 
             if (event.key === "Escape") event.currentTarget.blur();
           }}
           spellCheck={false}
-          aria-label="Filter by Boolean DSL"
+          aria-label="Search or filter by Boolean DSL"
           aria-invalid={error !== null}
-          placeholder='is:unread AND (label:"Label A" OR from:boss)'
+          placeholder='Search, or is:unread AND (label:"Label A" OR from:boss)'
           className="min-w-0 flex-1 bg-transparent py-1.5 font-mono text-sm outline-none"
         />
         {draft && (

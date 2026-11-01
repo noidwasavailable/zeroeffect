@@ -175,7 +175,7 @@ export const buildActions = (context: ActionContext): ReadonlyArray<AppAction> =
       enabled: context.threadOpen, run: context.closeThread,
     },
     {
-      id: "navigation.search", label: "Filter by Boolean DSL", group: "Filter & Views", shortcut: { key: "/" },
+      id: "navigation.search", label: "Search or filter by Boolean DSL", group: "Filter & Views", shortcut: { key: "/" },
       enabled: true, run: context.focusSearch,
     },
     {

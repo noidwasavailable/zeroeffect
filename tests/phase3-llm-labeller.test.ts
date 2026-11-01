@@ -350,6 +350,29 @@ describe("Phase 3: one structured LLM call per thread", () => {
     expect(offeredRuleNames(llmRequests[0]!)).toEqual(["Boss"]);
   });
 
+  test("full-text preconditions search the thread's message text before any LLM call (Phase 6)", async () => {
+    await env.db.writeRulesFile(formatRulesFile({
+      version: 1, llmEndpointId: "test-llm",
+      rules: [
+        rule({ name: "Invoices", precondition: 'invoi AND NOT "unsubscribe here"', instructions: "Invoices to pay" }),
+        rule({ name: "Reports", precondition: "보고서", instructions: "Reports from colleagues" }),
+      ],
+    })).pipe(Effect.runPromise);
+    await env.deliver("t-invoice", { id: "m1", from: "billing@vendor.example", at: 100, labels: ["INBOX"], body: "Your INVOICE for March is attached." });
+    llmReplies.push(selection(["Invoices"]));
+    expect(await env.run("t-invoice")).toMatchObject({ llmCalled: true, appliedRules: ["Invoices"] });
+    expect(offeredRuleNames(llmRequests[0]!)).toEqual(["Invoices"]);
+
+    // Preconditions gate the AI: a thread no precondition matches costs no call at all.
+    await env.deliver("t-promo", { id: "m2", from: "deals@shop.example", at: 100, labels: ["INBOX"], body: "Invoices made easy. Unsubscribe here." });
+    expect(await env.run("t-promo")).toMatchObject({ status: "skipped", llmCalled: false });
+    await env.deliver("t-report", { id: "m3", from: "Kim <kim@work.example>", at: 100, labels: ["INBOX"], body: "보고서를 보냈습니다." });
+    llmReplies.push(selection(["Reports"]));
+    expect(await env.run("t-report")).toMatchObject({ llmCalled: true, appliedRules: ["Reports"] });
+    expect(llmRequests).toHaveLength(2);
+    expect(offeredRuleNames(llmRequests[1]!)).toEqual(["Reports"]);
+  });
+
   test("no match is audited without changes and is not undoable", async () => {
     await env.deliver("t-misc", { id: "m1", from: "x@example.com", at: 100, labels: ["INBOX"] });
     llmReplies.push(selection([]));

@@ -1,5 +1,6 @@
 import * as Schema from "effect/Schema";
 import { CONVERSATION_STATUSES, type ConversationStatus } from "./aiRules";
+import type { SearchDocument } from "./searchText";
 
 export type FilterExpr =
   | { readonly _tag: "And"; readonly expressions: ReadonlyArray<FilterExpr> }
@@ -10,7 +11,9 @@ export type FilterExpr =
       readonly value: "unread" | "read" | "starred" | "archived";
     }
   | { readonly _tag: "Label"; readonly value: string }
-  | { readonly _tag: "Contains"; readonly field: "from" | "subject"; readonly value: string };
+  | { readonly _tag: "Contains"; readonly field: "from" | "subject"; readonly value: string }
+  /** Full-text search: the value's tokens, consecutively and as word prefixes, in any one message. */
+  | { readonly _tag: "Text"; readonly value: string };
 
 /** Recursive, serializable AST shared by the DSL, SQL compiler, and UI. */
 export const FilterExprSchema: Schema.Codec<FilterExpr> = Schema.suspend(() =>
@@ -32,6 +35,7 @@ export const FilterExprSchema: Schema.Codec<FilterExpr> = Schema.suspend(() =>
       field: Schema.Literals(["from", "subject"]),
       value: Schema.String,
     }),
+    Schema.TaggedStruct("Text", { value: Schema.String }),
   ]),
 );
 
@@ -43,6 +47,11 @@ export interface FilterThread {
   readonly isUnread: boolean;
   readonly isStarred: boolean;
   readonly isArchived: boolean;
+  /**
+   * The thread's indexed message text, one document per message, for `Text` conditions. Loaded
+   * only when an expression contains one (see `containsTextSearch`); without it they match nothing.
+   */
+  readonly searchDocuments?: ReadonlyArray<SearchDocument>;
 }
 
 export interface AccountRecord {

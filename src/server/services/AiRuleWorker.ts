@@ -2,7 +2,9 @@ import { randomUUID } from "node:crypto";
 import { Context, Effect, Layer } from "effect";
 import { CONVERSATION_STATUSES, isConversationStatus, type AiRule, type ConversationStatus } from "../../shared/aiRules";
 import { DatabaseError, GmailApiError, LlmEndpointError } from "../../shared/errors";
+import { containsTextSearch } from "../../shared/filterDsl";
 import { parseFilterDsl } from "../../shared/filterParser";
+import type { FilterThread } from "../../shared/schemas";
 import type { RuleSelection } from "../../shared/schemas";
 import { AccountDb, type AccountDbService, type AiAuditRecord, type AiThreadMessage } from "./AccountDb";
 import { parseRulesFile } from "./AiRules";
@@ -140,10 +142,16 @@ const makeService = (
     const inherited: AiRule[] = [];
     const aiCandidates: AiRule[] = [];
     let conversationRules: AiRule[] = [];
+    // Message text is read from the search index only when a precondition searches it.
+    let filterThread: FilterThread | null = null;
     for (const rule of rules) {
       if (rule.precondition?.trim()) {
         const precondition = parseFilterDsl(rule.precondition);
-        if (!precondition.ok || !booleanFilter.evaluate(precondition.expression, context.thread)) continue;
+        if (!precondition.ok) continue;
+        if (containsTextSearch(precondition.expression) && !filterThread) {
+          filterThread = { ...context.thread, searchDocuments: yield* accountDb.getThreadSearchDocuments(threadId) };
+        }
+        if (!booleanFilter.evaluate(precondition.expression, filterThread ?? context.thread)) continue;
       }
       if (isFollowUp && !rule.runOnThreads) {
         // First-message-only rules cost nothing on replies: inherit an earlier match, never ask again.
