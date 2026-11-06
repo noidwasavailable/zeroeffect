@@ -12,7 +12,7 @@ import { Keycap } from "./Keycap";
  */
 export type PalettePage = "actions" | "labels" | "aliases" | "labelJump" | "labelManage" | "accountAliases";
 
-const GROUP_ORDER: ReadonlyArray<ActionGroup> = ["Thread", "Selection", "Labels", "AI", "Navigation", "Filter & Views", "Account", "Help"];
+const GROUP_ORDER: ReadonlyArray<ActionGroup> = ["Thread", "Selection", "Labels", "AI", "Navigation", "Filter & Views", "Account", "Settings", "Help"];
 
 const PLACEHOLDERS: Record<PalettePage, string> = {
   actions: "Type a command…",

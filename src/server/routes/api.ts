@@ -7,6 +7,7 @@ import {
   LOCAL_REQUEST_HEADER,
   type AccountId,
   type ApiErrorBody,
+  type AppSettings,
   type BulkThreadResult,
   type SendAsAliasDetail,
   type ForwardDraft,
@@ -316,7 +317,7 @@ export const createApiHandler = (config: ApiConfig): ApiHandler => {
     const db = await accountDb(accountId);
     const thread = await Effect.runPromise(db.getThreadDetail(threadId));
     if (!thread) return apiError(404, { error: "Thread not found." });
-    const { add, remove } = threadActionLabels(action);
+    const { add, remove } = threadActionLabels(action, await Effect.runPromise(config.registry.getSettings()));
     const gmail = await gmailClient(accountId);
     // Gmail first: the local copy only changes once Gmail has accepted the change.
     await Effect.runPromise(Effect.gen(function* () {
@@ -327,6 +328,21 @@ export const createApiHandler = (config: ApiConfig): ApiHandler => {
     const updated = await Effect.runPromise(db.applyThreadLabelChange(threadId, add, remove));
     config.events.publish(accountId, { type: "threads-changed", threadIds: [threadId] });
     return json({ thread: updated });
+  };
+
+  /** Updates the settings sent (each optional); the others keep their stored values. */
+  const saveSettings = async (request: Request): Promise<Response> => {
+    const body = await readJson(request);
+    if (!body) return apiError(400, { error: "Request body must be a JSON object." });
+    if (body.markReadOnArchive !== undefined && typeof body.markReadOnArchive !== "boolean") {
+      return apiError(400, { error: "markReadOnArchive must be true or false." });
+    }
+    const current = await Effect.runPromise(config.registry.getSettings());
+    const settings: AppSettings = {
+      markReadOnArchive: typeof body.markReadOnArchive === "boolean" ? body.markReadOnArchive : current.markReadOnArchive,
+    };
+    await Effect.runPromise(config.registry.saveSettings(settings));
+    return json({ settings });
   };
 
   /**
@@ -340,7 +356,7 @@ export const createApiHandler = (config: ApiConfig): ApiHandler => {
     if (!body || !action) return apiError(400, { error: "Unsupported thread action." });
     const db = await accountDb(accountId);
     let threadIds: ReadonlyArray<string>;
-    const { add, remove } = threadActionLabels(action);
+    const { add, remove } = threadActionLabels(action, await Effect.runPromise(config.registry.getSettings()));
     if (typeof body.view === "string") {
       // Narrow to threads the action changes, e.g. only unread threads for "mark all read".
       const narrowing = action.type === "markRead" ? [await Effect.runPromise(booleanFilter.parse("is:unread"))] : [];
@@ -880,6 +896,18 @@ export const createApiHandler = (config: ApiConfig): ApiHandler => {
             return await saveLlmEndpoint(request);
           }
           return apiError(405, { error: "Use GET or POST." });
+        } catch (error) {
+          return failureResponse(error);
+        }
+      }
+      if (url.pathname === "/api/settings") {
+        try {
+          if (request.method === "GET") return json({ settings: await Effect.runPromise(config.registry.getSettings()) });
+          if (request.method === "PUT") {
+            if (!isTrustedMutation(request)) return apiError(403, { error: "This request must come from the ZeroEffect web client." });
+            return await saveSettings(request);
+          }
+          return apiError(405, { error: "Use GET or PUT." });
         } catch (error) {
           return failureResponse(error);
         }

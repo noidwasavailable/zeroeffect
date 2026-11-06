@@ -17,6 +17,7 @@ import {
   type RulesProblemSummary,
   type RulesResponse,
   type ApiErrorBody,
+  type AppSettings,
   type LabelSummary,
   type ServerStatus,
   type SyncJobStatus,
@@ -99,6 +100,9 @@ export const api = {
   refreshAliases: (accountId: string) =>
     request<{ aliases: ReadonlyArray<SendAsAliasDetail> }>(accountPath(accountId, "/aliases/refresh"), { method: "POST", body: {} })
       .then((body) => body.aliases),
+  settings: () => request<{ settings: AppSettings }>("/api/settings").then((body) => body.settings),
+  saveSettings: (settings: Partial<AppSettings>) =>
+    request<{ settings: AppSettings }>("/api/settings", { method: "PUT", body: settings }).then((body) => body.settings),
   serverStatus: () => request<{ status: ServerStatus }>("/api/status").then((body) => body.status),
   dismissResolvedProblems: () => request<{ status: ServerStatus }>("/api/status/dismiss", { method: "POST", body: {} }).then((body) => body.status),
   syncStatus: (accountId: string) =>

@@ -395,17 +395,20 @@ describe("Phase 5: attachment, bulk, forward, label and alias routes", () => {
     const archived = await env.send("POST", "/api/a/personal/threads/bulk", { action: { type: "archive" }, threadIds: ["p-1", "p-2", "w-1", "nope"] });
     expect(await archived.json()).toEqual({ threadsUpdated: 2, messagesUpdated: 3 });
     expect(env.gmailCalls).toEqual([
-      { method: "POST", path: "/gmail/v1/users/me/messages/batchModify", body: { ids: ["m-1", "m-2a", "m-2b"], addLabelIds: [], removeLabelIds: ["INBOX"] } },
+      { method: "POST", path: "/gmail/v1/users/me/messages/batchModify", body: { ids: ["m-1", "m-2a", "m-2b"], addLabelIds: [], removeLabelIds: ["INBOX", "UNREAD"] } },
     ]);
-    expect(await Effect.runPromise(env.personal.getThread("p-2"))).toMatchObject({ isArchived: true, labels: ["UNREAD"] });
+    // Archiving marks read too (markReadOnArchive is on by default).
+    expect(await Effect.runPromise(env.personal.getThread("p-2"))).toMatchObject({ isArchived: true, isUnread: false, labels: [] });
     // The work silo is untouched.
     expect(await Effect.runPromise(env.work.getThread("w-1"))).toMatchObject({ isArchived: false });
 
     env.gmailCalls.length = 0;
+    await env.send("POST", "/api/a/personal/threads/bulk", { action: { type: "markUnread" }, threadIds: ["p-1", "p-3"] });
+    env.gmailCalls.length = 0;
     const read = await env.send("POST", "/api/a/personal/threads/bulk", { action: { type: "markRead" }, view: "all" });
     expect(await read.json()).toEqual({ threadsUpdated: 2, messagesUpdated: 2 });
     expect(env.gmailCalls).toEqual([
-      { method: "POST", path: "/gmail/v1/users/me/messages/batchModify", body: { ids: ["m-1", "m-2b"], addLabelIds: [], removeLabelIds: ["UNREAD"] } },
+      { method: "POST", path: "/gmail/v1/users/me/messages/batchModify", body: { ids: ["m-1", "m-3"], addLabelIds: [], removeLabelIds: ["UNREAD"] } },
     ]);
     const unread = await (await env.call("/api/a/personal/threads?view=all&q=is:unread")).json() as { threads: ThreadSummary[] };
     expect(unread.threads).toEqual([]);
@@ -419,10 +422,32 @@ describe("Phase 5: attachment, bulk, forward, label and alias routes", () => {
     expect((await env.send("POST", "/api/a/personal/threads/bulk", { action: { type: "archive" }, view: "nope" })).status).toBe(404);
   });
 
+  test("archive and trash mark read unless the markReadOnArchive setting is off", async () => {
+    expect(await (await env.call("/api/settings")).json()).toEqual({ settings: { markReadOnArchive: true } });
+    expect((await env.send("PUT", "/api/settings", { markReadOnArchive: "no" })).status).toBe(400);
+    // Without the web client's header the change is refused.
+    expect((await env.call("/api/settings", { method: "PUT", body: JSON.stringify({ markReadOnArchive: false }) })).status).toBe(403);
+    expect(await (await env.send("PUT", "/api/settings", { markReadOnArchive: false })).json()).toEqual({ settings: { markReadOnArchive: false } });
+    expect(await (await env.call("/api/settings")).json()).toEqual({ settings: { markReadOnArchive: false } });
+
+    await env.send("POST", "/api/a/personal/threads/p-1/actions", { type: "archive" });
+    expect(env.gmailCalls.at(-1)).toMatchObject({ path: "/gmail/v1/users/me/threads/p-1/modify", body: { addLabelIds: [], removeLabelIds: ["INBOX"] } });
+    expect(await Effect.runPromise(env.personal.getThread("p-1"))).toMatchObject({ isArchived: true, isUnread: true });
+    await env.send("POST", "/api/a/personal/threads/bulk", { action: { type: "trash" }, threadIds: ["p-2"] });
+    expect(await Effect.runPromise(env.personal.getThread("p-2"))).toMatchObject({ labels: ["UNREAD", "TRASH"], isUnread: true });
+
+    // Only archive and trash widen; spam and plain label changes keep the unread state.
+    const on = { markReadOnArchive: true };
+    expect(threadActionLabels({ type: "archive" }, on)).toEqual({ add: [], remove: ["INBOX", "UNREAD"] });
+    expect(threadActionLabels({ type: "trash" }, on)).toEqual({ add: ["TRASH"], remove: ["INBOX", "SPAM", "UNREAD"] });
+    expect(threadActionLabels({ type: "spam" }, on)).toEqual({ add: ["SPAM"], remove: ["INBOX", "TRASH"] });
+    expect(threadActionLabels({ type: "moveToInbox" }, on)).toEqual({ add: ["INBOX"], remove: [] });
+  });
+
   test("trash and spam are thread actions with their own views", async () => {
     const trashed = await env.send("POST", "/api/a/personal/threads/p-3/actions", { type: "trash" });
     expect(await trashed.json()).toMatchObject({ thread: { labels: ["TRASH"], isArchived: true } });
-    expect(env.gmailCalls.at(-1)).toMatchObject({ path: "/gmail/v1/users/me/threads/p-3/modify", body: { addLabelIds: ["TRASH"], removeLabelIds: ["INBOX", "SPAM"] } });
+    expect(env.gmailCalls.at(-1)).toMatchObject({ path: "/gmail/v1/users/me/threads/p-3/modify", body: { addLabelIds: ["TRASH"], removeLabelIds: ["INBOX", "SPAM", "UNREAD"] } });
     const trash = await (await env.call("/api/a/personal/threads?view=trash")).json() as { threads: ThreadSummary[] };
     expect(trash.threads.map((thread) => thread.id)).toEqual(["p-3"]);
     const all = await (await env.call("/api/a/personal/threads?view=all")).json() as { threads: ThreadSummary[] };
@@ -510,6 +535,7 @@ describe("Phase 5: commands, bulk targets and views", () => {
     toggleBuilder: noop("builder"), saveView: noop("save"), editView: noop("edit"), deleteView: noop("delete"), moveView: noop("move-view"),
     runAi: noop("ai"), decideGhostLabels: noop("ghost"), toggleAudit: noop("audit"), undoAi: noop("undo"), openRules: noop("rules"),
     toggleRuleDryRun: noop("dry"), openComposer: noop("reply"), changeAlias: noop("alias"), sendReply: noop("send"), discardReply: noop("discard"),
+    markReadOnArchive: true, toggleMarkReadOnArchive: noop("toggle-mark-read-on-archive"),
   };
   const key = (actions: ReturnType<typeof buildActions>, pressed: string) =>
     actions.find((action) => action.shortcut && matchesShortcut({ key: pressed, code: "", altKey: false, metaKey: false, ctrlKey: false }, action.shortcut));

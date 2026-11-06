@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
+  DEFAULT_APP_SETTINGS,
   isAccountId,
   type AccountEvent,
+  type AppSettings,
   type LabelSummary as LabelRecordSummary,
   type SendAsAliasDetail,
   type AiAuditSummary,
@@ -151,6 +153,12 @@ function Inbox({ accounts, route, navigate }: {
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [palettePage, setPalettePage] = useState<PalettePage>("actions");
   const [syncing, setSyncing] = useState(false);
+  // Set while a sync the user asked for runs, so its completion (and only that one) is announced.
+  const syncRequested = useRef(false);
+  const [settings, setSettings] = useState<AppSettings>(DEFAULT_APP_SETTINGS);
+  useEffect(() => {
+    api.settings().then(setSettings, (error) => setNotice({ text: `Could not load settings: ${errorMessage(error)}`, tone: "error" }));
+  }, []);
   const [notice, setNotice] = useState<{ readonly text: string; readonly tone: "info" | "error" } | null>(null);
   const [aiBusy, setAiBusy] = useState(false);
   const [auditOpen, setAuditOpen] = useState(false);
@@ -201,8 +209,19 @@ function Inbox({ accounts, route, navigate }: {
   const viewDsl = view?.dsl;
 
   const foundIndex = threads.findIndex((thread) => thread.id === selection.id);
-  const selectedIndex = foundIndex >= 0 ? foundIndex : Math.min(selection.index, threads.length - 1);
-  const selectedThread = threads[selectedIndex] ?? null;
+  // The open conversation can leave the list while it is being read (e.g. marked read in Unread).
+  // It stays the selection, sitting just before the row now at its old index, so j opens that row
+  // and thread actions still apply to what is on screen.
+  const openDetail = openThreadId !== null && detail?.id === openThreadId ? detail : null;
+  const openLeftList = foundIndex < 0 && openDetail !== null && selection.id === openThreadId;
+  const selectedIndex = foundIndex >= 0 ? foundIndex : openLeftList ? -1 : Math.min(selection.index, threads.length - 1);
+  const selectedThread: ThreadSummary | null = openLeftList ? openDetail : threads[selectedIndex] ?? null;
+  const canSelectNext = openLeftList ? selection.index < threads.length : selectedIndex < threads.length - 1;
+  const canSelectPrevious = openLeftList ? selection.index > 0 : selectedIndex > 0;
+  // Keep the remembered index on the selected row as the list shifts, for the fallback above.
+  useEffect(() => {
+    if (foundIndex >= 0 && foundIndex !== selection.index) setSelection((previous) => ({ ...previous, index: foundIndex }));
+  }, [foundIndex, selection.index]);
   const checkedThreads = useMemo(() => threads.filter((thread) => checked.has(thread.id)), [threads, checked]);
   // Thread actions apply to the checked threads when there are any, else to the selected one.
   const targets = useMemo(
@@ -277,16 +296,24 @@ function Inbox({ accounts, route, navigate }: {
     void loadThreads("replace");
   }, [loadThreads]);
 
+  // Only the latest detail request for the open conversation may update the reader: with j/k
+  // moving on (or a refresh for the previous conversation still in flight), late replies are dropped.
+  const openThreadRef = useRef(openThreadId);
+  openThreadRef.current = openThreadId;
+  const detailRequest = useRef(0);
   const loadDetail = useCallback(async (threadId: string) => {
+    const request = ++detailRequest.current;
+    const current = () => request === detailRequest.current && threadId === openThreadRef.current;
     setDetailLoading(true);
     try {
       const thread = await api.thread(accountId, threadId);
+      if (!current()) return;
       setDetail(thread);
       setDetailError(null);
     } catch (error) {
-      setDetailError(errorMessage(error));
+      if (current()) setDetailError(errorMessage(error));
     } finally {
-      setDetailLoading(false);
+      if (current()) setDetailLoading(false);
     }
   }, [accountId]);
 
@@ -298,6 +325,7 @@ function Inbox({ accounts, route, navigate }: {
     }
     setSelection((previous) => ({ id: openThreadId, index: previous.index }));
     setDetail((previous) => previous?.id === openThreadId ? previous : null);
+    setDetailError(null);
     void loadDetail(openThreadId);
   }, [openThreadId, loadDetail]);
 
@@ -310,7 +338,7 @@ function Inbox({ accounts, route, navigate }: {
       setThreads((previous) => previous.map((thread) => thread.id === next.id ? next : thread));
       setDetail((previous) => previous?.id === next.id ? { ...previous, ...next } : previous);
     };
-    replace(applyThreadAction(target, action));
+    replace(applyThreadAction(target, action, settings));
     try {
       replace(await api.threadAction(accountId, target.id, action));
       if (action.type === "archive" && openThreadId === target.id) closeThread();
@@ -320,14 +348,14 @@ function Inbox({ accounts, route, navigate }: {
       replace(target);
       setNotice({ text: errorMessage(error), tone: "error" });
     }
-  }, [selectedThread, accountId, openThreadId, closeThread, loadThreads]);
+  }, [selectedThread, settings, accountId, openThreadId, closeThread, loadThreads]);
 
   /** Runs an action on the checked threads in one bulk request, or on the selected thread. */
   const runTargetsAction = useCallback(async (action: ThreadAction) => {
     if (checkedThreads.length === 0) return runThreadAction(action);
     const before = threadsRef.current;
     const ids = new Set(checkedThreads.map((thread) => thread.id));
-    setThreads((previous) => previous.map((thread) => ids.has(thread.id) ? applyThreadAction(thread, action) : thread));
+    setThreads((previous) => previous.map((thread) => ids.has(thread.id) ? applyThreadAction(thread, action, settings) : thread));
     try {
       const result = await api.bulkThreadAction(accountId, { action, threadIds: [...ids] });
       setNotice({ text: `Updated ${result.threadsUpdated} ${result.threadsUpdated === 1 ? "conversation" : "conversations"}.`, tone: "info" });
@@ -341,7 +369,7 @@ function Inbox({ accounts, route, navigate }: {
       setNotice({ text: errorMessage(error), tone: "error" });
     }
     void loadThreads("refresh");
-  }, [checkedThreads, runThreadAction, accountId, openThreadId, loadDetail, loadThreads]);
+  }, [checkedThreads, runThreadAction, settings, accountId, openThreadId, loadDetail, loadThreads]);
 
   const markAllRead = useCallback(async () => {
     const scope = query ? `“${view?.name ?? viewId}” matching ${query}` : `“${view?.name ?? viewId}”`;
@@ -452,10 +480,10 @@ function Inbox({ accounts, route, navigate }: {
   // Opening an unread thread marks it read, as in Gmail.
   const markedRead = useRef(new Set<string>());
   useEffect(() => {
-    if (!detail?.isUnread || markedRead.current.has(detail.id)) return;
+    if (!detail?.isUnread || detail.id !== openThreadId || markedRead.current.has(detail.id)) return;
     markedRead.current.add(detail.id);
     void runThreadAction({ type: "markRead" }, detail);
-  }, [detail, runThreadAction]);
+  }, [detail, openThreadId, runThreadAction]);
 
   // The audit drawer follows the selected (or open) conversation.
   const auditThreadId = auditOpen ? selectedThread?.id ?? null : null;
@@ -715,22 +743,45 @@ function Inbox({ accounts, route, navigate }: {
       return;
     }
     setSyncing(event.status === "queued" || event.status === "running");
-    if (event.status === "completed") loadMeta();
+    if (event.status === "completed") {
+      loadMeta();
+      if (syncRequested.current) setNotice({ text: `Synced ${account.displayName}.`, tone: "info" });
+    }
     if (event.status === "failed") setNotice({ text: event.error ?? "Gmail sync failed.", tone: "error" });
+    if (event.status === "completed" || event.status === "failed") syncRequested.current = false;
   });
   useEffect(() => () => clearTimeout(refreshTimer.current), []);
 
   const sync = useCallback(() => {
     setSyncing(true);
+    syncRequested.current = true;
     api.sync(accountId).then(
-      () => setNotice({ text: `Syncing ${account.displayName}…`, tone: "info" }),
+      // A quick sync can finish (and announce itself) before this reply arrives.
+      () => { if (syncRequested.current) setNotice({ text: `Syncing ${account.displayName}…`, tone: "info" }); },
       (error) => {
+        // 409: a sync is already running; its completion is announced as this one's.
         if (error instanceof ApiRequestError && error.status === 409) return;
+        syncRequested.current = false;
         setSyncing(false);
         setNotice({ text: errorMessage(error), tone: "error" });
       },
     );
   }, [accountId, account]);
+
+  const toggleMarkReadOnArchive = useCallback(() => {
+    const markReadOnArchive = !settings.markReadOnArchive;
+    setSettings((previous) => ({ ...previous, markReadOnArchive }));
+    api.saveSettings({ markReadOnArchive }).then(
+      (saved) => {
+        setSettings(saved);
+        setNotice({ text: saved.markReadOnArchive ? "Archiving or trashing now marks conversations read." : "Archiving or trashing now leaves conversations unread.", tone: "info" });
+      },
+      (error) => {
+        setSettings((previous) => ({ ...previous, markReadOnArchive: !markReadOnArchive }));
+        setNotice({ text: `Could not save the setting: ${errorMessage(error)}`, tone: "error" });
+      },
+    );
+  }, [settings]);
 
   const savedViews = views.filter((candidate) => !candidate.builtIn);
   const savedIndex = savedViews.findIndex((candidate) => candidate.id === viewId);
@@ -818,8 +869,8 @@ function Inbox({ accounts, route, navigate }: {
     toggleHelp: () => setHelpOpen((open) => !open),
     selectedOtpCode: selectedThread ? copyableOtp(selectedThread, otpLabels) : null,
     threadOpen: openThreadId !== null,
-    canSelectNext: selectedIndex < threads.length - 1,
-    canSelectPrevious: selectedIndex > 0,
+    canSelectNext,
+    canSelectPrevious,
     syncing,
     builderOpen,
     auditOpen,
@@ -831,7 +882,9 @@ function Inbox({ accounts, route, navigate }: {
     rules: ruleSummaries,
     savedViewPosition: savedIndex >= 0 ? { index: savedIndex, count: savedViews.length } : null,
     moveSelection: (delta) => {
-      const index = Math.max(0, Math.min(threads.length - 1, selectedIndex + delta));
+      // From an open conversation that left the list, j goes to the row that took its place.
+      const from = openLeftList ? selection.index - (delta > 0 ? 1 : 0) : selectedIndex;
+      const index = Math.max(0, Math.min(threads.length - 1, from + delta));
       const thread = threads[index];
       if (!thread) return;
       setSelection({ id: thread.id, index });
@@ -914,7 +967,9 @@ function Inbox({ accounts, route, navigate }: {
     },
     sendReply: () => void sendReply(),
     discardReply,
-  }), [composerVisible, openComposer, sendReply, discardReply, accounts, account, accountId, views, view, viewId, savedViews, savedIndex, selectedThread, targets, checkedThreads, openThreadId, selectedIndex, threads, syncing, builderOpen, auditOpen, aiBusy, statusOpen, serverStatus, ruleSummaries, otpLabels, copyOtp, detail, currentFold, cursorIndex, newMessage, openNewMessage, openForward, sendNewMessage, discardNewMessage, draft, query, goTo, closeThread, runTargetsAction, markAllRead, toggleChecked, loadAccountAliases, navigate, sync, runAi, decideGhostLabels, undoAi, toggleRuleDryRun]);
+    markReadOnArchive: settings.markReadOnArchive,
+    toggleMarkReadOnArchive,
+  }), [settings, toggleMarkReadOnArchive, openLeftList, selection.index, canSelectNext, canSelectPrevious, composerVisible, openComposer, sendReply, discardReply, accounts, account, accountId, views, view, viewId, savedViews, savedIndex, selectedThread, targets, checkedThreads, openThreadId, selectedIndex, threads, syncing, builderOpen, auditOpen, aiBusy, statusOpen, serverStatus, ruleSummaries, otpLabels, copyOtp, detail, currentFold, cursorIndex, newMessage, openNewMessage, openForward, sendNewMessage, discardNewMessage, draft, query, goTo, closeThread, runTargetsAction, markAllRead, toggleChecked, loadAccountAliases, navigate, sync, runAi, decideGhostLabels, undoAi, toggleRuleDryRun]);
 
   useVimShortcuts(actions, !paletteOpen && !helpOpen && !statusOpen && viewDialog === null && rulesPanel === null && newMessage === null);
   const setupAction = actions.find((action) => action.id === "account.setup");
@@ -967,7 +1022,7 @@ function Inbox({ accounts, route, navigate }: {
       )}
       <ActionToolbar actions={actions} onOpenPalette={() => { setPalettePage("actions"); setPaletteOpen(true); }} />
       <div className="flex min-h-0 flex-1">
-        <ViewSidebar views={views} activeViewId={viewId} actions={actions} />
+        <ViewSidebar views={views} activeViewId={viewId} actions={actions} settings={{ "settings.markReadOnArchive": settings.markReadOnArchive }} />
         <div className={`min-h-0 overflow-y-auto ${openThreadId ? "hidden w-[26rem] shrink-0 border-r border-zinc-200 md:block dark:border-zinc-800" : "flex-1"}`}>
           {checkedThreads.length > 0 && <SelectionBar count={checkedThreads.length} actions={actions} />}
           <ThreadList

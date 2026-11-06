@@ -1,7 +1,7 @@
 import type { ActionGroup, AppAction } from "../actions";
 import { Keycap } from "./Keycap";
 
-const GROUPS: ReadonlyArray<ActionGroup> = ["Navigation", "Thread", "Selection", "Labels", "AI", "Filter & Views", "Account", "Help"];
+const GROUPS: ReadonlyArray<ActionGroup> = ["Navigation", "Thread", "Selection", "Labels", "AI", "Filter & Views", "Account", "Settings", "Help"];
 
 /** Cheat sheet of every single-key shortcut, grouped like the command palette. */
 export function ShortcutHelp({ actions, onClose }: { readonly actions: ReadonlyArray<AppAction>; readonly onClose: () => void }) {

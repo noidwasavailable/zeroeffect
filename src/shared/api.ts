@@ -138,6 +138,14 @@ export interface ApiErrorBody {
   readonly retryable?: boolean;
 }
 
+/** App-wide preferences (shared by both accounts), stored in the registry. */
+export interface AppSettings {
+  /** Archiving or trashing a conversation also marks it read, so its unread state does not linger elsewhere (e.g. GitHub). */
+  readonly markReadOnArchive: boolean;
+}
+
+export const DEFAULT_APP_SETTINGS: AppSettings = { markReadOnArchive: true };
+
 export type SyncJobStatus = "queued" | "running" | "completed" | "failed";
 
 export type AccountEvent =

@@ -1,7 +1,18 @@
-import type { ThreadAction, ThreadSummary } from "./api";
+import type { AppSettings, ThreadAction, ThreadSummary } from "./api";
 
-/** The Gmail label names a thread action adds and removes. */
-export const threadActionLabels = (action: ThreadAction): { readonly add: ReadonlyArray<string>; readonly remove: ReadonlyArray<string> } => {
+/** The Gmail label names a thread action adds and removes, given the settings that widen it. */
+export const threadActionLabels = (
+  action: ThreadAction,
+  settings: Pick<AppSettings, "markReadOnArchive"> = { markReadOnArchive: false },
+): { readonly add: ReadonlyArray<string>; readonly remove: ReadonlyArray<string> } => {
+  const labels = baseActionLabels(action);
+  if (settings.markReadOnArchive && (action.type === "archive" || action.type === "trash")) {
+    return { add: labels.add, remove: [...labels.remove, "UNREAD"] };
+  }
+  return labels;
+};
+
+const baseActionLabels = (action: ThreadAction): { readonly add: ReadonlyArray<string>; readonly remove: ReadonlyArray<string> } => {
   switch (action.type) {
     case "archive": return { add: [], remove: ["INBOX"] };
     case "moveToInbox": return { add: ["INBOX"], remove: [] };
@@ -28,8 +39,12 @@ export const applyLabelChange = (
 };
 
 /** The thread as it will look once the action succeeds (used for optimistic UI updates). */
-export const applyThreadAction = <T extends ThreadSummary>(thread: T, action: ThreadAction): T => {
-  const { add, remove } = threadActionLabels(action);
+export const applyThreadAction = <T extends ThreadSummary>(
+  thread: T,
+  action: ThreadAction,
+  settings?: Pick<AppSettings, "markReadOnArchive">,
+): T => {
+  const { add, remove } = threadActionLabels(action, settings);
   const labels = applyLabelChange(thread.labels, add, remove);
   return {
     ...thread,

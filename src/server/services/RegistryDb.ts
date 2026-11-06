@@ -3,6 +3,7 @@ import { dirname } from "node:path";
 import { Context, Effect, Layer } from "effect";
 import { Database } from "bun:sqlite";
 import { DatabaseError } from "../../shared/errors";
+import { DEFAULT_APP_SETTINGS, type AppSettings } from "../../shared/api";
 import type { AccountRecord, LlmEndpointRecord } from "../../shared/schemas";
 
 export interface RegistryDbService {
@@ -16,6 +17,9 @@ export interface RegistryDbService {
   readonly getLlmEndpoint: (id: string) => Effect.Effect<LlmEndpointRecord | null, DatabaseError>;
   /** Endpoint settings without their encrypted API keys. */
   readonly listLlmEndpoints: () => Effect.Effect<ReadonlyArray<Omit<LlmEndpointRecord, "apiKeyEnc">>, DatabaseError>;
+  /** App-wide settings; unset ones take their defaults. */
+  readonly getSettings: () => Effect.Effect<AppSettings, DatabaseError>;
+  readonly saveSettings: (settings: AppSettings) => Effect.Effect<void, DatabaseError>;
 }
 
 export class RegistryDb extends Context.Service<RegistryDb, RegistryDbService>()(
@@ -51,6 +55,10 @@ const initialize = (database: Database): void => {
       api_mode TEXT NOT NULL CHECK (api_mode IN ('responses', 'chat_completions')),
       timeout_ms INTEGER NOT NULL DEFAULT 30000,
       max_concurrency INTEGER NOT NULL DEFAULT 3
+    );
+    CREATE TABLE IF NOT EXISTS app_settings (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
     );
   `);
 };
@@ -179,6 +187,29 @@ const makeService = (database: Database): RegistryDbService => ({
       `).all() as Array<Omit<LlmEndpointRecord, "apiKeyEnc">>,
       catch: (cause) => new DatabaseError({ message: "Failed to list LLM endpoints.", operation: "listLlmEndpoints", cause }),
     }),
+  getSettings: () =>
+    Effect.try({
+      try: () => {
+        // One row per setting, its value as JSON; rows of the wrong type are ignored.
+        const rows = database.prepare("SELECT key, value FROM app_settings").all() as Array<{ key: string; value: string }>;
+        const stored = new Map(rows.map((row) => [row.key, JSON.parse(row.value) as unknown]));
+        const markReadOnArchive = stored.get("markReadOnArchive");
+        return {
+          markReadOnArchive: typeof markReadOnArchive === "boolean" ? markReadOnArchive : DEFAULT_APP_SETTINGS.markReadOnArchive,
+        } satisfies AppSettings;
+      },
+      catch: (cause) => new DatabaseError({ message: "Failed to load settings.", operation: "getSettings", cause }),
+    }),
+  saveSettings: (settings) =>
+    Effect.try({
+      try: () => {
+        const upsert = database.prepare("INSERT INTO app_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value");
+        database.transaction(() => {
+          for (const [key, value] of Object.entries(settings)) upsert.run(key, JSON.stringify(value));
+        })();
+      },
+      catch: (cause) => new DatabaseError({ message: "Failed to save settings.", operation: "saveSettings", cause }),
+    }).pipe(Effect.asVoid),
 });
 
 export const RegistryDbLive = (path = "./data/registry.sqlite"): Layer.Layer<RegistryDb, DatabaseError> =>

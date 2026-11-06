@@ -11,7 +11,7 @@ export interface Shortcut {
   readonly alt?: boolean;
 }
 
-export type ActionGroup = "Navigation" | "Thread" | "Selection" | "Labels" | "AI" | "Filter & Views" | "Account" | "Help";
+export type ActionGroup = "Navigation" | "Thread" | "Selection" | "Labels" | "AI" | "Filter & Views" | "Account" | "Settings" | "Help";
 
 export interface AppAction {
   readonly id: string;
@@ -112,6 +112,9 @@ export interface ActionContext {
   readonly changeAlias: () => void;
   readonly sendReply: () => void;
   readonly discardReply: () => void;
+  /** Archive and Move to Trash also mark the conversation read (an app-wide setting). */
+  readonly markReadOnArchive: boolean;
+  readonly toggleMarkReadOnArchive: () => void;
 }
 
 /** Action ids shown as buttons in the persistent toolbar, in order. */
@@ -333,6 +336,11 @@ export const buildActions = (context: ActionContext): ReadonlyArray<AppAction> =
     {
       id: "account.refreshAliases", label: "Refresh Send As aliases from Gmail", group: "Account",
       enabled: true, run: context.refreshAliases,
+    },
+    {
+      id: "settings.markReadOnArchive",
+      label: `${context.markReadOnArchive ? "Stop marking" : "Mark"} conversations read when archiving or trashing`,
+      group: "Settings", enabled: true, run: context.toggleMarkReadOnArchive,
     },
     {
       id: "help.shortcuts", label: "Keyboard shortcuts", group: "Help", shortcut: { key: "?" },

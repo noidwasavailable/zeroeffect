@@ -321,6 +321,8 @@ describe("Phase 4: one action registry drives the palette, toolbar and Vim keys"
     changeAlias: () => calls.push("alias"),
     sendReply: () => calls.push("send"),
     discardReply: () => calls.push("discard"),
+    markReadOnArchive: true,
+    toggleMarkReadOnArchive: () => calls.push("toggle-mark-read-on-archive"),
     copyOtp: () => calls.push("copy-otp"),
     openMessageCount: 3,
     allMessagesExpanded: false,
@@ -343,7 +345,7 @@ describe("Phase 4: one action registry drives the palette, toolbar and Vim keys"
       .toEqual([
         "account.aliases", "account.refreshAliases",
         "ai.createRule", "ai.dryRun.Newsletter", "compose.discardNew", "compose.sendNew", "composer.changeAlias", "composer.discard", "composer.send",
-        "labels.manage", "views.delete", "views.edit", "views.go.spam", "views.go.trash", "views.moveDown", "views.moveUp",
+        "labels.manage", "settings.markReadOnArchive", "views.delete", "views.edit", "views.go.spam", "views.go.trash", "views.moveDown", "views.moveUp",
       ]);
     const ids = new Set(actions.map((action) => action.id));
     for (const id of TOOLBAR_ACTION_IDS) expect(ids.has(id)).toBe(true);
@@ -450,6 +452,7 @@ describe("Phase 4: one action registry drives the palette, toolbar and Vim keys"
 
   test("optimistic action results match the server's label rules", () => {
     expect(applyThreadAction(thread, { type: "archive" })).toMatchObject({ labels: ["UNREAD"], isArchived: true });
+    expect(applyThreadAction(thread, { type: "archive" }, { markReadOnArchive: true })).toMatchObject({ labels: [], isArchived: true, isUnread: false });
     expect(applyThreadAction(thread, { type: "setLabels", add: ["Receipts"], remove: ["UNREAD"] }))
       .toMatchObject({ labels: ["INBOX", "Receipts"], isUnread: false });
   });
@@ -666,10 +669,11 @@ describe("Phase 4: account-scoped HTTP API", () => {
 
     const response = await env.post("/api/a/personal/threads/p-new/actions", { type: "archive" });
     expect(response.status).toBe(200);
-    expect(await response.json()).toMatchObject({ thread: { id: "p-new", isArchived: true, labels: ["UNREAD"] } });
+    // Archiving marks the thread read too (the markReadOnArchive setting, on by default).
+    expect(await response.json()).toMatchObject({ thread: { id: "p-new", isArchived: true, isUnread: false, labels: [] } });
     // One threads.modify call covers every message in the thread.
     expect(env.gmailCalls.map((call) => [call.path, call.token, call.body])).toEqual([
-      ["/gmail/v1/users/me/threads/p-new/modify", "Bearer token-personal", { addLabelIds: [], removeLabelIds: ["INBOX"] }],
+      ["/gmail/v1/users/me/threads/p-new/modify", "Bearer token-personal", { addLabelIds: [], removeLabelIds: ["INBOX", "UNREAD"] }],
     ]);
     const inbox = await (await env.call("/api/a/personal/threads?view=inbox")).json() as ThreadPage;
     expect(inbox.threads.map((thread) => thread.id)).toEqual(["p-old"]);
