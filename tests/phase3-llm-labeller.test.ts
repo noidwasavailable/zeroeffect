@@ -2,12 +2,12 @@ import { unusedGmailExtras } from "./helpers/TestLayers";
 import { afterAll, beforeEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { Effect, Layer } from "effect";
-import type { AiRule, AiRulesFile } from "../src/shared/aiRules";
+import type { AiRule, AiRulesFile, LlmApiMode } from "../src/shared/aiRules";
 import { LlmEndpointError } from "../src/shared/errors";
 import type { RuleSelection } from "../src/shared/schemas";
 import { AccountDb, AccountDbTest, type AccountDbService } from "../src/server/services/AccountDb";
 import { buildSystemPrompt, buildUserPrompt, resolveRuleName } from "../src/server/services/AiRulePrompt";
-import { formatRulesFile, importInboxZeroRules, parseRulesFile } from "../src/server/services/AiRules";
+import { formatRulesFile, importInboxZeroRules, parseRulesFile, withRulesProviders } from "../src/server/services/AiRules";
 import { AiRuleWorker, AiRuleWorkerLive, type AiRuleWorkerService } from "../src/server/services/AiRuleWorker";
 import { BooleanFilterLive } from "../src/server/services/BooleanFilter";
 import { GmailClient, type GmailClientService } from "../src/server/services/GmailClient";
@@ -15,17 +15,27 @@ import { LlmProvider, LlmProviderLive } from "../src/server/services/LlmProvider
 import { OAuthTokenVault } from "../src/server/services/OAuthTokenVault";
 import { RegistryDb, RegistryDbTest } from "../src/server/services/RegistryDb";
 
-// A scriptable OpenAI-compatible endpoint: each test queues the replies and inspects the requests.
+// A scriptable endpoint speaking OpenAI's two APIs and Anthropic's Messages API: each test queues
+// the replies ("HTTP <status>" fails, "REFUSAL" is an Anthropic refusal) and inspects the requests.
 const llmReplies: string[] = [];
-const llmRequests: Array<{ path: string; body: Record<string, unknown> }> = [];
+const llmRequests: Array<{ path: string; headers: Headers; body: Record<string, unknown> }> = [];
+const anthropicMessage = (content: unknown[], stopReason: string, stopDetails: unknown = null) => ({
+  id: "msg_test", type: "message", role: "assistant", model: "test-model", content, stop_reason: stopReason,
+  stop_details: stopDetails, stop_sequence: null, usage: { input_tokens: 1, output_tokens: 1 },
+});
 const llmServer = Bun.serve({
   port: 0,
   async fetch(request) {
     const path = new URL(request.url).pathname;
-    llmRequests.push({ path, body: await request.json() as Record<string, unknown> });
+    llmRequests.push({ path, headers: new Headers(request.headers), body: await request.json() as Record<string, unknown> });
     const reply = llmReplies.shift();
     if (reply === undefined) return Response.json({ error: "no reply queued" }, { status: 500 });
     if (reply.startsWith("HTTP ")) return Response.json({ error: "failure" }, { status: Number(reply.slice(5)) });
+    if (path.endsWith("/messages")) {
+      return Response.json(reply === "REFUSAL"
+        ? anthropicMessage([], "refusal", { type: "refusal", category: "cyber", explanation: null })
+        : anthropicMessage([{ type: "thinking", thinking: "", signature: "sig" }, { type: "text", text: reply }], "end_turn"));
+    }
     return path.endsWith("/responses")
       ? Response.json({ output_text: reply })
       : Response.json({ choices: [{ message: { content: reply } }] });
@@ -86,6 +96,10 @@ const makeEnvironment = async (rulesFile: Partial<AiRulesFile> = {}, apiMode: "r
     id: "test-llm", name: "Local test", baseUrl: `${llmServer.url}v1`,
     apiKeyEnc: vault.encrypt("test-key"), modelId: "test-model", apiMode,
   }));
+  await Effect.runPromise(registry.upsertLlmEndpoint({
+    id: "claude", name: "Local Anthropic", baseUrl: `${llmServer.url}v1`,
+    apiKeyEnc: vault.encrypt("claude-key"), modelId: "claude-test", apiMode: "anthropic_messages",
+  }));
   await Effect.runPromise(db.replaceLabels([
     { id: "INBOX", name: "INBOX", type: "system", colorBg: null, colorText: null },
     { id: "UNREAD", name: "UNREAD", type: "system", colorBg: null, colorText: null },
@@ -133,6 +147,7 @@ const makeEnvironment = async (rulesFile: Partial<AiRulesFile> = {}, apiMode: "r
 type Environment = Awaited<ReturnType<typeof makeEnvironment>>;
 const offeredRuleNames = (request: { body: Record<string, unknown> }): string[] => {
   const format = (request.body.response_format as { json_schema?: { schema: unknown } } | undefined)?.json_schema?.schema
+    ?? (request.body.output_config as { format?: { schema: unknown } } | undefined)?.format?.schema
     ?? (request.body.text as { format: { schema: unknown } }).format.schema;
   return ((format as { properties: { matchedRules: { items: { properties: { ruleName: { enum: string[] } } } } } })
     .properties.matchedRules.items.properties.ruleName.enum);
@@ -397,6 +412,33 @@ describe("Phase 3: one structured LLM call per thread", () => {
     expect((await Effect.runPromise(env.db.getAiThreadContext("t-promo")))?.aiEvaluatedThrough).toBe(100);
   });
 
+  test("a failing endpoint falls back to the account's next endpoints, in order", async () => {
+    await env.db.writeRulesFile(formatRulesFile({ version: 1, llmEndpointId: "test-llm", fallbackLlmEndpointIds: ["gone", "claude"], rules: RULES })).pipe(Effect.runPromise);
+    await env.deliver("t-promo", { id: "m1", from: "deals@shop.example", at: 100, labels: ["INBOX"] });
+    llmReplies.push("HTTP 500", selection(["Newsletter"]));
+    const result = await env.run("t-promo");
+    expect(llmRequests.map((request) => request.path)).toEqual(["/v1/chat/completions", "/v1/messages"]);
+    expect(result).toMatchObject({ status: "processed", appliedRules: ["Newsletter"], endpointId: "claude" });
+    expect(result.failedEndpoints).toEqual(["test-llm: LLM endpoint returned HTTP 500.", "gone: LLM endpoint 'gone' was not found."]);
+    const [audit] = await Effect.runPromise(env.db.listAiAudits("t-promo"));
+    expect(audit).toMatchObject({ endpointId: "claude", apiModeUsed: "anthropic_messages", modelUsed: "claude-test" });
+
+    // When every endpoint fails, the error names each one.
+    await env.deliver("t-promo", { id: "m2", from: "deals@shop.example", at: 200, labels: ["INBOX"] });
+    llmReplies.push("HTTP 503", "REFUSAL");
+    const failure = await Effect.runPromise(Effect.flip(env.worker.runForThread("t-promo", { trigger: "manual" })));
+    expect(failure.message).toBe("Every LLM endpoint failed. test-llm: LLM endpoint returned HTTP 503. gone: LLM endpoint 'gone' was not found. claude: The model declined to answer (cyber).");
+  });
+
+  test("the account's API override applies to its primary endpoint only", async () => {
+    await env.db.writeRulesFile(formatRulesFile({ version: 1, llmEndpointId: "claude", fallbackLlmEndpointIds: ["test-llm"], apiMode: "responses", rules: RULES })).pipe(Effect.runPromise);
+    await env.deliver("t-promo", { id: "m1", from: "deals@shop.example", at: 100, labels: ["INBOX"] });
+    llmReplies.push("HTTP 529", selection(["Newsletter"]));
+    await env.run("t-promo");
+    // Anthropic ignores the OpenAI override; the fallback keeps its own chat_completions mode.
+    expect(llmRequests.map((request) => request.path)).toEqual(["/v1/messages", "/v1/chat/completions"]);
+  });
+
   test("a missing endpoint is a clear error", async () => {
     await env.db.writeRulesFile(formatRulesFile({ version: 1, llmEndpointId: null, rules: RULES })).pipe(Effect.runPromise);
     await env.deliver("t-x", { id: "m1", from: "x@example.com", at: 100, labels: ["INBOX"] });
@@ -405,7 +447,7 @@ describe("Phase 3: one structured LLM call per thread", () => {
   });
 });
 
-describe("Phase 3: LLM provider structured output (both API modes)", () => {
+describe("Phase 3: LLM provider structured output (every API mode)", () => {
   const request = {
     instructions: "Choose rules.",
     input: "<thread>…</thread>",
@@ -414,7 +456,7 @@ describe("Phase 3: LLM provider structured output (both API modes)", () => {
   };
   const provider = Effect.runSync(Effect.gen(function* () { return yield* LlmProvider; }).pipe(Effect.provide(LlmProviderLive())));
   const endpoint = { baseUrl: `${llmServer.url}v1/`, modelId: "test-model" };
-  const choose = (apiMode: "responses" | "chat_completions") => Effect.runPromise(provider.chooseRules(endpoint, "key", apiMode, request));
+  const choose = (apiMode: LlmApiMode) => Effect.runPromise(provider.chooseRules(endpoint, "key", apiMode, request));
 
   beforeEach(() => {
     llmReplies.length = 0;
@@ -454,5 +496,70 @@ describe("Phase 3: LLM provider structured output (both API modes)", () => {
     llmReplies.push("HTTP 429");
     expect((await Effect.runPromise(Effect.flip(provider.chooseRules(endpoint, "key", "responses", request)))).message).toContain("HTTP 429");
     expect(llmRequests).toHaveLength(5);
+  });
+
+  test("anthropic_messages mode calls the Messages API with an output_config JSON schema", async () => {
+    llmReplies.push(selection(["Conversations"], "TO_REPLY"));
+    expect(await choose("anthropic_messages")).toMatchObject({ matchedRules: [{ ruleName: "Conversations" }], conversationStatus: "TO_REPLY" });
+    const [sent] = llmRequests;
+    // A base URL copied with /v1 still reaches /v1/messages.
+    expect(sent!.path).toBe("/v1/messages");
+    expect(sent!.headers.get("authorization")).toBe("Bearer key");
+    expect(sent!.headers.get("anthropic-version")).toBeTruthy();
+    expect(sent!.body).toMatchObject({
+      model: "test-model", system: "Choose rules.", messages: [{ role: "user", content: "<thread>…</thread>" }],
+      output_config: { format: { type: "json_schema" } },
+    });
+    expect(offeredRuleNames(sent!)).toEqual(["Newsletter", "Conversations"]);
+    const schema = (sent!.body.output_config as { format: { schema: { properties: Record<string, unknown> } } }).format.schema;
+    expect(schema.properties.conversationStatus).toMatchObject({ anyOf: [{ type: "string", enum: ["TO_REPLY", "ACTIONED"] }, { type: "null" }] });
+  });
+
+  test("anthropic_messages refusals and HTTP errors are endpoint errors", async () => {
+    llmReplies.push("REFUSAL");
+    const fail = () => Effect.runPromise(Effect.flip(provider.chooseRules(endpoint, "key", "anthropic_messages", request)));
+    const refusal = await fail();
+    expect(refusal).toMatchObject({ apiMode: "anthropic_messages", message: "The model declined to answer (cyber)." });
+    llmReplies.push("HTTP 529");
+    expect((await fail()).message).toBe("LLM endpoint returned HTTP 529.");
+    // No SDK retries: the account's fallback endpoints take over instead.
+    expect(llmRequests).toHaveLength(2);
+  });
+});
+
+describe("Phase 3: provider settings in the rules file and registry", () => {
+  test("fallbacks round-trip without blanks, repeats or the primary endpoint", () => {
+    const text = formatRulesFile({ version: 1, llmEndpointId: "a", fallbackLlmEndpointIds: ["b", "a", " ", "b", "c"], rules: [] });
+    expect(JSON.parse(text)).toMatchObject({ llmEndpointId: "a", fallbackLlmEndpointIds: ["b", "c"] });
+    expect(parseRulesFile(text).file.fallbackLlmEndpointIds).toEqual(["b", "c"]);
+    expect(JSON.parse(formatRulesFile({ version: 1, llmEndpointId: "a", rules: [] }))).not.toHaveProperty("fallbackLlmEndpointIds");
+  });
+
+  test("changing providers leaves the rules on disk untouched, invalid ones included", () => {
+    const original = JSON.stringify({ version: 1, llmEndpointId: "a", apiMode: "responses", rules: [{ name: "Broken" }], note: "kept" });
+    const updated = JSON.parse(withRulesProviders(original, { llmEndpointId: "b", fallbackLlmEndpointIds: ["a"], apiMode: null }));
+    expect(updated).toEqual({ version: 1, llmEndpointId: "b", fallbackLlmEndpointIds: ["a"], rules: [{ name: "Broken" }], note: "kept" });
+    expect(JSON.parse(withRulesProviders(null, { llmEndpointId: "a", apiMode: "chat_completions" })))
+      .toEqual({ version: 1, llmEndpointId: "a", apiMode: "chat_completions", rules: [] });
+    expect(() => withRulesProviders("{ nope", { llmEndpointId: null })).toThrow();
+  });
+
+  test("older registries widen llm_endpoints to accept Anthropic endpoints and keep their rows", async () => {
+    const database = new Database(":memory:");
+    database.exec(`
+      CREATE TABLE llm_endpoints (
+        id TEXT PRIMARY KEY, name TEXT NOT NULL, base_url TEXT NOT NULL, api_key_enc BLOB NOT NULL, model_id TEXT NOT NULL,
+        api_mode TEXT NOT NULL CHECK (api_mode IN ('responses', 'chat_completions')),
+        timeout_ms INTEGER NOT NULL DEFAULT 30000, max_concurrency INTEGER NOT NULL DEFAULT 3
+      );
+      INSERT INTO llm_endpoints (id, name, base_url, api_key_enc, model_id, api_mode) VALUES ('old', 'Old', 'https://x/v1', x'00', 'm', 'responses');
+    `);
+    const registry = Effect.runSync(Effect.gen(function* () { return yield* RegistryDb; }).pipe(Effect.provide(RegistryDbTest(database))));
+    await Effect.runPromise(registry.upsertLlmEndpoint({ id: "claude", name: "Claude", baseUrl: "https://api.anthropic.com", apiKeyEnc: new Uint8Array([1]), modelId: "claude-opus-5-5", apiMode: "anthropic_messages" }));
+    expect((await Effect.runPromise(registry.listLlmEndpoints())).map((endpoint) => [endpoint.id, endpoint.apiMode]))
+      .toEqual([["claude", "anthropic_messages"], ["old", "responses"]]);
+    expect(await Effect.runPromise(registry.deleteLlmEndpoint("old"))).toBe(true);
+    expect(await Effect.runPromise(registry.deleteLlmEndpoint("old"))).toBe(false);
+    database.close();
   });
 });

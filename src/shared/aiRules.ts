@@ -42,12 +42,24 @@ export interface AiRule {
   readonly actions: ReadonlyArray<RuleAction>;
 }
 
+/** How an endpoint is called: OpenAI's two APIs (and compatible servers) or Anthropic's Messages API. */
+export const LLM_API_MODES = ["responses", "chat_completions", "anthropic_messages"] as const;
+export type LlmApiMode = (typeof LLM_API_MODES)[number];
+
+/** The OpenAI-compatible modes, which one account can override for its primary endpoint. */
+export type OpenAiApiMode = Exclude<LlmApiMode, "anthropic_messages">;
+
 export interface AiRulesFile {
   readonly version: 1;
   /** Registry id of the LLM endpoint used for this account's rules. */
   readonly llmEndpointId: string | null;
-  /** Overrides the endpoint's API mode for this account. */
-  readonly apiMode?: "responses" | "chat_completions" | null;
+  /**
+   * ZeroEffect extension: endpoints tried in order when the primary one fails (HTTP or network
+   * error, timeout, refusal, or output that stays invalid after a correction round).
+   */
+  readonly fallbackLlmEndpointIds?: ReadonlyArray<string>;
+  /** Overrides the primary endpoint's API mode for this account (OpenAI-compatible endpoints only). */
+  readonly apiMode?: OpenAiApiMode | null;
   readonly rules: ReadonlyArray<AiRule>;
 }
 

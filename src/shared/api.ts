@@ -185,7 +185,7 @@ export interface LlmEndpointSummary {
   readonly name: string;
   readonly baseUrl: string;
   readonly modelId: string;
-  readonly apiMode: "responses" | "chat_completions";
+  readonly apiMode: import("./aiRules").LlmApiMode;
   readonly timeoutMs?: number;
 }
 
@@ -206,6 +206,9 @@ export interface AiRunSummary {
   readonly appliedRules: ReadonlyArray<string>;
   readonly conversationStatus: string | null;
   readonly reason: string;
+  /** Endpoints that failed before a fallback answered ("id: error"). */
+  readonly failedEndpoints?: ReadonlyArray<string>;
+  readonly endpointId?: string;
 }
 
 export interface AiAuditSummary {
@@ -215,7 +218,7 @@ export interface AiAuditSummary {
   readonly ruleNames: ReadonlyArray<string>;
   readonly conversationStatus: string | null;
   readonly endpointId: string | null;
-  readonly apiModeUsed: "responses" | "chat_completions" | null;
+  readonly apiModeUsed: import("./aiRules").LlmApiMode | null;
   readonly modelUsed: string | null;
   readonly reasoning: string;
   readonly changes: {

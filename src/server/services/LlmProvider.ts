@@ -1,6 +1,7 @@
+import Anthropic from "@anthropic-ai/sdk";
 import { Context, Effect, Layer } from "effect";
 import * as Schema from "effect/Schema";
-import type { ConversationStatus } from "../../shared/aiRules";
+import type { ConversationStatus, LlmApiMode } from "../../shared/aiRules";
 import { LlmEndpointError } from "../../shared/errors";
 import { RuleSelectionSchema, type RuleSelection } from "../../shared/schemas";
 import { resolveRuleName } from "./AiRulePrompt";
@@ -25,7 +26,7 @@ export interface LlmProviderService {
   readonly chooseRules: (
     endpoint: LlmEndpoint,
     apiKey: string,
-    apiMode: "responses" | "chat_completions",
+    apiMode: LlmApiMode,
     request: RuleSelectionRequest,
   ) => Effect.Effect<RuleSelection, LlmEndpointError>;
 }
@@ -69,8 +70,31 @@ export const ruleSelectionJsonSchema = (request: Pick<RuleSelectionRequest, "rul
   required: ["reasoning", "matchedRules", "noMatchFound", "conversationStatus"],
 });
 
+/**
+ * The same schema for Anthropic's structured outputs, which take a nullable enum as `anyOf`
+ * rather than a type array.
+ */
+export const anthropicRuleSelectionJsonSchema = (request: Pick<RuleSelectionRequest, "ruleNames" | "conversationStatuses">) => {
+  const schema = ruleSelectionJsonSchema(request);
+  return {
+    ...schema,
+    properties: {
+      ...schema.properties,
+      conversationStatus: request.conversationStatuses.length > 0
+        ? {
+            anyOf: [{ type: "string", enum: [...request.conversationStatuses] }, { type: "null" }],
+            description: "Set only when the conversations option is selected; otherwise null.",
+          }
+        : schema.properties.conversationStatus,
+    },
+  };
+};
+
+/** The SDK adds `/v1/messages` itself, so a base URL copied with `/v1` loses it. */
+export const anthropicBaseUrl = (baseUrl: string): string => baseUrl.replace(/\/+$/, "").replace(/\/v1$/, "");
+
 const error = (
-  apiMode: "responses" | "chat_completions",
+  apiMode: LlmApiMode,
   message: string,
   rawBody = "",
 ): LlmEndpointError => new LlmEndpointError({ apiMode, message, rawBody });
@@ -147,7 +171,44 @@ export const validateSelection = (raw: unknown, request: Pick<RuleSelectionReque
 };
 
 const makeService = (config: LlmProviderConfig): LlmProviderService => {
-  const call = async (
+  const callAnthropic = async (endpoint: LlmEndpoint, apiKey: string, request: RuleSelectionRequest, input: string): Promise<string> => {
+    const testFetch = config.fetch;
+    const client = new Anthropic({
+      apiKey,
+      baseURL: anthropicBaseUrl(endpoint.baseUrl),
+      timeout: endpoint.timeoutMs ?? 30_000,
+      // A failure moves on to the account's next endpoint instead of retrying here.
+      maxRetries: 0,
+      ...(testFetch ? { fetch: (target: string | URL | Request, init?: RequestInit) => testFetch(new URL(target instanceof Request ? target.url : target), init) } : {}),
+    });
+    let message: Anthropic.Message;
+    try {
+      message = await client.messages.create({
+        model: endpoint.modelId,
+        max_tokens: 16_000,
+        system: request.instructions,
+        messages: [{ role: "user", content: input }],
+        output_config: { format: { type: "json_schema", schema: anthropicRuleSelectionJsonSchema(request) } },
+      });
+    } catch (cause) {
+      if (cause instanceof Anthropic.APIConnectionError) throw error("anthropic_messages", cause.message);
+      if (cause instanceof Anthropic.APIError) {
+        throw error("anthropic_messages", `LLM endpoint returned HTTP ${cause.status}.`, JSON.stringify(cause.error ?? cause.message));
+      }
+      throw error("anthropic_messages", cause instanceof Error ? cause.message : "LLM request failed.");
+    }
+    const rawBody = JSON.stringify(message);
+    if (message.stop_reason === "refusal") {
+      const category = message.stop_details?.category;
+      throw error("anthropic_messages", `The model declined to answer${category ? ` (${category})` : ""}.`, rawBody);
+    }
+    if (message.stop_reason === "max_tokens") throw error("anthropic_messages", "The model ran out of output tokens before finishing.", rawBody);
+    const text = message.content.flatMap((block) => block.type === "text" ? [block.text] : []).join("");
+    if (!text) throw error("anthropic_messages", "LLM response did not contain structured output.", rawBody);
+    return text;
+  };
+
+  const callOpenAi = async (
     endpoint: LlmEndpoint,
     apiKey: string,
     apiMode: "responses" | "chat_completions",
@@ -203,7 +264,9 @@ const makeService = (config: LlmProviderConfig): LlmProviderService => {
           let input = request.input;
           // One correction round for malformed answers; transport and HTTP errors are not retried here.
           for (let attempt = 1; ; attempt++) {
-            const text = await call(endpoint, apiKey, apiMode, request, input);
+            const text = apiMode === "anthropic_messages"
+              ? await callAnthropic(endpoint, apiKey, request, input)
+              : await callOpenAi(endpoint, apiKey, apiMode, request, input);
             try {
               let raw: unknown;
               try {

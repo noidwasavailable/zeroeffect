@@ -845,6 +845,11 @@ describe("Phase 4: account-scoped HTTP API", () => {
     const stored = await Effect.runPromise(env.registry.getLlmEndpoint("openai"));
     expect(stored).toMatchObject({ modelId: "gpt-y", apiMode: "chat_completions" });
     expect(vault.decrypt<string>(stored!.apiKeyEnc)).toBe("sk-secret");
+
+    // Pasted keys lose line breaks and zero-width spaces; other characters fetch rejects in a header are refused.
+    await send({ id: "openai", baseUrl: "https://api.openai.com/v1", modelId: "gpt-y", apiMode: "chat_completions", apiKey: " sk-sec\nret\u200b\n" });
+    expect(vault.decrypt<string>((await Effect.runPromise(env.registry.getLlmEndpoint("openai")))!.apiKeyEnc)).toBe("sk-secret");
+    expect((await send({ id: "openai", baseUrl: "https://api.openai.com/v1", modelId: "gpt-y", apiMode: "chat_completions", apiKey: "sk-ㄱ" })).status).toBe(400);
   });
 
   test("suggests replies with Gmail's reply / reply-all rules and the alias the mail was sent to", async () => {

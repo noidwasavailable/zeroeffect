@@ -1,4 +1,5 @@
 import { Data } from "effect";
+import type { LlmApiMode } from "./aiRules";
 
 export class AccountIsolationError extends Data.TaggedError("AccountIsolationError")<{
   readonly accountId: string;
@@ -22,7 +23,7 @@ export class GmailApiError extends Data.TaggedError("GmailApiError")<{
 
 export class LlmEndpointError extends Data.TaggedError("LlmEndpointError")<{
   readonly message: string;
-  readonly apiMode: "responses" | "chat_completions";
+  readonly apiMode: LlmApiMode;
   readonly rawBody: string;
 }> {}
 

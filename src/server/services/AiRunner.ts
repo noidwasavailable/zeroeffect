@@ -72,8 +72,11 @@ export const createAiRunner = (config: AiRunnerConfig): AiRunner => {
     }),
     runNewMail: (accountId, threadIds) => threadIds.length === 0 ? Promise.resolve() : enqueue(accountId, async () => {
       const failures: string[] = [];
+      // Runs a fallback endpoint rescued: labelled, but the primary endpoint needs attention.
+      const fallbacks: string[] = [];
       try {
         await withWorker(accountId, (worker) => Effect.forEach(threadIds, (threadId) => worker.runForThread(threadId, { trigger: "auto" }).pipe(
+          Effect.tap((result) => Effect.sync(() => { if (result.failedEndpoints?.length) fallbacks.push(...result.failedEndpoints); })),
           Effect.tap((result) => Effect.logInfo(`AI labeller (${accountId}) ${threadId}: ${result.status}${result.appliedRules.length ? ` → ${result.appliedRules.join(", ")}` : ""}${result.llmCalled ? "" : " (no LLM call)"}`)),
           Effect.catch((error) => Effect.sync(() => { failures.push(describeError(error)); }).pipe(
             Effect.andThen(Effect.logError(`AI labeller failed for ${accountId} thread ${threadId}: ${describeError(error)}`)),
@@ -83,9 +86,11 @@ export const createAiRunner = (config: AiRunnerConfig): AiRunner => {
         config.reportProblem?.("ai", accountId, error);
         throw error;
       }
-      config.reportProblem?.("ai", accountId, failures.length === 0
-        ? null
-        : `${failures.length} of ${threadIds.length} new ${threadIds.length === 1 ? "conversation" : "conversations"} could not be labelled: ${failures[0]}`);
+      config.reportProblem?.("ai", accountId, failures.length > 0
+        ? `${failures.length} of ${threadIds.length} new ${threadIds.length === 1 ? "conversation" : "conversations"} could not be labelled: ${failures[0]}`
+        : fallbacks.length > 0
+          ? `New mail was labelled by a fallback LLM endpoint because ${fallbacks[0]}`
+          : null);
       notify(accountId, threadIds);
     }),
     undo: (accountId) => enqueue(accountId, async () => {

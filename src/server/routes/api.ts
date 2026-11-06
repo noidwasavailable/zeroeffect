@@ -12,6 +12,7 @@ import {
   type SendAsAliasDetail,
   type ForwardDraft,
   type ReplyDraft,
+  type RulesResponse,
   type ServerStatus,
   type ThreadAction,
   type NewMessageDraft,
@@ -19,12 +20,13 @@ import {
   type ThreadPage,
   type ViewSummary,
 } from "../../shared/api";
+import { LLM_API_MODES, type LlmApiMode } from "../../shared/aiRules";
 import { DatabaseError, FilterParseError, GmailApiError, LlmEndpointError, SendAsComposeError } from "../../shared/errors";
 import type { FilterExpr } from "../../shared/schemas";
 import { threadActionLabels } from "../../shared/threadActions";
 import { BUILT_IN_VIEWS, orderViews } from "../../shared/views";
 import { AccountDb, AccountDbLive, type AccountDbService, type SendAsAliasRecord } from "../services/AccountDb";
-import { formatRulesFile, importInboxZeroRules, parseRulesFile } from "../services/AiRules";
+import { formatRulesFile, importInboxZeroRules, parseRulesFile, withRulesProviders } from "../services/AiRules";
 import type { OAuthTokenVault } from "../services/OAuthTokenVault";
 import type { AiRunner } from "../services/AiRunner";
 import { BooleanFilter, BooleanFilterLive } from "../services/BooleanFilter";
@@ -530,6 +532,32 @@ export const createApiHandler = (config: ApiConfig): ApiHandler => {
     return json({ rules: loaded.file, problems: [] });
   };
 
+  /** Sets the account's LLM endpoint, its fallbacks (in order) and the API override; rules stay untouched. */
+  const saveRulesProviders = async (accountId: AccountId, request: Request): Promise<Response> => {
+    const body = await readJson(request);
+    const primary = body?.llmEndpointId;
+    const fallbacks = body?.fallbackLlmEndpointIds ?? [];
+    const apiMode = body?.apiMode ?? null;
+    if (!body || (primary !== null && typeof primary !== "string") || !isStringArray(fallbacks) || (apiMode !== null && apiMode !== "responses" && apiMode !== "chat_completions")) {
+      return apiError(400, { error: "Send llmEndpointId (or null), fallbackLlmEndpointIds and apiMode (responses, chat_completions or null)." });
+    }
+    if (primary === null && fallbacks.length > 0) return apiError(400, { error: "Choose a primary endpoint before adding fallbacks." });
+    const known = new Set((await Effect.runPromise(config.registry.listLlmEndpoints())).map((endpoint) => endpoint.id));
+    const unknown = [primary, ...fallbacks].filter((id): id is string => id !== null && !known.has(id));
+    if (unknown.length > 0) return apiError(400, { error: `Unknown LLM endpoint: ${unknown.join(", ")}.` });
+    const db = await accountDb(accountId);
+    let text: string;
+    try {
+      text = withRulesProviders(await Effect.runPromise(db.readRulesFile()), { llmEndpointId: primary, fallbackLlmEndpointIds: fallbacks, apiMode });
+    } catch {
+      return apiError(409, { error: `data/accounts/${accountId}.rules.json is not valid JSON; fix it by hand first.` });
+    }
+    await Effect.runPromise(db.writeRulesFile(text));
+    config.events.publish(accountId, { type: "rules-changed" });
+    const loaded = parseRulesFile(text);
+    return json({ rules: loaded.file, problems: loaded.problems } satisfies RulesResponse);
+  };
+
   const importRules = async (accountId: AccountId, request: Request): Promise<Response> => {
     const body = await readJson(request);
     if (!body || !Array.isArray(body.export)) return apiError(400, { error: "Send an Inbox Zero export as { export: [...] }." });
@@ -583,7 +611,7 @@ export const createApiHandler = (config: ApiConfig): ApiHandler => {
     const baseUrl = text(body?.baseUrl);
     const modelId = text(body?.modelId);
     const apiMode = body?.apiMode;
-    if (!id || !/^[A-Za-z0-9_-]{1,40}$/.test(id) || !baseUrl || !modelId || (apiMode !== "responses" && apiMode !== "chat_completions")) {
+    if (!id || !/^[A-Za-z0-9_-]{1,40}$/.test(id) || !baseUrl || !modelId || !LLM_API_MODES.includes(apiMode as LlmApiMode)) {
       return apiError(400, { error: "An endpoint needs an id (letters, digits, - or _), a base URL, a model and an API mode." });
     }
     try {
@@ -592,7 +620,12 @@ export const createApiHandler = (config: ApiConfig): ApiHandler => {
       return apiError(400, { error: "The base URL must be an http(s) URL." });
     }
     const existing = await Effect.runPromise(config.registry.getLlmEndpoint(id));
-    const apiKey = text(body?.apiKey);
+    // API keys never contain whitespace, but a pasted key can carry a line break or a zero-width space;
+    // fetch rejects such Authorization headers, so drop the whitespace and refuse anything else invalid.
+    const apiKey = typeof body?.apiKey === "string" ? body.apiKey.replace(/[\s\u200b-\u200d\u2060\ufeff]+/g, "") || null : null;
+    if (apiKey && !/^[\x21-\x7e]+$/.test(apiKey)) {
+      return apiError(400, { error: "The API key contains characters that are not allowed in a key (only printable ASCII). Paste it again." });
+    }
     // Keys are write-only: an update without a new key keeps the stored one.
     if (!apiKey && !existing) return apiError(400, { error: "A new endpoint needs an API key." });
     await Effect.runPromise(config.registry.upsertLlmEndpoint({
@@ -600,7 +633,7 @@ export const createApiHandler = (config: ApiConfig): ApiHandler => {
       name: text(body?.name) ?? id,
       baseUrl,
       modelId,
-      apiMode,
+      apiMode: apiMode as LlmApiMode,
       apiKeyEnc: apiKey ? config.vault.encrypt(apiKey) : existing!.apiKeyEnc,
       timeoutMs: typeof body?.timeoutMs === "number" && body.timeoutMs > 0 ? body.timeoutMs : existing?.timeoutMs ?? 30_000,
     }));
@@ -843,6 +876,7 @@ export const createApiHandler = (config: ApiConfig): ApiHandler => {
       return json({ rules: loaded.file, problems: loaded.problems });
     }
     if (request.method === "PUT" && rest === "/rules") return saveRules(accountId, request);
+    if (request.method === "PUT" && rest === "/rules/providers") return saveRulesProviders(accountId, request);
     if (request.method === "POST" && rest === "/rules/import") return importRules(accountId, request);
     const replyMatch = /^\/threads\/([^/]+)\/reply$/.exec(rest);
     if (replyMatch) {
@@ -888,6 +922,19 @@ export const createApiHandler = (config: ApiConfig): ApiHandler => {
   return {
     handle: async (request, url) => {
       // LLM endpoints are shared by both accounts (each account's rules file picks one).
+      const endpointMatch = /^\/api\/llm-endpoints\/([^/]+)$/.exec(url.pathname);
+      if (endpointMatch) {
+        try {
+          if (request.method !== "DELETE") return apiError(405, { error: "Use DELETE." });
+          if (!isTrustedMutation(request)) return apiError(403, { error: "This request must come from the ZeroEffect web client." });
+          // Rules files that still name the endpoint skip it (and fall back) until they are updated.
+          const deleted = await Effect.runPromise(config.registry.deleteLlmEndpoint(decodeURIComponent(endpointMatch[1]!)));
+          if (!deleted) return apiError(404, { error: "LLM endpoint not found." });
+          return json({ endpoints: await Effect.runPromise(config.registry.listLlmEndpoints()) });
+        } catch (error) {
+          return failureResponse(error);
+        }
+      }
       if (url.pathname === "/api/llm-endpoints") {
         try {
           if (request.method === "GET") return json({ endpoints: await Effect.runPromise(config.registry.listLlmEndpoints()) });

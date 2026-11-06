@@ -3,6 +3,7 @@ import { dirname } from "node:path";
 import { Context, Effect, Layer } from "effect";
 import { Database } from "bun:sqlite";
 import { DatabaseError } from "../../shared/errors";
+import { LLM_API_MODES } from "../../shared/aiRules";
 import { DEFAULT_APP_SETTINGS, type AppSettings } from "../../shared/api";
 import type { AccountRecord, LlmEndpointRecord } from "../../shared/schemas";
 
@@ -15,6 +16,7 @@ export interface RegistryDbService {
   readonly deleteServiceCredential: (id: string) => Effect.Effect<void, DatabaseError>;
   readonly upsertLlmEndpoint: (endpoint: LlmEndpointRecord) => Effect.Effect<void, DatabaseError>;
   readonly getLlmEndpoint: (id: string) => Effect.Effect<LlmEndpointRecord | null, DatabaseError>;
+  readonly deleteLlmEndpoint: (id: string) => Effect.Effect<boolean, DatabaseError>;
   /** Endpoint settings without their encrypted API keys. */
   readonly listLlmEndpoints: () => Effect.Effect<ReadonlyArray<Omit<LlmEndpointRecord, "apiKeyEnc">>, DatabaseError>;
   /** App-wide settings; unset ones take their defaults. */
@@ -25,6 +27,34 @@ export interface RegistryDbService {
 export class RegistryDb extends Context.Service<RegistryDb, RegistryDbService>()(
   "zeroeffect/RegistryDb",
 ) {}
+
+const llmEndpointsTable = (name: string) => `
+    CREATE TABLE IF NOT EXISTS ${name} (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      base_url TEXT NOT NULL,
+      api_key_enc BLOB NOT NULL,
+      model_id TEXT NOT NULL,
+      api_mode TEXT NOT NULL CHECK (api_mode IN (${LLM_API_MODES.map((mode) => `'${mode}'`).join(", ")})),
+      timeout_ms INTEGER NOT NULL DEFAULT 30000,
+      max_concurrency INTEGER NOT NULL DEFAULT 3
+    );`;
+const LLM_ENDPOINTS_TABLE = llmEndpointsTable("llm_endpoints");
+
+/** Registries created before an API mode existed rebuild llm_endpoints to widen its CHECK. */
+const widenLlmEndpointModes = (database: Database): void => {
+  const table = database.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'llm_endpoints'").get() as { sql: string } | null;
+  if (!table || LLM_API_MODES.every((mode) => table.sql.includes(`'${mode}'`))) return;
+  database.transaction(() => {
+    database.exec(llmEndpointsTable("llm_endpoints_widened"));
+    database.exec(`
+      INSERT INTO llm_endpoints_widened (id, name, base_url, api_key_enc, model_id, api_mode, timeout_ms, max_concurrency)
+        SELECT id, name, base_url, api_key_enc, model_id, api_mode, timeout_ms, max_concurrency FROM llm_endpoints;
+      DROP TABLE llm_endpoints;
+      ALTER TABLE llm_endpoints_widened RENAME TO llm_endpoints;
+    `);
+  })();
+};
 
 const initialize = (database: Database): void => {
   database.exec("PRAGMA journal_mode = WAL;");
@@ -46,21 +76,13 @@ const initialize = (database: Database): void => {
       credentials_enc BLOB NOT NULL,
       updated_at INTEGER NOT NULL
     );
-    CREATE TABLE IF NOT EXISTS llm_endpoints (
-      id TEXT PRIMARY KEY,
-      name TEXT NOT NULL,
-      base_url TEXT NOT NULL,
-      api_key_enc BLOB NOT NULL,
-      model_id TEXT NOT NULL,
-      api_mode TEXT NOT NULL CHECK (api_mode IN ('responses', 'chat_completions')),
-      timeout_ms INTEGER NOT NULL DEFAULT 30000,
-      max_concurrency INTEGER NOT NULL DEFAULT 3
-    );
+    ${LLM_ENDPOINTS_TABLE}
     CREATE TABLE IF NOT EXISTS app_settings (
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL
     );
   `);
+  widenLlmEndpointModes(database);
 };
 
 const makeService = (database: Database): RegistryDbService => ({
@@ -177,6 +199,11 @@ const makeService = (database: Database): RegistryDbService => ({
         FROM llm_endpoints WHERE id = ?
       `).get(id) as LlmEndpointRecord | null,
       catch: (cause) => new DatabaseError({ message: "Failed to load LLM endpoint.", operation: "getLlmEndpoint", cause }),
+    }),
+  deleteLlmEndpoint: (id) =>
+    Effect.try({
+      try: () => database.prepare("DELETE FROM llm_endpoints WHERE id = ?").run(id).changes > 0,
+      catch: (cause) => new DatabaseError({ message: "Failed to delete LLM endpoint.", operation: "deleteLlmEndpoint", cause }),
     }),
   listLlmEndpoints: () =>
     Effect.try({

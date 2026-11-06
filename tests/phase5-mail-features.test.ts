@@ -350,7 +350,7 @@ const makeEnvironment = async () => {
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
   });
   const thread = async (id: string) => ((await (await call(`/api/a/personal/threads/${id}`)).json()) as { thread: ThreadDetail }).thread;
-  return { api, events, personal, work, gmailCalls, sent, call, send, thread };
+  return { api, events, personal, work, registry, gmailCalls, sent, call, send, thread };
 };
 
 describe("Phase 5: attachment, bulk, forward, label and alias routes", () => {
@@ -442,6 +442,30 @@ describe("Phase 5: attachment, bulk, forward, label and alias routes", () => {
     expect(threadActionLabels({ type: "trash" }, on)).toEqual({ add: ["TRASH"], remove: ["INBOX", "SPAM", "UNREAD"] });
     expect(threadActionLabels({ type: "spam" }, on)).toEqual({ add: ["SPAM"], remove: ["INBOX", "TRASH"] });
     expect(threadActionLabels({ type: "moveToInbox" }, on)).toEqual({ add: ["INBOX"], remove: [] });
+  });
+
+  test("an account's LLM endpoints and fallbacks are saved without touching its rules; endpoints can be deleted", async () => {
+    for (const [id, apiMode] of [["openai", "responses"], ["claude", "anthropic_messages"]] as const) {
+      await Effect.runPromise(env.registry.upsertLlmEndpoint({ id, name: id, baseUrl: "https://llm.example/v1", apiKeyEnc: new Uint8Array([1]), modelId: "m", apiMode }));
+    }
+    // An invalid rule on disk survives a provider change (a full rules save would drop it).
+    await Effect.runPromise(env.personal.writeRulesFile(JSON.stringify({ version: 1, llmEndpointId: null, rules: [{ name: "Broken" }] })));
+    const saved = await env.send("PUT", "/api/a/personal/rules/providers", { llmEndpointId: "openai", fallbackLlmEndpointIds: ["claude"], apiMode: "chat_completions" });
+    expect(await saved.json()).toMatchObject({ rules: { llmEndpointId: "openai", fallbackLlmEndpointIds: ["claude"], apiMode: "chat_completions" }, problems: [{ rule: "Broken" }] });
+    expect(JSON.parse((await Effect.runPromise(env.personal.readRulesFile()))!)).toEqual({
+      version: 1, llmEndpointId: "openai", fallbackLlmEndpointIds: ["claude"], apiMode: "chat_completions", rules: [{ name: "Broken" }],
+    });
+    // The work silo's rules are untouched.
+    expect(await Effect.runPromise(env.work.readRulesFile())).toBeNull();
+
+    expect((await env.send("PUT", "/api/a/personal/rules/providers", { llmEndpointId: "nope" })).status).toBe(400);
+    expect((await env.send("PUT", "/api/a/personal/rules/providers", { llmEndpointId: null, fallbackLlmEndpointIds: ["claude"] })).status).toBe(400);
+    expect((await env.send("PUT", "/api/a/personal/rules/providers", { llmEndpointId: "openai", apiMode: "anthropic_messages" })).status).toBe(400);
+
+    expect((await env.call("/api/llm-endpoints/claude", { method: "DELETE" })).status).toBe(403);
+    const deleted = await env.send("DELETE", "/api/llm-endpoints/claude");
+    expect((await deleted.json() as { endpoints: Array<{ id: string }> }).endpoints.map((endpoint) => endpoint.id)).toEqual(["openai"]);
+    expect((await env.send("DELETE", "/api/llm-endpoints/claude")).status).toBe(404);
   });
 
   test("trash and spam are thread actions with their own views", async () => {

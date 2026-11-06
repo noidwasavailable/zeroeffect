@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { Context, Effect, Layer } from "effect";
 import { Database } from "bun:sqlite";
 import { AccountIsolationError, DatabaseError } from "../../shared/errors";
-import type { ConversationStatus } from "../../shared/aiRules";
+import type { ConversationStatus, LlmApiMode } from "../../shared/aiRules";
 import { extractOtpCode } from "../../shared/otp";
 import { formatFilterExpr, renameFilterLabels } from "../../shared/filterDsl";
 import { applyLabelChange } from "../../shared/threadActions";
@@ -99,7 +99,7 @@ export interface AiAuditRecord {
   readonly conversationStatus: ConversationStatus | null;
   /** Null when the run needed no LLM call (static or inherited matches only). */
   readonly endpointId: string | null;
-  readonly apiModeUsed: "responses" | "chat_completions" | null;
+  readonly apiModeUsed: LlmApiMode | null;
   readonly modelUsed: string | null;
   readonly reasoning: string;
   readonly changes: AiRunChanges;
@@ -200,7 +200,7 @@ interface AuditRow {
   rule_names_json: string;
   conversation_status: ConversationStatus | null;
   endpoint_id: string | null;
-  api_mode_used: "responses" | "chat_completions" | null;
+  api_mode_used: LlmApiMode | null;
   model_used: string | null;
   reasoning: string;
   actions_applied_json: string;

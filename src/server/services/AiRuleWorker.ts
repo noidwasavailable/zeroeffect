@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { Context, Effect, Layer } from "effect";
-import { CONVERSATION_STATUSES, isConversationStatus, type AiRule, type ConversationStatus } from "../../shared/aiRules";
+import { CONVERSATION_STATUSES, isConversationStatus, type AiRule, type AiRulesFile, type ConversationStatus, type LlmApiMode } from "../../shared/aiRules";
 import { DatabaseError, GmailApiError, LlmEndpointError } from "../../shared/errors";
 import { containsTextSearch } from "../../shared/filterDsl";
 import { parseFilterDsl } from "../../shared/filterParser";
@@ -24,6 +24,10 @@ export interface AiRunResult {
   readonly conversationStatus: ConversationStatus | null;
   readonly auditId?: string;
   readonly reason: string;
+  /** Endpoints that failed before a fallback answered ("id: error"); empty when the first one did. */
+  readonly failedEndpoints?: ReadonlyArray<string>;
+  /** The endpoint that answered, when the LLM was called. */
+  readonly endpointId?: string;
 }
 
 export interface AiRuleWorkerService {
@@ -86,30 +90,59 @@ const makeService = (
       .map((address) => address.toLowerCase()));
   });
 
+  /**
+   * One structured call for the thread on the account's primary endpoint, then on each fallback in
+   * order while they fail. Missing endpoints are skipped; when every one fails, the error lists them all.
+   */
   const select = (
-    rulesFile: { readonly llmEndpointId: string | null; readonly apiMode?: "responses" | "chat_completions" | null },
+    rulesFile: Pick<AiRulesFile, "llmEndpointId" | "fallbackLlmEndpointIds" | "apiMode">,
     request: Parameters<LlmProviderService["chooseRules"]>[3],
   ) => Effect.gen(function* () {
-    const fallbackMode = rulesFile.apiMode ?? "responses";
+    const overrideMode = rulesFile.apiMode ?? "responses";
     if (!rulesFile.llmEndpointId) {
       return yield* Effect.fail(new LlmEndpointError({
-        apiMode: fallbackMode,
-        message: `No LLM endpoint is configured: set "llmEndpointId" in data/accounts/${accountDb.accountId}.rules.json.`,
+        apiMode: overrideMode,
+        message: `No LLM endpoint is configured: choose one in Settings, or set "llmEndpointId" in data/accounts/${accountDb.accountId}.rules.json.`,
         rawBody: "",
       }));
     }
-    const endpoint = yield* registry.getLlmEndpoint(rulesFile.llmEndpointId);
-    if (!endpoint) {
-      return yield* Effect.fail(new LlmEndpointError({ apiMode: fallbackMode, message: `LLM endpoint '${rulesFile.llmEndpointId}' was not found.`, rawBody: "" }));
+    const chain = [rulesFile.llmEndpointId, ...(rulesFile.fallbackLlmEndpointIds ?? [])];
+    const failures: Array<{ readonly endpointId: string; readonly error: LlmEndpointError }> = [];
+    for (const [position, endpointId] of chain.entries()) {
+      const endpoint = yield* registry.getLlmEndpoint(endpointId);
+      if (!endpoint) {
+        failures.push({ endpointId, error: new LlmEndpointError({ apiMode: overrideMode, message: `LLM endpoint '${endpointId}' was not found.`, rawBody: "" }) });
+        continue;
+      }
+      // The account's override only switches its primary endpoint between the OpenAI-compatible APIs.
+      const apiMode: LlmApiMode = position === 0 && rulesFile.apiMode && endpoint.apiMode !== "anthropic_messages" ? rulesFile.apiMode : endpoint.apiMode;
+      const startedAt = performance.now();
+      const attempt = yield* Effect.try({
+        try: () => vault.decrypt<string>(endpoint.apiKeyEnc),
+        catch: () => new LlmEndpointError({ apiMode, message: "Could not decrypt the configured LLM API key.", rawBody: "" }),
+      }).pipe(
+        Effect.flatMap((apiKey) => llm.chooseRules(endpoint, apiKey, apiMode, request)),
+        Effect.result,
+      );
+      if (attempt._tag === "Failure") {
+        failures.push({ endpointId, error: attempt.failure });
+        if (position < chain.length - 1) yield* Effect.logWarning(`LLM endpoint '${endpointId}' failed (${attempt.failure.message}); trying the next one.`);
+        continue;
+      }
+      return {
+        selection: attempt.success,
+        endpoint,
+        apiMode,
+        latencyMs: Math.max(0, Math.round(performance.now() - startedAt)),
+        failedEndpoints: failures.map((failure) => `${failure.endpointId}: ${failure.error.message}`),
+      };
     }
-    const apiMode = rulesFile.apiMode ?? endpoint.apiMode;
-    const apiKey = yield* Effect.try({
-      try: () => vault.decrypt<string>(endpoint.apiKeyEnc),
-      catch: () => new LlmEndpointError({ apiMode, message: "Could not decrypt the configured LLM API key.", rawBody: "" }),
-    });
-    const startedAt = performance.now();
-    const selection = yield* llm.chooseRules(endpoint, apiKey, apiMode, request);
-    return { selection, endpoint, apiMode, latencyMs: Math.max(0, Math.round(performance.now() - startedAt)) };
+    const last = failures.at(-1)!.error;
+    return yield* Effect.fail(failures.length === 1 ? last : new LlmEndpointError({
+      apiMode: last.apiMode,
+      message: `Every LLM endpoint failed. ${failures.map((failure) => `${failure.endpointId}: ${failure.error.message}`).join(" ")}`,
+      rawBody: last.rawBody,
+    }));
   });
 
   const run = (threadId: string, trigger: "auto" | "manual") => Effect.gen(function* () {
@@ -176,7 +209,7 @@ const makeService = (
       conversationRules.some((rule) => rule.systemType === status) && !(status === "FYI" && userSentLastMessage));
     const optionName = conversationsOptionName(aiCandidates.map((rule) => rule.name));
 
-    let llmResult: { readonly selection: RuleSelection; readonly endpoint: { readonly id: string; readonly modelId: string }; readonly apiMode: "responses" | "chat_completions"; readonly latencyMs: number } | null = null;
+    let llmResult: { readonly selection: RuleSelection; readonly endpoint: { readonly id: string; readonly modelId: string }; readonly apiMode: LlmApiMode; readonly latencyMs: number; readonly failedEndpoints: ReadonlyArray<string> } | null = null;
     if (aiCandidates.length > 0 || offeredStatuses.length > 0) {
       llmResult = yield* select(loaded.file, {
         instructions: buildSystemPrompt({
@@ -274,6 +307,7 @@ const makeService = (
       conversationStatus: audit.conversationStatus,
       auditId: audit.id,
       reason: reasoning,
+      ...(llmResult ? { endpointId: llmResult.endpoint.id, failedEndpoints: llmResult.failedEndpoints } : {}),
     } satisfies AiRunResult;
   }).pipe(
     // A failed run leaves the evaluation marker alone so the next new message retries it.

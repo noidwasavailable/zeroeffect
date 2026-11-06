@@ -1,5 +1,5 @@
 import * as Schema from "effect/Schema";
-import { CONVERSATION_STATUSES, type ConversationStatus } from "./aiRules";
+import { CONVERSATION_STATUSES, type ConversationStatus, type LlmApiMode } from "./aiRules";
 import type { SearchDocument } from "./searchText";
 
 export type FilterExpr =
@@ -72,7 +72,7 @@ export interface LlmEndpointRecord {
   readonly baseUrl: string;
   readonly apiKeyEnc: Uint8Array;
   readonly modelId: string;
-  readonly apiMode: "responses" | "chat_completions";
+  readonly apiMode: LlmApiMode;
   readonly timeoutMs?: number;
   readonly maxConcurrency?: number;
 }

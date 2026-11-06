@@ -37,6 +37,7 @@ const AiRuleSchema = Schema.Struct({
 const RulesFileSchema = Schema.Struct({
   version: Schema.Literal(1),
   llmEndpointId: NullableString,
+  fallbackLlmEndpointIds: Schema.optional(Schema.Array(Schema.String)),
   apiMode: Schema.optional(Schema.NullOr(Schema.Literals(["responses", "chat_completions"]))),
   rules: Schema.Array(Schema.Unknown),
 });
@@ -105,13 +106,19 @@ export const parseRulesFile = (text: string | null): LoadedRules => {
     if (issues.length > 0) problems.push(...issues.map((message) => ({ rule: rule.name, message })));
     else rules.push(rule);
   });
-  return { file: { version: 1, llmEndpointId: file.llmEndpointId, apiMode: file.apiMode ?? null, rules }, rules, problems };
+  const fallbackLlmEndpointIds = fallbackChain(file.llmEndpointId, file.fallbackLlmEndpointIds ?? []);
+  return { file: { version: 1, llmEndpointId: file.llmEndpointId, fallbackLlmEndpointIds, apiMode: file.apiMode ?? null, rules }, rules, problems };
 };
+
+/** Fallback endpoint ids without blanks, repeats or the primary endpoint itself. */
+const fallbackChain = (primary: string | null, ids: ReadonlyArray<string>): string[] =>
+  [...new Set(ids.map((id) => id.trim()).filter((id) => id && id !== primary))];
 
 /** Serializes a rules file the way it is kept on disk: stable key order, no null-only noise in actions. */
 export const formatRulesFile = (file: AiRulesFile): string => JSON.stringify({
   version: 1,
   llmEndpointId: file.llmEndpointId,
+  ...(file.fallbackLlmEndpointIds?.length ? { fallbackLlmEndpointIds: fallbackChain(file.llmEndpointId, file.fallbackLlmEndpointIds) } : {}),
   ...(file.apiMode ? { apiMode: file.apiMode } : {}),
   rules: file.rules.map((rule) => ({
     name: rule.name,
@@ -129,6 +136,26 @@ export const formatRulesFile = (file: AiRulesFile): string => JSON.stringify({
     actions: rule.actions.map((action) => action.type === "LABEL" ? { type: action.type, label: action.label } : { type: action.type }),
   })),
 }, null, 2) + "\n";
+
+export type RulesProviders = Pick<AiRulesFile, "llmEndpointId" | "fallbackLlmEndpointIds" | "apiMode">;
+
+/**
+ * Rewrites only a rules file's provider settings (endpoint, fallbacks, API override), leaving the
+ * rules exactly as they are on disk, invalid ones included. Throws when the file is not a JSON object.
+ */
+export const withRulesProviders = (text: string | null, providers: RulesProviders): string => {
+  const raw: unknown = text === null || text.trim() === "" ? { version: 1, rules: [] } : JSON.parse(text);
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) throw new Error("The rules file is not a JSON object.");
+  const { llmEndpointId: _primary, fallbackLlmEndpointIds: _fallbacks, apiMode: _mode, version: _version, ...rest } = raw as Record<string, unknown>;
+  const fallbacks = fallbackChain(providers.llmEndpointId, providers.fallbackLlmEndpointIds ?? []);
+  return JSON.stringify({
+    version: 1,
+    llmEndpointId: providers.llmEndpointId,
+    ...(fallbacks.length ? { fallbackLlmEndpointIds: fallbacks } : {}),
+    ...(providers.apiMode ? { apiMode: providers.apiMode } : {}),
+    ...rest,
+  }, null, 2) + "\n";
+};
 
 // Inbox Zero action fields that would change what an action does; any non-null value is unsupported.
 const UNSUPPORTED_ACTION_FIELDS = [
