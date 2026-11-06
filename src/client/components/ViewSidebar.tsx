@@ -9,25 +9,18 @@ const VIEW_CONTROLS = [
   { id: "views.delete", label: "Delete", title: "Delete view" },
 ] as const;
 
-/** Label and alias management and settings, at the bottom of the sidebar. */
+/** Label and alias management, at the bottom of the sidebar. */
 const FOOTER_ACTIONS = [
   { id: "labels.jump", label: "Jump to label…" },
   { id: "labels.manage", label: "Manage labels…" },
   { id: "account.aliases", label: "Send As aliases…" },
 ] as const;
 
-/** Settings shown as switches below the footer actions. */
-const SETTING_ACTIONS = [
-  { id: "settings.markReadOnArchive", label: "Mark read on archive / trash" },
-] as const;
-
 /** Built-in and saved views; each entry runs its "Go to view" action (digit key / Cmd+K). */
-export function ViewSidebar({ views, activeViewId, actions, settings }: {
+export function ViewSidebar({ views, activeViewId, actions }: {
   readonly views: ReadonlyArray<ViewSummary>;
   readonly activeViewId: string;
   readonly actions: ReadonlyArray<AppAction>;
-  /** Each setting switch's current state, by action id. */
-  readonly settings: Readonly<Record<(typeof SETTING_ACTIONS)[number]["id"], boolean>>;
 }) {
   const byId = new Map(actions.map((action) => [action.id, action]));
   const firstSaved = views.findIndex((view) => !view.builtIn);
@@ -87,26 +80,6 @@ export function ViewSidebar({ views, activeViewId, actions, settings }: {
             >
               {label}
               {action.shortcut && <Keycap shortcut={action.shortcut} />}
-            </button>
-          );
-        })}
-        {SETTING_ACTIONS.map(({ id, label }) => {
-          const action = byId.get(id);
-          if (!action) return null;
-          return (
-            <button
-              key={id}
-              type="button"
-              role="switch"
-              aria-checked={settings[id]}
-              title={action.label}
-              onClick={action.run}
-              className="flex items-center justify-between gap-2 rounded-md px-2 py-1 text-left text-xs text-zinc-500 hover:bg-zinc-50 hover:text-zinc-800 dark:hover:bg-zinc-900 dark:hover:text-zinc-200"
-            >
-              {label}
-              <span className={`rounded px-1 text-[10px] font-medium ${settings[id] ? "bg-blue-100 text-blue-700 dark:bg-blue-900/50 dark:text-blue-300" : "bg-zinc-100 text-zinc-500 dark:bg-zinc-800"}`}>
-                {settings[id] ? "On" : "Off"}
-              </span>
             </button>
           );
         })}

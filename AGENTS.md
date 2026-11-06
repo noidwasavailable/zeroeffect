@@ -67,10 +67,11 @@ Before writing Gmail API synchronization, MIME parsing, or LLM prompt constructi
 - **HTTP & WebSockets/SSE:** Always use `Bun.serve()`.
 - **Testing:** Always use `import { describe, test, expect, beforeAll, afterAll } from "bun:test"`. Do not install Jest or Vitest.
 
-### 2.4 Dual LLM API Requirement (`/v1/responses` AND `/v1/chat/completions`)
+### 2.4 LLM API Requirement (`/v1/responses`, `/v1/chat/completions` AND Anthropic `/v1/messages`)
 
-- `LlmProviderService` must support switching between `apiMode: "responses"` and `apiMode: "chat_completions"` per endpoint (overridable per account in its rules file).
-- AI rules are evaluated with **one structured call per thread** over the whole rule list (not one call per rule). Both modes must enforce structured JSON output matching the Effect Schema definition for `RuleSelection` (`reasoning`, `matchedRules[{ ruleName, isPrimary }]`, `noMatchFound`, `conversationStatus`), with rule names and statuses constrained by enums in the request schema.
+- `LlmProviderService` must support `apiMode: "responses"`, `"chat_completions"` and `"anthropic_messages"` per endpoint. The OpenAI modes are raw `fetch`; Anthropic goes through `@anthropic-ai/sdk` (`output_config.format` JSON schema, `maxRetries: 0`). An account's rules file may override the OpenAI mode of its **primary** endpoint only.
+- Each account's rules file lists a primary `llmEndpointId` and ordered `fallbackLlmEndpointIds`; `AiRuleWorker` tries them in order on any `LlmEndpointError` (HTTP/network error, timeout, refusal, output still invalid after the correction round). Endpoints and each account's chain are managed on the Settings page (`PUT /api/a/:account/rules/providers`, which rewrites only those fields).
+- AI rules are evaluated with **one structured call per thread** over the whole rule list (not one call per rule). Every mode must enforce structured JSON output matching the Effect Schema definition for `RuleSelection` (`reasoning`, `matchedRules[{ ruleName, isPrimary }]`, `noMatchFound`, `conversationStatus`), with rule names and statuses constrained by enums in the request schema.
 - Rules live per account in `data/accounts/<account_id>.rules.json` (Inbox Zero export shape; see `src/shared/aiRules.ts`). `runOnThreads: false` rules must never cost an LLM call on follow-up messages.
 
 ### 2.5 Hybrid UI Requirement (`Cmd+K` + Clickable Buttons + Vim Keys)
@@ -116,7 +117,7 @@ At the end of each phase, you must:
 
 - **🛑 Checkpoint 1 (After Phase 1):** `AccountDb` physical isolation + `BooleanFilter` recursive `AND`/`OR`/`NOT` DSL parser, SQLite compiler, and in-memory evaluator + `tests/phase1-db-and-filter.test.ts`.
 - **🛑 Checkpoint 2 (After Phase 2):** Gmail OAuth2, `history.list` delta sync, MIME parser, `sendAs` alias sync, RFC 2822 alias composer, and outbound GCP Pub/Sub `StreamingPull` listener + `tests/phase2-gmail-sync.test.ts`.
-- **🛑 Checkpoint 3 (After Phase 3):** Dual `/v1/responses` & `/v1/chat/completions` `LlmProvider`, `AiRuleWorker` with `FilterExpr` pre-conditions, Ghost Labels (`dry_run`), `ai_audit_logs`, and Undo + `tests/phase3-llm-labeller.test.ts`.
+- **🛑 Checkpoint 3 (After Phase 3):** `/v1/responses`, `/v1/chat/completions` & Anthropic Messages `LlmProvider` with per-account endpoint fallbacks, `AiRuleWorker` with `FilterExpr` pre-conditions, Ghost Labels (`dry_run`), `ai_audit_logs`, and Undo + `tests/phase3-llm-labeller.test.ts`.
 - **🛑 Checkpoint 4 (After Phase 4):** React 19 Web UI (`Cmd+K` palette, Action Toolbar buttons with Vim badges, Account Switcher, Visual/DSL Filter Builder, Shadow-DOM reader, Alias Reply Composer) + `tests/phase4-api-and-e2e.test.ts`. Tailscale exposure and authentication are managed outside this app (no auth middleware).
 - **🛑 Checkpoint 5 (After Phase 5):** Catch-up `history.list` sync, attachments in and out (download route, inline `cid:` images, upload-endpoint sending), Forward, Trash & Spam, bulk actions + "Mark all as read", label management, Send As aliases page, and the extra palette commands/keys + `tests/phase5-mail-features.test.ts`.
 - **🛑 Checkpoint 6 (After Phase 6):** Full-text search: `Text` `FilterExpr` node in the shared parser/formatter/builder, `messages_fts MATCH` compilation with bound prefix queries, identical in-memory tokenizer, and the extended AST equivalence matrix + `tests/phase6-search.test.ts`.
@@ -174,6 +175,7 @@ zero-effect/
 │   │   │   ├── AttachmentField.tsx
 │   │   │   ├── ShortcutHelp.tsx
 │   │   │   ├── ServerStatusPanel.tsx # Header status button + background problems panel (H)
+│   │   │   ├── SettingsPage.tsx    # Settings (.): general, LLM endpoints, per-account fallbacks
 │   │   │   └── AiAuditDrawer.tsx
 │   │   └── hooks/
 │   │       └── useVimShortcuts.ts

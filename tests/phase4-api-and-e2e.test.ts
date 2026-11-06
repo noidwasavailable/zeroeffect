@@ -323,6 +323,8 @@ describe("Phase 4: one action registry drives the palette, toolbar and Vim keys"
     discardReply: () => calls.push("discard"),
     markReadOnArchive: true,
     toggleMarkReadOnArchive: () => calls.push("toggle-mark-read-on-archive"),
+    settingsOpen: false,
+    toggleSettings: () => calls.push("settings"),
     copyOtp: () => calls.push("copy-otp"),
     openMessageCount: 3,
     allMessagesExpanded: false,

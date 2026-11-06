@@ -34,6 +34,7 @@ import { canSendNewMessage, emptyNewMessage, forwardMessage, NewMessageDialog, t
 import { outgoingAttachments } from "./components/AttachmentField";
 import { ReplyComposer, splitAddressList, type ComposerState } from "./components/ReplyComposer";
 import { RulesPanel } from "./components/RulesPanel";
+import { SettingsPage } from "./components/SettingsPage";
 import { CommandPalette, type PalettePage } from "./components/CommandPalette";
 import { FilterBar } from "./components/FilterBar";
 import { FilterBuilder } from "./components/FilterBuilder";
@@ -164,6 +165,7 @@ function Inbox({ accounts, route, navigate }: {
   const [auditOpen, setAuditOpen] = useState(false);
   const [audits, setAudits] = useState<{ readonly threadId: string | null; readonly entries: ReadonlyArray<AiAuditSummary>; readonly loading: boolean; readonly error: string | null }>({ threadId: null, entries: [], loading: false, error: null });
   const [rulesPanel, setRulesPanel] = useState<{ readonly newRule: boolean } | null>(null);
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [composer, setComposer] = useState<ComposerState | null>(null);
   const [rulesFile, setRulesFile] = useState<AiRulesFile | null>(null);
   const ruleSummaries = useMemo(() => (rulesFile?.rules ?? []).map(({ name, automate }) => ({ name, automate })), [rulesFile]);
@@ -524,10 +526,11 @@ function Inbox({ accounts, route, navigate }: {
       if (results.length === 1 && only) {
         setNotice(only.result
           ? {
-              text: only.result.appliedRules.length > 0
+              text: (only.result.appliedRules.length > 0
                 ? `AI applied: ${only.result.appliedRules.join(", ")}${only.result.llmCalled ? "" : " (no LLM call needed)"}`
-                : `No rule applied. ${only.result.reason}`,
-              tone: "info",
+                : `No rule applied. ${only.result.reason}`)
+                + (only.result.failedEndpoints?.length ? ` Answered by fallback ${only.result.endpointId} after ${only.result.failedEndpoints.join("; ")}` : ""),
+              tone: only.result.failedEndpoints?.length ? "error" : "info",
             }
           : { text: only.error!, tone: "error" });
       } else {
@@ -969,11 +972,14 @@ function Inbox({ accounts, route, navigate }: {
     discardReply,
     markReadOnArchive: settings.markReadOnArchive,
     toggleMarkReadOnArchive,
-  }), [settings, toggleMarkReadOnArchive, openLeftList, selection.index, canSelectNext, canSelectPrevious, composerVisible, openComposer, sendReply, discardReply, accounts, account, accountId, views, view, viewId, savedViews, savedIndex, selectedThread, targets, checkedThreads, openThreadId, selectedIndex, threads, syncing, builderOpen, auditOpen, aiBusy, statusOpen, serverStatus, ruleSummaries, otpLabels, copyOtp, detail, currentFold, cursorIndex, newMessage, openNewMessage, openForward, sendNewMessage, discardNewMessage, draft, query, goTo, closeThread, runTargetsAction, markAllRead, toggleChecked, loadAccountAliases, navigate, sync, runAi, decideGhostLabels, undoAi, toggleRuleDryRun]);
+    settingsOpen,
+    toggleSettings: () => setSettingsOpen((open) => !open),
+  }), [settings, toggleMarkReadOnArchive, settingsOpen, openLeftList, selection.index, canSelectNext, canSelectPrevious, composerVisible, openComposer, sendReply, discardReply, accounts, account, accountId, views, view, viewId, savedViews, savedIndex, selectedThread, targets, checkedThreads, openThreadId, selectedIndex, threads, syncing, builderOpen, auditOpen, aiBusy, statusOpen, serverStatus, ruleSummaries, otpLabels, copyOtp, detail, currentFold, cursorIndex, newMessage, openNewMessage, openForward, sendNewMessage, discardNewMessage, draft, query, goTo, closeThread, runTargetsAction, markAllRead, toggleChecked, loadAccountAliases, navigate, sync, runAi, decideGhostLabels, undoAi, toggleRuleDryRun]);
 
-  useVimShortcuts(actions, !paletteOpen && !helpOpen && !statusOpen && viewDialog === null && rulesPanel === null && newMessage === null);
+  useVimShortcuts(actions, !paletteOpen && !helpOpen && !statusOpen && viewDialog === null && rulesPanel === null && !settingsOpen && newMessage === null);
   const setupAction = actions.find((action) => action.id === "account.setup");
   const rulesAction = actions.find((action) => action.id === "ai.rules");
+  const settingsAction = actions.find((action) => action.id === "settings.open");
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -1009,6 +1015,12 @@ function Inbox({ accounts, route, navigate }: {
             {rulesAction.shortcut && <Keycap shortcut={rulesAction.shortcut} />}
           </button>
         )}
+        {settingsAction && (
+          <button type="button" className={toolbarButtonClass} onClick={settingsAction.run}>
+            Settings
+            {settingsAction.shortcut && <Keycap shortcut={settingsAction.shortcut} />}
+          </button>
+        )}
       </header>
       {builderOpen && (
         <FilterBuilder
@@ -1022,7 +1034,7 @@ function Inbox({ accounts, route, navigate }: {
       )}
       <ActionToolbar actions={actions} onOpenPalette={() => { setPalettePage("actions"); setPaletteOpen(true); }} />
       <div className="flex min-h-0 flex-1">
-        <ViewSidebar views={views} activeViewId={viewId} actions={actions} settings={{ "settings.markReadOnArchive": settings.markReadOnArchive }} />
+        <ViewSidebar views={views} activeViewId={viewId} actions={actions} />
         <div className={`min-h-0 overflow-y-auto ${openThreadId ? "hidden w-[26rem] shrink-0 border-r border-zinc-200 md:block dark:border-zinc-800" : "flex-1"}`}>
           {checkedThreads.length > 0 && <SelectionBar count={checkedThreads.length} actions={actions} />}
           <ThreadList
@@ -1108,6 +1120,20 @@ function Inbox({ accounts, route, navigate }: {
           startWithNewRule={rulesPanel.newRule}
           onClose={() => setRulesPanel(null)}
           onSaved={setRulesFile}
+          onOpenSettings={() => {
+            setRulesPanel(null);
+            setSettingsOpen(true);
+          }}
+        />
+      )}
+      {settingsOpen && (
+        <SettingsPage
+          accountId={accountId}
+          accountName={account.displayName}
+          settings={settings}
+          actions={actions}
+          onClose={() => setSettingsOpen(false)}
+          onRulesSaved={setRulesFile}
         />
       )}
       {helpOpen && <ShortcutHelp actions={actions} onClose={() => setHelpOpen(false)} />}

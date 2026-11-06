@@ -148,63 +148,20 @@ function RuleEditor({ rule, issues, onChange, onDelete }: {
   );
 }
 
-function EndpointForm({ onSaved, onCancel }: { readonly onSaved: (endpoints: ReadonlyArray<LlmEndpointSummary>, id: string) => void; readonly onCancel: () => void }) {
-  const [form, setForm] = useState({ id: "", name: "", baseUrl: "https://api.openai.com/v1", modelId: "", apiMode: "responses" as "responses" | "chat_completions", apiKey: "" });
-  const [error, setError] = useState<string | null>(null);
-  const field = (key: keyof typeof form, label: string, type = "text") => (
-    <label className={labelClass}>
-      {label}
-      <input className={inputClass} type={type} autoComplete="off" value={form[key]} onChange={(event) => setForm({ ...form, [key]: event.target.value })} />
-    </label>
-  );
-  return (
-    <form
-      className="flex flex-col gap-3 rounded-md border border-zinc-200 p-3 dark:border-zinc-800"
-      onSubmit={async (event) => {
-        event.preventDefault();
-        try {
-          onSaved(await api.saveLlmEndpoint(form), form.id.trim());
-        } catch (cause) {
-          setError(cause instanceof Error ? cause.message : "Could not save the endpoint.");
-        }
-      }}
-    >
-      <div className="grid gap-3 sm:grid-cols-2">
-        {field("id", "Id (letters, digits, - or _)")}
-        {field("name", "Display name")}
-        {field("baseUrl", "Base URL (OpenAI-compatible, ending in /v1)")}
-        {field("modelId", "Model")}
-        <label className={labelClass}>
-          API
-          <select className={inputClass} value={form.apiMode} onChange={(event) => setForm({ ...form, apiMode: event.target.value as "responses" | "chat_completions" })}>
-            <option value="responses">/v1/responses</option>
-            <option value="chat_completions">/v1/chat/completions</option>
-          </select>
-        </label>
-        {field("apiKey", "API key (stored encrypted; leave empty to keep an existing key)", "password")}
-      </div>
-      {error && <p role="alert" className="text-xs text-red-600 dark:text-red-400">{error}</p>}
-      <div className="flex gap-2">
-        <button type="submit" className={toolbarButtonClass}>Save endpoint</button>
-        <button type="button" className={toolbarButtonClass} onClick={onCancel}>Cancel</button>
-      </div>
-    </form>
-  );
-}
-
-/** Edits one account's AI rules file (data/accounts/<account>.rules.json) and its LLM endpoint. */
-export function RulesPanel({ accountId, accountName, startWithNewRule, onClose, onSaved }: {
+/** Edits one account's AI rules file (data/accounts/<account>.rules.json); its LLM endpoints are set in Settings. */
+export function RulesPanel({ accountId, accountName, startWithNewRule, onClose, onSaved, onOpenSettings }: {
   readonly accountId: string;
   readonly accountName: string;
   readonly startWithNewRule: boolean;
   readonly onClose: () => void;
   readonly onSaved: (rules: AiRulesFile) => void;
+  /** Closes the rules and opens Settings, where the account's LLM endpoints are chosen. */
+  readonly onOpenSettings: () => void;
 }) {
   const [loaded, setLoaded] = useState<RulesResponse | null>(null);
   const [draft, setDraft] = useState<AiRulesFile | null>(null);
   const [selected, setSelected] = useState(0);
   const [endpoints, setEndpoints] = useState<ReadonlyArray<LlmEndpointSummary>>([]);
-  const [addingEndpoint, setAddingEndpoint] = useState(false);
   const [dirty, setDirty] = useState(false);
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState<{ readonly text: string; readonly tone: "info" | "error" } | null>(null);
@@ -245,6 +202,10 @@ export function RulesPanel({ accountId, accountName, startWithNewRule, onClose, 
     );
   }
 
+  const endpointName = (id: string) => {
+    const endpoint = endpoints.find((candidate) => candidate.id === id);
+    return endpoint ? `${endpoint.name} · ${endpoint.modelId}` : `${id} (missing)`;
+  };
   const rules = draft.rules;
   const current = rules[selected];
   const issuesByRule = rules.map((rule) => ruleIssues(rule, rules));
@@ -321,35 +282,20 @@ export function RulesPanel({ accountId, accountName, startWithNewRule, onClose, 
           </span>
         </header>
 
-        <div className="flex flex-wrap items-end gap-3 border-b border-zinc-200 px-4 py-3 dark:border-zinc-800">
-          <label className={`${labelClass} w-56`}>
-            LLM endpoint
-            <select className={inputClass} value={draft.llmEndpointId ?? ""} onChange={(event) => update({ ...draft, llmEndpointId: event.target.value || null })}>
-              <option value="">None (AI disabled)</option>
-              {endpoints.map((endpoint) => <option key={endpoint.id} value={endpoint.id}>{endpoint.name} · {endpoint.modelId}</option>)}
-            </select>
-          </label>
-          <label className={`${labelClass} w-56`}>
-            API
-            <select className={inputClass} value={draft.apiMode ?? ""} onChange={(event) => update({ ...draft, apiMode: (event.target.value || null) as AiRulesFile["apiMode"] })}>
-              <option value="">Endpoint default</option>
-              <option value="responses">/v1/responses</option>
-              <option value="chat_completions">/v1/chat/completions</option>
-            </select>
-          </label>
-          <button type="button" className={toolbarButtonClass} onClick={() => setAddingEndpoint((open) => !open)}>{addingEndpoint ? "Close" : "Add endpoint…"}</button>
-          {addingEndpoint && (
-            <div className="w-full">
-              <EndpointForm
-                onCancel={() => setAddingEndpoint(false)}
-                onSaved={(list, id) => {
-                  setEndpoints(list);
-                  setAddingEndpoint(false);
-                  update({ ...draft, llmEndpointId: id });
-                }}
-              />
-            </div>
-          )}
+        <div className="flex flex-wrap items-center gap-3 border-b border-zinc-200 px-4 py-2 text-sm dark:border-zinc-800">
+          <span className="text-zinc-600 dark:text-zinc-400">
+            {draft.llmEndpointId
+              ? <>AI provider: <span className="font-medium text-zinc-900 dark:text-zinc-100">{endpointName(draft.llmEndpointId)}</span>
+                  {(draft.fallbackLlmEndpointIds?.length ?? 0) > 0 && <>, then {draft.fallbackLlmEndpointIds!.map(endpointName).join(", ")}</>}</>
+              : "No LLM endpoint: rules with instructions do not run."}
+          </span>
+          <button
+            type="button"
+            className={toolbarButtonClass}
+            onClick={() => { if (!dirty || confirm("Discard unsaved rule changes and open Settings?")) onOpenSettings(); }}
+          >
+            Choose in Settings…
+          </button>
         </div>
 
         {(loaded.problems.length > 0 || serverProblems.length > 0) && (

@@ -108,6 +108,8 @@ Incoming emails are ingested in real time via outbound Google Cloud Pub/Sub stre
   - Each configured LLM provider endpoint supports choosing between:
     - **`responses` (`POST /v1/responses`)**: Uses `instructions`, `input`, and `text.format` (`json_schema`) for structured output.
     - **`chat_completions` (`POST /v1/chat/completions`)**: Uses `messages` (`system` + `user`) and `response_format` (`json_schema`) for compatibility with Ollama, vLLM, LiteLLM, OpenRouter, and OpenAI.
+    - **`anthropic_messages` (`POST /v1/messages`)**: Anthropic's Messages API through `@anthropic-ai/sdk`, with `system`, one `user` message and `output_config.format` (`json_schema`; the nullable status enum is sent as `anyOf`). Refusals and `max_tokens` stops are endpoint errors.
+  - **Fallbacks:** each account's rules file names a primary endpoint and ordered `fallbackLlmEndpointIds`; a failing endpoint (HTTP/network error, timeout, refusal, output still invalid after one correction) hands the same request to the next. The audit log records the endpoint that answered; background runs rescued by a fallback show up in the server status panel. Endpoints and each account's chain are edited on the Settings page.
 - **FR-LLM-02 (Rule Pipeline & Dry-Run Mode):**
   - Rules are stored per account as JSON (`data/accounts/<account_id>.rules.json`) in Inbox Zero's export shape: `name`, `instructions`, `enabled`, `automate`, `runOnThreads`, `systemType`, static `from`/`to`/`subject`/`body` conditions with `conditionalOperator`, an optional `precondition` (Boolean DSL), and `LABEL` / `ARCHIVE` / `MARK_READ` actions. Inbox Zero exports are imported per account with `scripts/import-rules.ts`.
   - When new mail arrives in a thread (incremental sync), or on demand:
@@ -170,7 +172,7 @@ CREATE TABLE llm_endpoints (
     base_url TEXT NOT NULL,              -- e.g., '[https://api.openai.com/v1](https://api.openai.com/v1)'
     api_key_enc BLOB NOT NULL,
     model_id TEXT NOT NULL,
-    api_mode TEXT NOT NULL CHECK (api_mode IN ('responses', 'chat_completions')),
+    api_mode TEXT NOT NULL CHECK (api_mode IN ('responses', 'chat_completions', 'anthropic_messages')),
     timeout_ms INTEGER NOT NULL DEFAULT 30000,
     max_concurrency INTEGER NOT NULL DEFAULT 3
 );

@@ -560,6 +560,7 @@ describe("Phase 5: commands, bulk targets and views", () => {
     runAi: noop("ai"), decideGhostLabels: noop("ghost"), toggleAudit: noop("audit"), undoAi: noop("undo"), openRules: noop("rules"),
     toggleRuleDryRun: noop("dry"), openComposer: noop("reply"), changeAlias: noop("alias"), sendReply: noop("send"), discardReply: noop("discard"),
     markReadOnArchive: true, toggleMarkReadOnArchive: noop("toggle-mark-read-on-archive"),
+    settingsOpen: false, toggleSettings: noop("settings"),
   };
   const key = (actions: ReturnType<typeof buildActions>, pressed: string) =>
     actions.find((action) => action.shortcut && matchesShortcut({ key: pressed, code: "", altKey: false, metaKey: false, ctrlKey: false }, action.shortcut));

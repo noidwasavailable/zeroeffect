@@ -115,6 +115,8 @@ export interface ActionContext {
   /** Archive and Move to Trash also mark the conversation read (an app-wide setting). */
   readonly markReadOnArchive: boolean;
   readonly toggleMarkReadOnArchive: () => void;
+  readonly settingsOpen: boolean;
+  readonly toggleSettings: () => void;
 }
 
 /** Action ids shown as buttons in the persistent toolbar, in order. */
@@ -336,6 +338,10 @@ export const buildActions = (context: ActionContext): ReadonlyArray<AppAction> =
     {
       id: "account.refreshAliases", label: "Refresh Send As aliases from Gmail", group: "Account",
       enabled: true, run: context.refreshAliases,
+    },
+    {
+      id: "settings.open", label: context.settingsOpen ? "Close settings" : "Settings (general, LLM endpoints and fallbacks)",
+      group: "Settings", shortcut: { key: "." }, enabled: true, run: context.toggleSettings,
     },
     {
       id: "settings.markReadOnArchive",

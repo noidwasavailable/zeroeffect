@@ -145,4 +145,8 @@ export const api = {
   llmEndpoints: () => request<{ endpoints: ReadonlyArray<LlmEndpointSummary> }>("/api/llm-endpoints").then((body) => body.endpoints),
   saveLlmEndpoint: (endpoint: Omit<LlmEndpointSummary, "timeoutMs"> & { readonly apiKey?: string }) =>
     request<{ endpoints: ReadonlyArray<LlmEndpointSummary> }>("/api/llm-endpoints", { method: "POST", body: endpoint }).then((body) => body.endpoints),
+  deleteLlmEndpoint: (id: string) =>
+    request<{ endpoints: ReadonlyArray<LlmEndpointSummary> }>(`/api/llm-endpoints/${encodeURIComponent(id)}`, { method: "DELETE" }).then((body) => body.endpoints),
+  saveRulesProviders: (accountId: string, providers: Pick<AiRulesFile, "llmEndpointId" | "fallbackLlmEndpointIds" | "apiMode">) =>
+    request<RulesResponse>(accountPath(accountId, "/rules/providers"), { method: "PUT", body: providers }),
 };
