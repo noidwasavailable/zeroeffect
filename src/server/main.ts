@@ -145,6 +145,22 @@ const main = async (): Promise<void> => {
   let notificationWorkerTask: Promise<void> | undefined;
   let watchRenewalTimer: ReturnType<typeof setInterval> | undefined;
   let localValkey: LocalValkey | undefined;
+  let lastValkeyCheck = 0;
+  // The notification queue needs Redis/Valkey: start a local Valkey container if nothing is listening.
+  // Called at startup and again when queue operations fail, since restarting Docker (or Colima) stops
+  // the container while this server keeps running.
+  const ensureValkey = async (): Promise<void> => {
+    if (stopping || Date.now() - lastValkeyCheck < 30_000) return;
+    lastValkeyCheck = Date.now();
+    try {
+      const valkey = await ensureLocalValkey(redisUrl);
+      if (!valkey.started) return;
+      localValkey = valkey;
+      console.log(`Started Valkey (Docker container ${VALKEY_CONTAINER}) at ${redisUrl}.`);
+    } catch (error) {
+      console.error(error instanceof Error ? error.message : error, "Gmail notifications will queue once it is reachable.");
+    }
+  };
   const renewWatchesSafely = async (topicName: string): Promise<void> => {
     try {
       await accountOperations.renewWatches(topicName);
@@ -205,6 +221,7 @@ const main = async (): Promise<void> => {
         } catch (error) {
           console.error("Could not recover in-flight Gmail notifications; retrying shortly.", error);
           serverStatus.report("notifications", null, error);
+          await ensureValkey();
           await new Promise((resolve) => setTimeout(resolve, 5_000));
         }
       }
@@ -232,6 +249,7 @@ const main = async (): Promise<void> => {
         } catch (error) {
           console.error("Gmail notification processing failed; preserving the queue item for retry.", error);
           serverStatus.report("notifications", null, error);
+          await ensureValkey();
           if (reserved !== null) {
             try {
               await Effect.runPromise(queueApi!.retry(processingQueue, "gmail:notifications", reserved));
@@ -258,13 +276,7 @@ const main = async (): Promise<void> => {
     }, 12 * 60 * 60 * 1000);
   };
   if (pubSubProjectId && pubSubSubscription && pubSubTopic) {
-    // The notification queue needs Redis/Valkey; start a local Valkey container if nothing is listening yet.
-    try {
-      localValkey = await ensureLocalValkey(redisUrl);
-      if (localValkey.started) console.log(`Started Valkey (Docker container ${VALKEY_CONTAINER}) at ${redisUrl}.`);
-    } catch (error) {
-      console.error(error instanceof Error ? error.message : error, "Gmail notifications will queue once it is reachable.");
-    }
+    await ensureValkey();
     try {
       const encrypted = await registryRuntime.runPromise(registry.getServiceCredential("google_pubsub"));
       if (encrypted) {
