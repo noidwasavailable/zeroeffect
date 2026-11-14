@@ -44,6 +44,8 @@ Each user creates their own OAuth client. ZeroEffect doesn't ship one.
      http://127.0.0.1:3838/auth/google/pubsub/callback
      ```
 
+     To connect accounts from other devices over Tailscale, also add the two callbacks under [Connecting accounts over Tailscale](#connecting-accounts-over-tailscale).
+
 > [!IMPORTANT]
 > While the app's publishing status is **Testing**, Google expires its sign-ins after 7 days and you'll have to reconnect. To avoid that, set the status to **In production**. An unverified app you use yourself works fine; you'll see a one-time warning screen.
 
@@ -127,7 +129,16 @@ tailscale serve --service=svc:mail --https=443 127.0.0.1:3838
 > Don't expose it to the public internet. Use `tailscale serve`, never `tailscale funnel` or port forwarding: anyone who can reach the server can read and send your mail.
 > Similarly, if other people on your tailnet can access this service, they will be able to read all your messages and even send one on your behalf!
 
-Google only accepts loopback OAuth callbacks, so connect accounts from the machine running the server, at `http://127.0.0.1:3838/setup`, or add the Tailscale FQDN in the Google Cloud OAuth client as an additional redirect URI, such as `https://<svc-name>.tail-scale.ts.net/setup`, etc.
+### Connecting accounts over Tailscale
+
+Setup works from any device. When you connect an account, Google sends you back to the address in your browser's address bar, so that address must be an authorized redirect URI on your OAuth client. To connect through Tailscale, add both callbacks for your Tailscale name next to the `127.0.0.1` ones from [step 1](#1-create-a-google-oauth-client):
+
+```text
+https://<svc-name>.<tailnet>.ts.net/auth/google/callback
+https://<svc-name>.<tailnet>.ts.net/auth/google/pubsub/callback
+```
+
+Without them, Google refuses the sign-in with `redirect_uri_mismatch`. To skip this, connect accounts from the machine running the server, at `http://127.0.0.1:3838/setup`.
 
 ## Filter and search syntax
 
