@@ -213,7 +213,8 @@ CREATE TABLE threads (
     ghost_labels_json TEXT NOT NULL DEFAULT '[]', -- Pending dry-run AI suggestions
     ai_status TEXT NOT NULL DEFAULT 'pending',    -- 'pending' | 'processed' | 'skipped' | 'error'
     ai_evaluated_through INTEGER,                 -- date_ts of the newest message the AI has classified
-    otp_code TEXT                                 -- One-time code found in the newest message
+    otp_code TEXT,                                -- One-time code found in the newest message
+    login_link TEXT                               -- One-click sign-in link ("magic link") in the newest message
 );
 
 CREATE TABLE messages (

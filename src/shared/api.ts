@@ -30,6 +30,8 @@ export interface ThreadSummary {
   readonly aiStatus: "pending" | "processed" | "skipped" | "error";
   /** One-time code found in the newest message; the client offers "copy" on OTP-labelled threads. */
   readonly otpCode: string | null;
+  /** One-click sign-in link ("Sign in with Magic Link") in the newest message; offered like otpCode. */
+  readonly loginLink: string | null;
 }
 
 export interface AttachmentSummary {

@@ -1,6 +1,6 @@
 import { Context, Effect, Layer } from "effect";
 import { GmailApiError } from "../../shared/errors";
-import { extractOtpCode } from "../../shared/otp";
+import { extractLoginLink, extractOtpCode } from "../../shared/otp";
 import { AccountDb } from "./AccountDb";
 import type { MessageRecord, ThreadRecord } from "./AccountDb";
 import { GmailClient } from "./GmailClient";
@@ -134,6 +134,7 @@ export const GmailSyncServiceLive: Layer.Layer<GmailSyncService, never, AccountD
           lastMessageAt: msgRecord.dateTs,
           deliveredToAlias: matchedAlias,
           otpCode: extractOtpCode(headers.subject ?? "", parsedBody.bodyMarkdown),
+          loginLink: extractLoginLink(parsedBody.bodyHtmlSanitized),
         };
         yield* accountDb.upsertThread(threadRecord);
         yield* accountDb.upsertMessage(msgRecord);

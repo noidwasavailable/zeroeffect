@@ -19,8 +19,9 @@ import {
 import type { AiRulesFile } from "../shared/aiRules";
 import { formatFilterExpr } from "../shared/filterDsl";
 import { parseFilterDsl } from "../shared/filterParser";
-import { copyableOtp, otpLabelNames } from "../shared/otp";
+import { copyableOtp, openableLoginLink, otpLabelNames } from "../shared/otp";
 import { copyText } from "./clipboard";
+import { openInNewTab } from "./openTab";
 import { allMessagesExpanded, initialFold, revealMessage, toggleAllMessages, type MessageFold } from "./threadFolding";
 import { applyThreadAction } from "../shared/threadActions";
 import { BUILT_IN_VIEWS } from "../shared/views";
@@ -479,6 +480,18 @@ function Inbox({ accounts, route, navigate }: {
     }, (error) => setNotice({ text: `Could not copy the code: ${errorMessage(error)}`, tone: "error" }));
   }, [otpLabels, runThreadAction]);
 
+  // Opens an OTP-labelled thread's sign-in link in a new tab (no opener or referrer) and, once the
+  // tab opened, marks the thread read.
+  const openLoginLink = useCallback((target: ThreadSummary | null) => {
+    const link = target ? openableLoginLink(target, otpLabels) : null;
+    if (!target || !link) return;
+    if (!openInNewTab(link)) {
+      setNotice({ text: "The browser blocked the new tab. Allow pop-ups for ZeroEffect and try again.", tone: "error" });
+      return;
+    }
+    if (target.isUnread) void runThreadAction({ type: "markRead" }, target);
+  }, [otpLabels, runThreadAction]);
+
   // Opening an unread thread marks it read, as in Gmail.
   const markedRead = useRef(new Set<string>());
   useEffect(() => {
@@ -871,6 +884,7 @@ function Inbox({ accounts, route, navigate }: {
     refreshAliases: () => loadAccountAliases(true),
     toggleHelp: () => setHelpOpen((open) => !open),
     selectedOtpCode: selectedThread ? copyableOtp(selectedThread, otpLabels) : null,
+    selectedLoginLink: selectedThread ? openableLoginLink(selectedThread, otpLabels) : null,
     threadOpen: openThreadId !== null,
     canSelectNext,
     canSelectPrevious,
@@ -905,6 +919,7 @@ function Inbox({ accounts, route, navigate }: {
     },
     runThreadAction: (action) => void runTargetsAction(action),
     copyOtp: () => copyOtp(selectedThread),
+    openLoginLink: () => openLoginLink(selectedThread),
     openMessageCount: openThreadId && detail?.id === openThreadId ? detail.messages.length : 0,
     allMessagesExpanded: detail !== null && currentFold !== null && allMessagesExpanded(currentFold, detail.messages),
     toggleExpandAll: () => {
@@ -974,7 +989,7 @@ function Inbox({ accounts, route, navigate }: {
     toggleMarkReadOnArchive,
     settingsOpen,
     toggleSettings: () => setSettingsOpen((open) => !open),
-  }), [settings, toggleMarkReadOnArchive, settingsOpen, openLeftList, selection.index, canSelectNext, canSelectPrevious, composerVisible, openComposer, sendReply, discardReply, accounts, account, accountId, views, view, viewId, savedViews, savedIndex, selectedThread, targets, checkedThreads, openThreadId, selectedIndex, threads, syncing, builderOpen, auditOpen, aiBusy, statusOpen, serverStatus, ruleSummaries, otpLabels, copyOtp, detail, currentFold, cursorIndex, newMessage, openNewMessage, openForward, sendNewMessage, discardNewMessage, draft, query, goTo, closeThread, runTargetsAction, markAllRead, toggleChecked, loadAccountAliases, navigate, sync, runAi, decideGhostLabels, undoAi, toggleRuleDryRun]);
+  }), [settings, toggleMarkReadOnArchive, settingsOpen, openLeftList, selection.index, canSelectNext, canSelectPrevious, composerVisible, openComposer, sendReply, discardReply, accounts, account, accountId, views, view, viewId, savedViews, savedIndex, selectedThread, targets, checkedThreads, openThreadId, selectedIndex, threads, syncing, builderOpen, auditOpen, aiBusy, statusOpen, serverStatus, ruleSummaries, otpLabels, copyOtp, openLoginLink, detail, currentFold, cursorIndex, newMessage, openNewMessage, openForward, sendNewMessage, discardNewMessage, draft, query, goTo, closeThread, runTargetsAction, markAllRead, toggleChecked, loadAccountAliases, navigate, sync, runAi, decideGhostLabels, undoAi, toggleRuleDryRun]);
 
   useVimShortcuts(actions, !paletteOpen && !helpOpen && !statusOpen && viewDialog === null && rulesPanel === null && !settingsOpen && newMessage === null);
   const setupAction = actions.find((action) => action.id === "account.setup");
@@ -1060,6 +1075,13 @@ function Inbox({ accounts, route, navigate }: {
               if (!thread) return;
               setSelection({ id: thread.id, index });
               copyOtp(thread);
+            }}
+            openLoginLinkAction={actions.find((action) => action.id === "thread.openLoginLink")}
+            onOpenLoginLink={(index) => {
+              const thread = threads[index];
+              if (!thread) return;
+              setSelection({ id: thread.id, index });
+              openLoginLink(thread);
             }}
           />
         </div>

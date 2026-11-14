@@ -45,6 +45,8 @@ export interface ActionContext {
   readonly searchActive: boolean;
   /** The selected thread's one-time code, when it carries an OTP label (see shared/otp.ts). */
   readonly selectedOtpCode: string | null;
+  /** The selected thread's one-click sign-in link, when it carries an OTP label (see shared/otp.ts). */
+  readonly selectedLoginLink: string | null;
   readonly threadOpen: boolean;
   readonly canSelectNext: boolean;
   readonly canSelectPrevious: boolean;
@@ -83,6 +85,7 @@ export interface ActionContext {
   readonly focusSearch: () => void;
   readonly runThreadAction: (action: ThreadAction) => void;
   readonly copyOtp: () => void;
+  readonly openLoginLink: () => void;
   /** The open conversation's message count and whether every message is expanded. */
   readonly openMessageCount: number;
   readonly allMessagesExpanded: boolean;
@@ -290,6 +293,11 @@ export const buildActions = (context: ActionContext): ReadonlyArray<AppAction> =
     {
       id: "thread.copyOtp", label: context.selectedOtpCode ? `Copy code ${context.selectedOtpCode} and mark read` : "Copy one-time code",
       group: "Thread", shortcut: { key: "p" }, enabled: context.selectedOtpCode !== null, run: context.copyOtp,
+    },
+    {
+      id: "thread.openLoginLink",
+      label: context.selectedLoginLink ? `Open sign-in link on ${new URL(context.selectedLoginLink).host} and mark read` : "Open sign-in link",
+      group: "Thread", shortcut: { key: "P" }, enabled: context.selectedLoginLink !== null, run: context.openLoginLink,
     },
     {
       id: "thread.reply", label: "Reply", group: "Thread", shortcut: { key: "r" },

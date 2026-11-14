@@ -1,3 +1,5 @@
+import { decodeHtmlEntities } from "../../shared/htmlEntities";
+
 export interface GmailMimePart {
   readonly partId?: string | null;
   readonly mimeType?: string | null;
@@ -138,7 +140,7 @@ export const sanitizeHtml = (input: string): string => {
       if (name === "a") {
         const href = /\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/i.exec(rawAttributes);
         const title = /\btitle\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/i.exec(rawAttributes);
-        const safeHref = decodeEntities(href?.[1] ?? href?.[2] ?? href?.[3] ?? "").trim();
+        const safeHref = decodeHtmlEntities(href?.[1] ?? href?.[2] ?? href?.[3] ?? "").trim();
         if (/^(https?:|mailto:)/i.test(safeHref)) attributes += ` href="${escapeAttribute(safeHref)}" rel="noreferrer noopener"`;
         const safeTitle = title?.[1] ?? title?.[2] ?? title?.[3];
         if (safeTitle) attributes += ` title="${escapeAttribute(safeTitle)}"`;
@@ -148,7 +150,7 @@ export const sanitizeHtml = (input: string): string => {
   );
 };
 
-export const htmlToMarkdown = (html: string): string => decodeEntities(
+export const htmlToMarkdown = (html: string): string => decodeHtmlEntities(
   html
     .replace(/<br\s*\/?\s*>/gi, "\n")
     .replace(/<li\b[^>]*>/gi, "\n- ")
@@ -164,28 +166,6 @@ export const htmlToMarkdown = (html: string): string => decodeEntities(
     .replace(/[ \t]+\n/g, "\n")
     .replace(/\n{3,}/g, "\n\n")
     .trim(),
-);
-
-const decodeEntities = (value: string): string => value.replace(
-  /&(#x[\da-f]{1,6}|#\d{1,7}|amp|apos|gt|lt|nbsp|quot);/gi,
-  (entity, body: string) => {
-    switch (body.toLowerCase()) {
-      case "amp": return "&";
-      case "apos": return "'";
-      case "gt": return ">";
-      case "lt": return "<";
-      case "nbsp": return " ";
-      case "quot": return '"';
-      default: {
-        const code = body[1]?.toLowerCase() === "x"
-          ? Number.parseInt(body.slice(2), 16)
-          : Number.parseInt(body.slice(1), 10);
-        return Number.isInteger(code) && code >= 0 && code <= 0x10ffff && !(code >= 0xd800 && code <= 0xdfff)
-          ? String.fromCodePoint(code)
-          : entity;
-      }
-    }
-  },
 );
 
 const escapeAttribute = (value: string): string => value.replace(/[&"<>]/g, (character) => ({

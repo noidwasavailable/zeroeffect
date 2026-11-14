@@ -1,12 +1,12 @@
 import { useEffect, useRef } from "react";
 import type { AppAction } from "../actions";
 import type { LabelSummary, ThreadSummary } from "../../shared/api";
-import { copyableOtp } from "../../shared/otp";
+import { copyableOtp, openableLoginLink } from "../../shared/otp";
 import { displayName, formatListDate } from "../format";
 import { Keycap } from "./Keycap";
 import { LabelChips } from "./LabelChips";
 
-export function ThreadList({ threads, selectedIndex, openThreadId, labelCatalog, loading, error, hasMore, checked, onToggleChecked, onSelect, onOpen, onLoadMore, otpLabels, copyOtpAction, onCopyOtp }: {
+export function ThreadList({ threads, selectedIndex, openThreadId, labelCatalog, loading, error, hasMore, checked, onToggleChecked, onSelect, onOpen, onLoadMore, otpLabels, copyOtpAction, onCopyOtp, openLoginLinkAction, onOpenLoginLink }: {
   readonly threads: ReadonlyArray<ThreadSummary>;
   readonly selectedIndex: number;
   readonly openThreadId: string | null;
@@ -26,6 +26,9 @@ export function ThreadList({ threads, selectedIndex, openThreadId, labelCatalog,
   /** The "copy code" action, for its shortcut badge on the selected row. */
   readonly copyOtpAction?: AppAction;
   readonly onCopyOtp: (index: number) => void;
+  /** The "open sign-in link" action, for its shortcut badge on the selected row. */
+  readonly openLoginLinkAction?: AppAction;
+  readonly onOpenLoginLink: (index: number) => void;
 }) {
   const selectedRef = useRef<HTMLLIElement>(null);
   useEffect(() => {
@@ -44,6 +47,7 @@ export function ThreadList({ threads, selectedIndex, openThreadId, labelCatalog,
         const selected = index === selectedIndex;
         const isChecked = checked.has(thread.id);
         const otp = copyableOtp(thread, otpLabels);
+        const loginLink = openableLoginLink(thread, otpLabels);
         return (
           <li
             key={thread.id}
@@ -84,7 +88,20 @@ export function ThreadList({ threads, selectedIndex, openThreadId, labelCatalog,
                   {selected && copyOtpAction?.shortcut && <Keycap shortcut={copyOtpAction.shortcut} />}
                 </button>
               )}
-              <span className={`${otp ? "" : "ml-auto "}shrink-0 text-xs text-zinc-500`}>{formatListDate(thread.lastMessageAt)}</span>
+              {loginLink && (
+                <button
+                  type="button"
+                  // The full address on hover; the row shows the host so a look-alike domain stands out.
+                  title={`Open ${loginLink} in a new tab and mark as read`}
+                  className={`${otp ? "" : "ml-auto "}flex shrink-0 items-center gap-1.5 rounded border border-zinc-300 px-1.5 text-xs leading-5 hover:bg-zinc-100 dark:border-zinc-700 dark:hover:bg-zinc-800`}
+                  onClick={(event) => { event.stopPropagation(); onOpenLoginLink(index); }}
+                  onDoubleClick={(event) => event.stopPropagation()}
+                >
+                  Sign in → {new URL(loginLink).host}
+                  {selected && openLoginLinkAction?.shortcut && <Keycap shortcut={openLoginLinkAction.shortcut} />}
+                </button>
+              )}
+              <span className={`${otp || loginLink ? "" : "ml-auto "}shrink-0 text-xs text-zinc-500`}>{formatListDate(thread.lastMessageAt)}</span>
             </div>
             {/* Labels lead the subject, as in Gmail, so they stay readable however long the subject is. */}
             <div className="flex min-w-0 items-center gap-1.5">

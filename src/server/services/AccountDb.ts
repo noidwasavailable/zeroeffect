@@ -5,7 +5,7 @@ import { Context, Effect, Layer } from "effect";
 import { Database } from "bun:sqlite";
 import { AccountIsolationError, DatabaseError } from "../../shared/errors";
 import type { ConversationStatus, LlmApiMode } from "../../shared/aiRules";
-import { extractOtpCode } from "../../shared/otp";
+import { extractLoginLink, extractOtpCode } from "../../shared/otp";
 import { formatFilterExpr, renameFilterLabels } from "../../shared/filterDsl";
 import { applyLabelChange } from "../../shared/threadActions";
 import type { FilterExpr, FilterThread } from "../../shared/schemas";
@@ -23,6 +23,8 @@ export interface ThreadRecord extends FilterThread {
   readonly aiStatus?: "pending" | "processed" | "skipped" | "error";
   /** One-time code found in the newest message (see shared/otp.ts); shown for OTP-labelled threads. */
   readonly otpCode?: string | null;
+  /** Sign-in link found in the newest message's HTML (see shared/otp.ts); shown for OTP-labelled threads. */
+  readonly loginLink?: string | null;
 }
 
 export interface LabelRecord {
@@ -191,6 +193,7 @@ interface ThreadRow {
   ai_status: "pending" | "processed" | "skipped" | "error";
   ai_evaluated_through: number | null;
   otp_code: string | null;
+  login_link: string | null;
 }
 
 interface AuditRow {
@@ -314,25 +317,27 @@ const MESSAGES_FTS_TABLE = `
     tokenize = 'unicode61 remove_diacritics 2'
   );
 `;
-/** Bumped whenever extractOtpCode learns new code shapes (v2: letter codes), so stored threads are rescanned. */
-const OTP_CODES_MIGRATION_ID = "otp-codes-v2";
+/**
+ * Bumped whenever extractOtpCode or extractLoginLink learn new shapes (v2: letter codes; v3: sign-in
+ * links), so stored threads are rescanned.
+ */
+const OTP_CODES_MIGRATION_ID = "otp-codes-v3";
 
-/** Adds threads.otp_code if missing and (re)extracts it from each thread's newest message, as sync does for new mail. */
+/** Adds threads.otp_code / login_link if missing and (re)extracts them from each thread's newest message, as sync does for new mail. */
 const migrateOtpCodes = (database: Database): void => {
-  const columnMissing = !columnNames(database, "threads").includes("otp_code");
-  if (!columnMissing && database.prepare("SELECT 1 FROM schema_migrations WHERE id = ?").get(OTP_CODES_MIGRATION_ID)) return;
+  const missing = ["otp_code", "login_link"].filter((column) => !columnNames(database, "threads").includes(column));
+  if (missing.length === 0 && database.prepare("SELECT 1 FROM schema_migrations WHERE id = ?").get(OTP_CODES_MIGRATION_ID)) return;
   database.transaction(() => {
-    if (columnMissing) database.exec("ALTER TABLE threads ADD COLUMN otp_code TEXT");
+    for (const column of missing) database.exec(`ALTER TABLE threads ADD COLUMN ${column} TEXT`);
     const newest = database.prepare(`
-      SELECT threads.id, threads.subject, messages.body_markdown FROM threads
+      SELECT threads.id, threads.subject, messages.body_markdown, messages.body_html_sanitized FROM threads
       JOIN messages ON messages.id = (
         SELECT id FROM messages WHERE thread_id = threads.id ORDER BY date_ts DESC, id DESC LIMIT 1
       )
-    `).all() as Array<{ id: string; subject: string; body_markdown: string }>;
-    const update = database.prepare("UPDATE threads SET otp_code = ? WHERE id = ? AND otp_code IS NOT ?");
+    `).all() as Array<{ id: string; subject: string; body_markdown: string; body_html_sanitized: string }>;
+    const update = database.prepare("UPDATE threads SET otp_code = ?1, login_link = ?2 WHERE id = ?3 AND (otp_code IS NOT ?1 OR login_link IS NOT ?2)");
     for (const row of newest) {
-      const code = extractOtpCode(row.subject, row.body_markdown);
-      update.run(code, row.id, code);
+      update.run(extractOtpCode(row.subject, row.body_markdown), extractLoginLink(row.body_html_sanitized), row.id);
     }
     database.prepare("INSERT OR IGNORE INTO schema_migrations (id) VALUES (?)").run(OTP_CODES_MIGRATION_ID);
   })();
@@ -409,7 +414,8 @@ const initialize = (database: Database): void => {
       ai_status TEXT NOT NULL DEFAULT 'pending'
         CHECK (ai_status IN ('pending', 'processed', 'skipped', 'error')),
       ai_evaluated_through INTEGER,
-      otp_code TEXT
+      otp_code TEXT,
+      login_link TEXT
     );
     CREATE TABLE IF NOT EXISTS messages (
       id TEXT PRIMARY KEY,
@@ -494,6 +500,7 @@ const toThreadSummary = (row: ThreadRow): ThreadSummary => ({
   ghostLabels: JSON.parse(row.ghost_labels_json) as string[],
   aiStatus: row.ai_status,
   otpCode: row.otp_code ?? null,
+  loginLink: row.login_link ?? null,
 });
 
 const makeService = (accountId: string, database: Database, rulesStore: RulesStore): AccountDbService => ({
@@ -505,8 +512,8 @@ const makeService = (accountId: string, database: Database, rulesStore: RulesSto
         const saved = database.prepare(`
           INSERT INTO threads (
             id, subject, snippet, last_message_at, is_unread, is_starred, is_archived,
-            sender_summary, delivered_to_alias, labels_json, ghost_labels_json, ai_status, otp_code
-          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, COALESCE(?11, '[]'), COALESCE(?12, 'pending'), ?13)
+            sender_summary, delivered_to_alias, labels_json, ghost_labels_json, ai_status, otp_code, login_link
+          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, COALESCE(?11, '[]'), COALESCE(?12, 'pending'), ?13, ?14)
           ON CONFLICT(id) DO UPDATE SET
             -- Display fields follow the newest message; updating an older message must not roll them back.
             subject = CASE WHEN excluded.last_message_at >= threads.last_message_at THEN excluded.subject ELSE threads.subject END,
@@ -514,6 +521,7 @@ const makeService = (accountId: string, database: Database, rulesStore: RulesSto
             sender_summary = CASE WHEN excluded.last_message_at >= threads.last_message_at THEN excluded.sender_summary ELSE threads.sender_summary END,
             delivered_to_alias = CASE WHEN excluded.last_message_at >= threads.last_message_at THEN excluded.delivered_to_alias ELSE threads.delivered_to_alias END,
             otp_code = CASE WHEN excluded.last_message_at >= threads.last_message_at THEN excluded.otp_code ELSE threads.otp_code END,
+            login_link = CASE WHEN excluded.last_message_at >= threads.last_message_at THEN excluded.login_link ELSE threads.login_link END,
             last_message_at = MAX(threads.last_message_at, excluded.last_message_at),
             is_unread = excluded.is_unread,
             is_starred = excluded.is_starred,
@@ -537,6 +545,7 @@ const makeService = (accountId: string, database: Database, rulesStore: RulesSto
           thread.ghostLabels ? JSON.stringify(thread.ghostLabels) : null,
           thread.aiStatus ?? null,
           thread.otpCode ?? null,
+          thread.loginLink ?? null,
         ) as { subject: string };
         // Search rows carry the thread subject.
         if (previous && previous.subject !== saved.subject) reindexThreadText(database, thread.id);

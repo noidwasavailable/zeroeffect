@@ -27,7 +27,7 @@ import { allMessagesExpanded, foldLayout, initialFold, toggleAllMessages, toggle
 import { LOCAL_REQUEST_HEADER, type AccountId, type ThreadDetail, type ThreadMessage, type ThreadPage, type ThreadSummary } from "../src/shared/api";
 import { formatFilterExpr } from "../src/shared/filterDsl";
 import { parseFilterDsl } from "../src/shared/filterParser";
-import { copyableOtp, extractOtpCode, otpLabelNames } from "../src/shared/otp";
+import { copyableOtp, extractLoginLink, extractOtpCode, openableLoginLink, otpLabelNames } from "../src/shared/otp";
 import type { FilterExpr } from "../src/shared/schemas";
 import { applyThreadAction } from "../src/shared/threadActions";
 import { BUILT_IN_VIEWS, orderViews } from "../src/shared/views";
@@ -192,6 +192,20 @@ describe("Phase 4: one-time codes", () => {
     expect(extractOtpCode("Your login code", "LqKmAU\n\nX7K9P2")).toBeNull();
   });
 
+  test("finds a single https sign-in link by its text", () => {
+    const notion = '<p>Login to Notion</p><a href="https://app.notion.com/loginwithemail?state=s&amp;password=LqKmAU" rel="noreferrer noopener"><span>Sign in with Magic Link</span></a> <a href="https://app.notion.com/?n=email_footer">Notion.com</a>';
+    expect(extractLoginLink(notion)).toBe("https://app.notion.com/loginwithemail?state=s&password=LqKmAU");
+    // A button and its plain-URL fallback with the same address count once.
+    expect(extractLoginLink('<a href="https://x.example/l?t=1">Log in</a> or <a href="https://x.example/l?t=1">log in here</a>')).toBe("https://x.example/l?t=1");
+    expect(extractLoginLink('<a href="https://x.example/a">로그인</a>')).toBe("https://x.example/a");
+    // Two different candidates, non-https links and unrelated text offer nothing.
+    expect(extractLoginLink('<a href="https://x.example/a">Sign in</a><a href="https://x.example/b">Verify email</a>')).toBeNull();
+    expect(extractLoginLink('<a href="http://x.example/a">Sign in</a>')).toBeNull();
+    expect(extractLoginLink('<a href="https://x.example/u">Unsubscribe</a><a href="https://x.example/blog">Design blog</a>')).toBeNull();
+    expect(openableLoginLink({ loginLink: "https://x.example/a", labels: ["OTP"] }, otpLabelNames([]))).toBe("https://x.example/a");
+    expect(openableLoginLink({ loginLink: "https://x.example/a", labels: ["INBOX"] }, otpLabelNames([]))).toBeNull();
+  });
+
   test("only OTP-labelled threads offer a code; the label comes from the account's OTP rules", () => {
     const rules = [{ systemType: "OTP", actions: [{ type: "LABEL", label: "Codes" }] }, { systemType: "NEWSLETTER", actions: [{ type: "LABEL", label: "News" }] }];
     expect([...otpLabelNames(rules)]).toEqual(["Codes"]);
@@ -207,7 +221,7 @@ describe("Phase 4: one-time codes", () => {
     const db = open();
     const upsert = (id: string, at: number, otpCode: string | null, body: string) => Effect.runPromise(Effect.gen(function* () {
       yield* db.upsertThread({ id: "t-otp", subject: "Your login code", senderSummary: "a@x.example", labels: ["INBOX", "OTP"], lastMessageAt: at, isUnread: true, isStarred: false, isArchived: false, otpCode });
-      yield* db.upsertMessage({ id, threadId: "t-otp", fromAddress: "a@x.example", toAddresses: [], ccAddresses: [], deliveredTo: null, dateTs: at, bodyMarkdown: body, bodyHtmlSanitized: "", rawHeaders: {} });
+      yield* db.upsertMessage({ id, threadId: "t-otp", fromAddress: "a@x.example", toAddresses: [], ccAddresses: [], deliveredTo: null, dateTs: at, bodyMarkdown: body, bodyHtmlSanitized: `<a href="https://x.example/${id}">Sign in</a>`, rawHeaders: {} });
     }));
     await upsert("m2", 20, "222222", "Your code is 222222");
     // An older message synced later must not replace the newest message's code.
@@ -220,8 +234,8 @@ describe("Phase 4: one-time codes", () => {
     expect((await Effect.runPromise(migrated.listThreadSummaries(filter, { limit: 5, offset: 0 })))[0]?.otpCode).toBe("222222");
 
     // A newer extractor rescans threads stored by an older one.
-    database.exec("UPDATE threads SET otp_code = NULL; DELETE FROM schema_migrations WHERE id LIKE 'otp-codes-%'");
-    expect((await Effect.runPromise(open().listThreadSummaries(filter, { limit: 5, offset: 0 })))[0]?.otpCode).toBe("222222");
+    database.exec("UPDATE threads SET otp_code = NULL, login_link = NULL; DELETE FROM schema_migrations WHERE id LIKE 'otp-codes-%'");
+    expect((await Effect.runPromise(open().listThreadSummaries(filter, { limit: 5, offset: 0 })))[0]).toMatchObject({ otpCode: "222222", loginLink: "https://x.example/m2" });
     database.close();
   });
 });
@@ -268,7 +282,7 @@ describe("Phase 4: reading a conversation from its latest reply", () => {
 describe("Phase 4: one action registry drives the palette, toolbar and Vim keys", () => {
   const thread: ThreadSummary = {
     id: "t1", subject: "Hello", snippet: "", senderSummary: "a@example.com", lastMessageAt: 1,
-    labels: ["INBOX", "UNREAD"], ghostLabels: [], isUnread: true, isStarred: false, isArchived: false, aiStatus: "pending", otpCode: null,
+    labels: ["INBOX", "UNREAD"], ghostLabels: [], isUnread: true, isStarred: false, isArchived: false, aiStatus: "pending", otpCode: null, loginLink: null,
   };
   const calls: string[] = [];
   const context: ActionContext = {
@@ -303,6 +317,7 @@ describe("Phase 4: one action registry drives the palette, toolbar and Vim keys"
     refreshAliases: () => calls.push("refresh-aliases"),
     toggleHelp: () => calls.push("help"),
     selectedOtpCode: null,
+    selectedLoginLink: null,
     threadOpen: true,
     canSelectNext: true,
     canSelectPrevious: false,
@@ -342,6 +357,7 @@ describe("Phase 4: one action registry drives the palette, toolbar and Vim keys"
     settingsOpen: false,
     toggleSettings: () => calls.push("settings"),
     copyOtp: () => calls.push("copy-otp"),
+    openLoginLink: () => calls.push("login-link"),
     openMessageCount: 3,
     allMessagesExpanded: false,
     toggleExpandAll: () => calls.push("expand-all"),
@@ -399,6 +415,7 @@ describe("Phase 4: one action registry drives the palette, toolbar and Vim keys"
     expect(byKey("2", true)).toBe("account.switch.work");
     expect(byKey("c")).toBe("compose.new");
     expect(byKey("p")).toBe("thread.copyOtp");
+    expect(byKey("P")).toBe("thread.openLoginLink");
     expect(byKey("G")).toBe("account.setup");
     expect(byKey(";")).toBe("thread.toggleExpandAll");
     expect(actions.find((action) => action.id === "thread.toggleRead")?.label).toBe("Mark as read");
@@ -417,6 +434,13 @@ describe("Phase 4: one action registry drives the palette, toolbar and Vim keys"
     expect(withCode.find((action) => action.id === "compose.sendNew")?.enabled).toBe(true);
     copy.run();
     expect(calls.at(-1)).toBe("copy-otp");
+
+    expect(actions.find((action) => action.id === "thread.openLoginLink")?.enabled).toBe(false);
+    const withLink = buildActions({ ...context, selectedLoginLink: "https://app.notion.com/loginwithemail?password=x" });
+    const open = withLink.find((action) => action.id === "thread.openLoginLink")!;
+    expect(open).toMatchObject({ enabled: true, label: "Open sign-in link on app.notion.com and mark read" });
+    open.run();
+    expect(calls.at(-1)).toBe("login-link");
   });
 
   test("shortcuts ignore Cmd/Ctrl chords and Alt shortcuts match the physical key", () => {

@@ -1,6 +1,9 @@
-// One-time passcode extraction for "copy the code" on OTP-labelled conversations. Heuristic and
-// deliberately conservative: a code is only returned when it sits near an OTP keyword (or is the
-// only code-shaped token in the subject), so ordinary numbers like prices or order IDs are skipped.
+// One-time passcode and sign-in link extraction for "copy the code" / "open the link" on
+// OTP-labelled conversations. Heuristic and deliberately conservative: a code is only returned when
+// it sits near an OTP keyword (or is the only code-shaped token in the subject), so ordinary numbers
+// like prices or order IDs are skipped.
+
+import { decodeHtmlEntities } from "./htmlEntities";
 
 const KEYWORDS = [
   "verification code", "verification", "verify", "security code", "login code", "sign-in code", "sign in code",
@@ -113,9 +116,37 @@ export const otpLabelNames = (
   return new Set(labels.length > 0 ? labels : ["OTP"]);
 };
 
+const hasOtpLabel = (thread: { readonly labels: ReadonlyArray<string> }, otpLabels: ReadonlySet<string>): boolean =>
+  thread.labels.some((label) => otpLabels.has(label));
+
 /** The code to offer for copying: only on threads carrying an OTP label, so stray numbers elsewhere stay hidden. */
 export const copyableOtp = (
   thread: { readonly otpCode: string | null; readonly labels: ReadonlyArray<string> },
   otpLabels: ReadonlySet<string>,
-): string | null => thread.otpCode && thread.labels.some((label) => otpLabels.has(label)) ? thread.otpCode : null;
+): string | null => thread.otpCode && hasOtpLabel(thread, otpLabels) ? thread.otpCode : null;
 
+
+// Link text that marks a one-click sign-in ("Sign in with Magic Link", "Log in", "Verify email").
+const LOGIN_LINK_TEXT = /\b(?:sign|log)[ -]?(?:in|on)\b|\bmagic[ -]?link\b|\bverify\b|\bconfirm (?:your )?(?:email|sign|log)|로그인|인증|ログイン|登录|登入/i;
+
+/**
+ * The one-click sign-in link of an email's HTML: an https link whose text reads like "Sign in" or
+ * "Magic link". Null unless exactly one such address exists (a button and its plain-URL fallback
+ * count once), so a mail with several candidates never guesses.
+ */
+export const extractLoginLink = (html: string): string | null => {
+  const hrefs = new Set<string>();
+  for (const match of html.slice(0, 200_000).matchAll(/<a\b[^>]*?\bhref\s*=\s*(["'])(.*?)\1[^>]*>([\s\S]*?)<\/a\s*>/gi)) {
+    const text = decodeHtmlEntities(match[3]!.replace(/<[^>]*>/g, " ")).replace(/\s+/g, " ").trim();
+    if (!LOGIN_LINK_TEXT.test(text)) continue;
+    const href = decodeHtmlEntities(match[2]!.trim());
+    if (URL.canParse(href) && new URL(href).protocol === "https:") hrefs.add(href);
+  }
+  return hrefs.size === 1 ? [...hrefs][0]! : null;
+};
+
+/** The sign-in link to offer: like copyableOtp, only on threads carrying an OTP label. */
+export const openableLoginLink = (
+  thread: { readonly loginLink: string | null; readonly labels: ReadonlyArray<string> },
+  otpLabels: ReadonlySet<string>,
+): string | null => thread.loginLink && hasOtpLabel(thread, otpLabels) ? thread.loginLink : null;
