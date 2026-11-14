@@ -1,5 +1,7 @@
 // Click-tracking redirects in email links. Pure redirectors that carry the destination in a query
-// parameter are unwrapped offline, so the tracker never sees the click.
+// parameter are unwrapped offline, so the tracker never sees the click. Opaque ones (SendGrid's
+// signed `upn`) can only be read by asking the tracker: the server resolves those one hop when the
+// link is clicked (GET /api/out), never ahead of time.
 
 /** Redirectors whose only job is to forward to the URL in one of `params`; matched on host and path. */
 const REDIRECTORS: ReadonlyArray<{ readonly host: RegExp; readonly path: RegExp; readonly params: ReadonlyArray<string> }> = [
@@ -10,6 +12,14 @@ const REDIRECTORS: ReadonlyArray<{ readonly host: RegExp; readonly path: RegExp;
   { host: /^(?:www\.)?youtube\.com$/, path: /^\/redirect$/, params: ["q"] },
   { host: /^(?:www\.)?linkedin\.com$/, path: /^\/redir\/redirect\/?$/, params: ["url"] },
   { host: /^slack-redir\.net$/, path: /^\/link$/, params: ["url"] },
+];
+
+/** Click trackers with an opaque destination, resolved by the server on click. */
+const OPAQUE_TRACKERS: ReadonlyArray<{ readonly host: RegExp; readonly path: RegExp }> = [
+  { host: /\.ct\.sendgrid\.net$/, path: /^\/ls\/click$/ },
+  { host: /(?:^|\.)list-manage\.com$/, path: /^\/track\/click$/ },
+  { host: /^mandrillapp\.com$/, path: /^\/track\/click\// },
+  { host: /\.hubspotlinks\.com$/, path: /^\// },
 ];
 
 const parseWebUrl = (value: string): URL | null => {
@@ -31,5 +41,19 @@ export const unwrapTrackedUrl = (value: string): string => {
   return current;
 };
 
-/** Where a clicked email link should go: past pure redirectors, and unchanged otherwise (mailto:, ordinary links). */
-export const outboundUrl = (value: string): string => unwrapTrackedUrl(value);
+/** Whether a link goes through a tracker whose destination only the tracker knows. */
+export const isOpaqueTracker = (value: string): boolean => {
+  const url = parseWebUrl(value);
+  return url?.protocol === "https:" && OPAQUE_TRACKERS.some((rule) => rule.host.test(url.hostname) && rule.path.test(url.pathname));
+};
+
+export const OUTBOUND_PATH = "/api/out";
+
+/**
+ * Where a clicked email link should go: unwrapped offline when possible, through the server's
+ * one-hop resolver for opaque trackers, and unchanged otherwise (mailto:, ordinary links).
+ */
+export const outboundUrl = (value: string): string => {
+  const unwrapped = unwrapTrackedUrl(value);
+  return isOpaqueTracker(unwrapped) ? `${OUTBOUND_PATH}?url=${encodeURIComponent(unwrapped)}` : unwrapped;
+};

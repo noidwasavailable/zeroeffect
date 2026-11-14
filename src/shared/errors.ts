@@ -36,6 +36,12 @@ export class RedisQueueError extends Data.TaggedError("RedisQueueError")<{
   readonly cause?: unknown;
 }> {}
 
+export class TrackerRequestError extends Data.TaggedError("TrackerRequestError")<{
+  readonly message: string;
+  readonly url: string;
+  readonly cause?: unknown;
+}> {}
+
 export class DatabaseError extends Data.TaggedError("DatabaseError")<{
   readonly message: string;
   readonly operation: string;

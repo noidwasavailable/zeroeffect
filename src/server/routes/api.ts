@@ -38,6 +38,8 @@ import type { RegistryDbService } from "../services/RegistryDb";
 import { chooseAlias, isSendableAlias, SendAsComposerService, SendAsComposerServiceLive, type OutgoingFile } from "../services/SendAsComposerService";
 import { accountEventStream, type AccountEventBus } from "./sse";
 import type { ServerStatusStore } from "../serverStatus";
+import { outboundRedirect, type LinkResolverOptions } from "../linkResolver";
+import { OUTBOUND_PATH } from "../../shared/trackers";
 
 export interface ApiConfig {
   readonly registry: RegistryDbService;
@@ -55,6 +57,8 @@ export interface ApiConfig {
   readonly onReplySent?: (accountId: AccountId) => void;
   /** Background problems and the Pub/Sub state for the status panel; without it the panel shows nothing. */
   readonly serverStatus?: ServerStatusStore;
+  /** How GET /api/out reaches click trackers (tests use a local mock tracker). */
+  readonly linkResolver?: LinkResolverOptions;
 }
 
 export interface ApiHandler {
@@ -921,6 +925,10 @@ export const createApiHandler = (config: ApiConfig): ApiHandler => {
 
   return {
     handle: async (request, url) => {
+      if (url.pathname === OUTBOUND_PATH) {
+        if (request.method !== "GET") return apiError(405, { error: "Use GET." });
+        return Effect.runPromise(outboundRedirect(url, config.linkResolver));
+      }
       // LLM endpoints are shared by both accounts (each account's rules file picks one).
       const endpointMatch = /^\/api\/llm-endpoints\/([^/]+)$/.exec(url.pathname);
       if (endpointMatch) {

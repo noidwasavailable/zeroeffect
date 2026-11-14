@@ -143,6 +143,7 @@ zero-effect/
 │   │   ├── dev-server.ts           # HTTP server: setup/OAuth pages, client bundle, sync jobs
 │   │   ├── serverStatus.ts         # Background problems + Pub/Sub state (GET /api/status)
 │   │   ├── pubSubSupervisor.ts     # StreamingPull reconnects, invalid_grant, reauthorization
+│   │   ├── linkResolver.ts         # One-hop click-tracker resolution for GET /api/out
 │   │   ├── services/
 │   │   │   ├── RegistryDb.ts
 │   │   │   ├── AccountDb.ts
