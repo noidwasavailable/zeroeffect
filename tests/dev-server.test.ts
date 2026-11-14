@@ -219,6 +219,31 @@ describe("local account setup", () => {
     expect(callback.status).toBe(303);
     expect(callback.headers.get("location")).toContain("connected=personal");
     expect(tokenRequests[0]?.get("client_secret")).toBe("local-secret");
+    expect(tokenRequests[0]?.get("redirect_uri")).toBe("http://127.0.0.1:3838/auth/google/callback");
+
+    // Behind `tailscale serve` the browser's host is kept, so the callback goes back to it over https.
+    const proxiedHeaders = { host: "mail.example.ts.net" };
+    const proxiedPage = await fetch(new URL("/setup", app.url), { headers: proxiedHeaders, redirect: "manual" });
+    expect(proxiedPage.status).toBe(200);
+    const proxiedStart = await fetch(new URL("/auth/google/start?accountId=personal", app.url), { headers: proxiedHeaders, redirect: "manual" });
+    expect(proxiedStart.status).toBe(302);
+    const proxiedAuthorizationUrl = new URL(proxiedStart.headers.get("location")!);
+    expect(proxiedAuthorizationUrl.searchParams.get("redirect_uri")).toBe("https://mail.example.ts.net/auth/google/callback");
+    const proxiedState = proxiedAuthorizationUrl.searchParams.get("state")!;
+    const proxiedCookie = proxiedStart.headers.get("set-cookie")!.split(";")[0]!;
+    const wrongHostCallback = await fetch(new URL(`/auth/google/callback?code=offline-code&state=${encodeURIComponent(proxiedState)}`, app.url), {
+      headers: { cookie: proxiedCookie },
+      redirect: "manual",
+    });
+    expect(wrongHostCallback.status).toBe(400);
+    const proxiedStartAgain = await fetch(new URL("/auth/google/start?accountId=personal", app.url), { headers: proxiedHeaders, redirect: "manual" });
+    const retryState = new URL(proxiedStartAgain.headers.get("location")!).searchParams.get("state")!;
+    const proxiedCallback = await fetch(new URL(`/auth/google/callback?code=offline-code&state=${encodeURIComponent(retryState)}`, app.url), {
+      headers: { ...proxiedHeaders, cookie: proxiedStartAgain.headers.get("set-cookie")!.split(";")[0]! },
+      redirect: "manual",
+    });
+    expect(proxiedCallback.status).toBe(303);
+    expect(tokenRequests[1]?.get("redirect_uri")).toBe("https://mail.example.ts.net/auth/google/callback");
 
     const accountResponse = await fetch(new URL("/api/accounts", app.url));
     expect(await accountResponse.json()).toEqual({

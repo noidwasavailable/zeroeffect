@@ -19,8 +19,9 @@ export interface GoogleOAuthTokens {
 }
 
 export interface GoogleOAuth2Api {
-  readonly authorizationUrl: (accountId: string, state: string, purpose?: GoogleOAuthPurpose) => URL;
-  readonly exchangeCode: (accountId: string, code: string) => Effect.Effect<{ readonly accountId: string; readonly tokens: GoogleOAuthTokens }, GmailApiError>;
+  /** `redirectUri` overrides the configured callback; the code exchange must then pass the same URI. */
+  readonly authorizationUrl: (accountId: string, state: string, purpose?: GoogleOAuthPurpose, redirectUri?: string) => URL;
+  readonly exchangeCode: (accountId: string, code: string, redirectUri?: string) => Effect.Effect<{ readonly accountId: string; readonly tokens: GoogleOAuthTokens }, GmailApiError>;
   readonly refreshAccessToken: (accountId: string, refreshToken: string) => Effect.Effect<{ readonly accountId: string; readonly tokens: GoogleOAuthTokens }, GmailApiError>;
 }
 
@@ -46,13 +47,13 @@ const makeOAuth2 = (config: GoogleOAuth2Config): GoogleOAuth2Api => {
   const authorizationEndpoint = config.authorizationEndpoint ?? "https://accounts.google.com/o/oauth2/v2/auth";
   const tokenEndpoint = config.tokenEndpoint ?? "https://oauth2.googleapis.com/token";
   const fetcher = config.fetch ?? globalThis.fetch;
-  const authorizationUrl = (accountId: string, state: string, purpose: GoogleOAuthPurpose = "gmail"): URL => {
+  const authorizationUrl = (accountId: string, state: string, purpose: GoogleOAuthPurpose = "gmail", redirectUri = config.redirectUri): URL => {
     validateAccountId(accountId);
     if (!state || /[\r\n]/.test(state)) throw new Error("OAuth state must be a non-empty, single-line value.");
     const url = new URL(authorizationEndpoint);
     url.search = new URLSearchParams({
       client_id: config.clientId,
-      redirect_uri: config.redirectUri,
+      redirect_uri: redirectUri,
       response_type: "code",
       scope: (purpose === "pubsub" ? PUBSUB_OAUTH_SCOPES : GMAIL_OAUTH_SCOPES).join(" "),
       access_type: "offline",
@@ -99,11 +100,11 @@ const makeOAuth2 = (config: GoogleOAuth2Config): GoogleOAuth2Api => {
 
   return {
     authorizationUrl,
-    exchangeCode: (accountId, code) => tokenRequest(accountId, new URLSearchParams({
+    exchangeCode: (accountId, code, redirectUri = config.redirectUri) => tokenRequest(accountId, new URLSearchParams({
       code,
       client_id: config.clientId,
       client_secret: config.clientSecret,
-      redirect_uri: config.redirectUri,
+      redirect_uri: redirectUri,
       grant_type: "authorization_code",
     })),
     refreshAccessToken: (accountId, refreshToken) => tokenRequest(accountId, new URLSearchParams({

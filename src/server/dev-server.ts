@@ -149,8 +149,22 @@ export const createDevServer = (config: DevServerConfig): Bun.Server<unknown> =>
   if (!isLoopback(callbackHostname) || !isLoopback(pubsubCallbackHostname)) {
     throw new Error("Google OAuth callbacks must use a loopback hostname.");
   }
-  const pendingStates = new Map<string, { readonly accountId: AccountId; readonly createdAt: number }>();
-  const pendingPubSubStates = new Map<string, number>();
+  // Loopback visitors use the configured callback, on its own host so the state cookie comes back.
+  // Other hosts (a `tailscale serve` name) get the callback on the host the browser used; Google
+  // refuses any redirect URI not registered on the OAuth client, so a forged Host header gets nowhere.
+  const callbackUriFor = (request: Request, url: URL, configured: URL): string | null => {
+    if (isLoopback(url.hostname)) return url.hostname === configured.hostname ? configured.toString() : null;
+    const forwardedProto = request.headers.get("x-forwarded-proto");
+    const protocol = forwardedProto === "http" || forwardedProto === "https" ? forwardedProto : "https";
+    return `${protocol}://${url.host}${configured.pathname}`;
+  };
+  const redirectToHost = (url: URL, hostname: string): Response => {
+    const canonicalUrl = new URL(url);
+    canonicalUrl.hostname = hostname;
+    return new Response(null, { status: 302, headers: { Location: canonicalUrl.toString(), "Cache-Control": "no-store" } });
+  };
+  const pendingStates = new Map<string, { readonly accountId: AccountId; readonly createdAt: number; readonly redirectUri: string }>();
+  const pendingPubSubStates = new Map<string, { readonly createdAt: number; readonly redirectUri: string }>();
   const syncJobs = new Map<AccountId, SyncJob>();
 
   const tokens = config.tokens ?? createGmailAccessTokenProvider({ registry: config.registry, oauth: config.oauth, vault });
@@ -190,21 +204,6 @@ export const createDevServer = (config: DevServerConfig): Bun.Server<unknown> =>
       const apiResponse = await api.handle(request, url);
       if (apiResponse) return apiResponse;
 
-      // Google only accepts loopback OAuth callbacks, so account setup runs on the server's own host.
-      if (
-        request.method === "GET" &&
-        url.hostname !== callbackHostname &&
-        url.hostname !== pubsubCallbackHostname &&
-        (url.pathname === "/setup" || url.pathname === "/auth/google/start" || url.pathname === "/auth/google/pubsub/start")
-      ) {
-        const canonicalUrl = new URL(url);
-        canonicalUrl.hostname = url.pathname === "/auth/google/pubsub/start" ? pubsubCallbackHostname : callbackHostname;
-        return new Response(null, {
-          status: 302,
-          headers: { Location: canonicalUrl.toString(), "Cache-Control": "no-store" },
-        });
-      }
-
       const setupFile = request.method === "GET" ? SETUP_FILES[url.pathname] : undefined;
       if (setupFile) {
         return new Response(Bun.file(join(SETUP_DIRECTORY, setupFile.file)), {
@@ -219,6 +218,8 @@ export const createDevServer = (config: DevServerConfig): Bun.Server<unknown> =>
       }
 
       if (request.method === "GET" && url.pathname === "/auth/google/start") {
+        const redirectUri = callbackUriFor(request, url, callbackUrl);
+        if (!redirectUri) return redirectToHost(url, callbackHostname);
         const accountId = url.searchParams.get("accountId");
         if (!isAccountId(accountId)) return new Response("accountId must be personal or work", { status: 400 });
         const now = Date.now();
@@ -226,11 +227,11 @@ export const createDevServer = (config: DevServerConfig): Bun.Server<unknown> =>
           if (pending.createdAt < now - 10 * 60_000) pendingStates.delete(state);
         }
         const state = crypto.randomUUID();
-        pendingStates.set(state, { accountId, createdAt: now });
+        pendingStates.set(state, { accountId, createdAt: now, redirectUri });
         return new Response(null, {
           status: 302,
           headers: {
-            Location: config.oauth.authorizationUrl(accountId, state).toString(),
+            Location: config.oauth.authorizationUrl(accountId, state, "gmail", redirectUri).toString(),
             "Set-Cookie": `ze_oauth_state=${state}; HttpOnly; SameSite=Lax; Path=/auth/google/callback; Max-Age=600`,
             "Cache-Control": "no-store",
           },
@@ -238,22 +239,19 @@ export const createDevServer = (config: DevServerConfig): Bun.Server<unknown> =>
       }
 
       if (request.method === "GET" && url.pathname === "/auth/google/pubsub/start") {
-        if (url.hostname !== pubsubCallbackHostname) {
-          const canonicalUrl = new URL(url);
-          canonicalUrl.hostname = pubsubCallbackHostname;
-          return new Response(null, { status: 302, headers: { Location: canonicalUrl.toString(), "Cache-Control": "no-store" } });
-        }
+        const redirectUri = callbackUriFor(request, url, pubsubCallbackUrl);
+        if (!redirectUri) return redirectToHost(url, pubsubCallbackHostname);
         if (!config.pubsubOAuth) return new Response("Google Pub/Sub OAuth is not configured.", { status: 503 });
         const now = Date.now();
-        for (const [state, createdAt] of pendingPubSubStates) {
-          if (createdAt < now - 10 * 60_000) pendingPubSubStates.delete(state);
+        for (const [state, pending] of pendingPubSubStates) {
+          if (pending.createdAt < now - 10 * 60_000) pendingPubSubStates.delete(state);
         }
         const state = crypto.randomUUID();
-        pendingPubSubStates.set(state, now);
+        pendingPubSubStates.set(state, { createdAt: now, redirectUri });
         return new Response(null, {
           status: 302,
           headers: {
-            Location: config.pubsubOAuth.authorizationUrl("pubsub", state, "pubsub").toString(),
+            Location: config.pubsubOAuth.authorizationUrl("pubsub", state, "pubsub", redirectUri).toString(),
             "Set-Cookie": `ze_pubsub_oauth_state=${state}; HttpOnly; SameSite=Lax; Path=/auth/google/pubsub/callback; Max-Age=600`,
             "Cache-Control": "no-store",
           },
@@ -261,14 +259,11 @@ export const createDevServer = (config: DevServerConfig): Bun.Server<unknown> =>
       }
 
       if (request.method === "GET" && url.pathname === "/auth/google/pubsub/callback") {
-        if (url.hostname !== pubsubCallbackHostname) {
-          return new Response("Pub/Sub OAuth callback host does not match the configured loopback URI.", { status: 400 });
-        }
         const suppliedState = url.searchParams.get("state") ?? "";
         const separator = suppliedState.indexOf(":");
         const statePurpose = suppliedState.slice(0, separator);
         const state = suppliedState.slice(separator + 1);
-        const pendingAt = pendingPubSubStates.get(state);
+        const pending = pendingPubSubStates.get(state);
         const cookieState = request.headers.get("cookie")?.split(";")
           .map((part) => part.trim())
           .find((part) => part.startsWith("ze_pubsub_oauth_state="))
@@ -282,7 +277,11 @@ export const createDevServer = (config: DevServerConfig): Bun.Server<unknown> =>
             "Cache-Control": "no-store",
           },
         });
-        if (!config.pubsubOAuth || statePurpose !== "pubsub" || !state || pendingAt === undefined || pendingAt < Date.now() - 10 * 60_000 || cookieState !== state) {
+        if (
+          !config.pubsubOAuth || statePurpose !== "pubsub" || !state || !pending ||
+          pending.createdAt < Date.now() - 10 * 60_000 || cookieState !== state ||
+          new URL(pending.redirectUri).hostname !== url.hostname
+        ) {
           return new Response("Pub/Sub OAuth state is missing, expired, or invalid. Start connection again.", {
             status: 400,
             headers: { "Set-Cookie": clearStateCookie, "Cache-Control": "no-store" },
@@ -294,7 +293,7 @@ export const createDevServer = (config: DevServerConfig): Bun.Server<unknown> =>
         const code = url.searchParams.get("code");
         if (!code) return redirectError("Google did not return an authorization code.");
         try {
-          const { tokens } = await Effect.runPromise(config.pubsubOAuth.exchangeCode("pubsub", code));
+          const { tokens } = await Effect.runPromise(config.pubsubOAuth.exchangeCode("pubsub", code, pending.redirectUri));
           const previousEncrypted = await Effect.runPromise(config.registry.getServiceCredential("google_pubsub"));
           let previousRefreshToken: string | undefined;
           if (previousEncrypted) {
@@ -333,7 +332,10 @@ export const createDevServer = (config: DevServerConfig): Bun.Server<unknown> =>
           .find((part) => part.startsWith("ze_oauth_state="))
           ?.slice("ze_oauth_state=".length);
         const clearStateCookie = "ze_oauth_state=; HttpOnly; SameSite=Lax; Path=/auth/google/callback; Max-Age=0";
-        if (!isAccountId(stateAccountId) || !pending || pending.accountId !== stateAccountId || cookieNonce !== nonce) {
+        if (
+          !isAccountId(stateAccountId) || !pending || pending.accountId !== stateAccountId || cookieNonce !== nonce ||
+          new URL(pending.redirectUri).hostname !== url.hostname
+        ) {
           return new Response("OAuth state is missing, expired, or invalid. Start account connection again.", {
             status: 400,
             headers: { "Set-Cookie": clearStateCookie, "Cache-Control": "no-store" },
@@ -354,7 +356,7 @@ export const createDevServer = (config: DevServerConfig): Bun.Server<unknown> =>
         if (!code) return redirectError("Google did not return an authorization code.");
 
         try {
-          const { tokens } = await Effect.runPromise(config.oauth.exchangeCode(pending.accountId, code));
+          const { tokens } = await Effect.runPromise(config.oauth.exchangeCode(pending.accountId, code, pending.redirectUri));
           const clientLayer = GmailClientLive({ accessToken: tokens.accessToken, apiBaseUrl: config.gmailApiBaseUrl });
           const gmail = Effect.runSync(Effect.gen(function* () {
             return yield* GmailClient;
