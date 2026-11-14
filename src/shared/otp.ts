@@ -11,8 +11,8 @@ const KEYWORDS = [
 ] as const;
 
 // 4-8 digits, optionally split once by a space or hyphen ("123 456") and optionally behind a
-// "G-" style prefix. Letter-and-digit codes are left out: course codes, order IDs and product
-// names look the same and are far more common in mail.
+// "G-" style prefix. Codes with letters are matched separately (see standaloneLetterCode): course
+// codes, order IDs and product names look the same and are far more common in running text.
 const CANDIDATE = /(?<![\w.,/:#-])(?:[A-Z]-)?(\d{3,4}[ -]\d{3,4}|\d{4,8})(?![\w/:%#-]|[.,]\d)/g;
 
 /** How far (in characters) after a keyword a code may appear and still belong to it. */
@@ -56,7 +56,39 @@ const codeNearKeyword = (text: string): string | null => {
   return best?.code ?? null;
 };
 
-/** Extracts a one-time code from an email's subject and plain-text body, or null if none is clear. */
+/** A line holding nothing but a token, allowing Markdown emphasis, code spans and headings around it. */
+const STANDALONE_LINE = /^[#>\s]*[*_`]*([A-Za-z0-9]{4,10})[*_`]*\s*$/;
+
+/**
+ * Whether a letter token reads as random rather than as a word: it mixes letters and digits
+ * ("X7K9P2"), or switches from lower to upper case at least twice ("LqKmAU"; "GitHub" and
+ * "iPhone" switch once). All-capital words ("NOTION") stay out.
+ */
+const looksGenerated = (token: string): boolean =>
+  (/\d/.test(token) && /[A-Za-z]/.test(token)) || (token.match(/[a-z](?=[A-Z])/g)?.length ?? 0) >= 2;
+
+const mentionsKeyword = (text: string): boolean => {
+  const lower = text.toLowerCase();
+  return KEYWORDS.some((keyword) => lastKeywordBefore(lower, keyword, lower.length) >= 0);
+};
+
+/**
+ * A letter code set on a line of its own ("Login to Notion / LqKmAU / Sign in…"), when the mail
+ * mentions an OTP keyword anywhere and exactly one such token exists.
+ */
+const standaloneLetterCode = (subject: string, body: string): string | null => {
+  if (!mentionsKeyword(subject) && !mentionsKeyword(body)) return null;
+  const tokens = new Set(body.split("\n").flatMap((line) => {
+    const token = STANDALONE_LINE.exec(line)?.[1];
+    return token && /[A-Za-z]/.test(token) && looksGenerated(token) ? [token] : [];
+  }));
+  return tokens.size === 1 ? [...tokens][0]! : null;
+};
+
+/**
+ * Extracts a one-time code from an email's subject and plain-text body, or null if none is clear.
+ * Bump OTP_CODES_MIGRATION_ID in AccountDb.ts when this learns new shapes, so stored threads are rescanned.
+ */
 export const extractOtpCode = (subject: string, body: string): string | null => {
   const fromSubject = codeNearKeyword(subject);
   if (fromSubject) return fromSubject;
@@ -64,7 +96,8 @@ export const extractOtpCode = (subject: string, body: string): string | null => 
   if (fromBody) return fromBody;
   // "123456 is your code" puts the code before the keyword; accept a lone code-shaped token in the subject.
   const subjectCandidates = candidatesIn(subject);
-  return subjectCandidates.length === 1 ? subjectCandidates[0]!.code : null;
+  if (subjectCandidates.length === 1) return subjectCandidates[0]!.code;
+  return standaloneLetterCode(subject, body.slice(0, 5_000));
 };
 
 /**
@@ -85,3 +118,4 @@ export const copyableOtp = (
   thread: { readonly otpCode: string | null; readonly labels: ReadonlyArray<string> },
   otpLabels: ReadonlySet<string>,
 ): string | null => thread.otpCode && thread.labels.some((label) => otpLabels.has(label)) ? thread.otpCode : null;
+

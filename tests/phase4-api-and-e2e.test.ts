@@ -180,6 +180,18 @@ describe("Phase 4: one-time codes", () => {
     expect(extractOtpCode("Your code", "Use code 2026 in your account settings.")).toBeNull();
   });
 
+  test("takes letter codes only from a line of their own that cannot be a word", () => {
+    const notion = "LqKmAU\n\nNever share this code with anyone. If you didn’t request this code, you can ignore this email.";
+    expect(extractOtpCode("Your temporary Notion login code", notion)).toBe("LqKmAU");
+    expect(extractOtpCode("Your login code", "Sign in with:\n\n**X7K9P2**\n\nIt expires soon.")).toBe("X7K9P2");
+    // Brand names, capital words and codes inside sentences stay out.
+    expect(extractOtpCode("Your login code", "GitHub\n\nNOTION\n\niPhone")).toBeNull();
+    expect(extractOtpCode("Your login code", "Your code is LqKmAU, enter it now.")).toBeNull();
+    // Without an OTP keyword, or with two candidates, nothing is offered.
+    expect(extractOtpCode("Weekly digest", "LqKmAU")).toBeNull();
+    expect(extractOtpCode("Your login code", "LqKmAU\n\nX7K9P2")).toBeNull();
+  });
+
   test("only OTP-labelled threads offer a code; the label comes from the account's OTP rules", () => {
     const rules = [{ systemType: "OTP", actions: [{ type: "LABEL", label: "Codes" }] }, { systemType: "NEWSLETTER", actions: [{ type: "LABEL", label: "News" }] }];
     expect([...otpLabelNames(rules)]).toEqual(["Codes"]);
@@ -206,6 +218,10 @@ describe("Phase 4: one-time codes", () => {
     database.exec("ALTER TABLE threads DROP COLUMN otp_code");
     const migrated = open();
     expect((await Effect.runPromise(migrated.listThreadSummaries(filter, { limit: 5, offset: 0 })))[0]?.otpCode).toBe("222222");
+
+    // A newer extractor rescans threads stored by an older one.
+    database.exec("UPDATE threads SET otp_code = NULL; DELETE FROM schema_migrations WHERE id LIKE 'otp-codes-%'");
+    expect((await Effect.runPromise(open().listThreadSummaries(filter, { limit: 5, offset: 0 })))[0]?.otpCode).toBe("222222");
     database.close();
   });
 });

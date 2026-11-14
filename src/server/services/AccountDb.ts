@@ -282,21 +282,6 @@ const migrateAiStorage = (database: Database): void => {
     if (!columnNames(database, "threads").includes("ai_evaluated_through")) {
       database.exec("ALTER TABLE threads ADD COLUMN ai_evaluated_through INTEGER");
     }
-    if (!columnNames(database, "threads").includes("otp_code")) {
-      database.exec("ALTER TABLE threads ADD COLUMN otp_code TEXT");
-      // Backfill from each thread's newest message, as sync does for new mail.
-      const newest = database.prepare(`
-        SELECT threads.id, threads.subject, messages.body_markdown FROM threads
-        JOIN messages ON messages.id = (
-          SELECT id FROM messages WHERE thread_id = threads.id ORDER BY date_ts DESC, id DESC LIMIT 1
-        )
-      `).all() as Array<{ id: string; subject: string; body_markdown: string }>;
-      const update = database.prepare("UPDATE threads SET otp_code = ? WHERE id = ?");
-      for (const row of newest) {
-        const code = extractOtpCode(row.subject, row.body_markdown);
-        if (code) update.run(code, row.id);
-      }
-    }
     if (!columnNames(database, "messages").includes("body_html")) {
       // NULL marks messages stored before original HTML was kept; the API refetches those on open.
       database.exec("ALTER TABLE messages ADD COLUMN body_html TEXT");
@@ -329,6 +314,30 @@ const MESSAGES_FTS_TABLE = `
     tokenize = 'unicode61 remove_diacritics 2'
   );
 `;
+/** Bumped whenever extractOtpCode learns new code shapes (v2: letter codes), so stored threads are rescanned. */
+const OTP_CODES_MIGRATION_ID = "otp-codes-v2";
+
+/** Adds threads.otp_code if missing and (re)extracts it from each thread's newest message, as sync does for new mail. */
+const migrateOtpCodes = (database: Database): void => {
+  const columnMissing = !columnNames(database, "threads").includes("otp_code");
+  if (!columnMissing && database.prepare("SELECT 1 FROM schema_migrations WHERE id = ?").get(OTP_CODES_MIGRATION_ID)) return;
+  database.transaction(() => {
+    if (columnMissing) database.exec("ALTER TABLE threads ADD COLUMN otp_code TEXT");
+    const newest = database.prepare(`
+      SELECT threads.id, threads.subject, messages.body_markdown FROM threads
+      JOIN messages ON messages.id = (
+        SELECT id FROM messages WHERE thread_id = threads.id ORDER BY date_ts DESC, id DESC LIMIT 1
+      )
+    `).all() as Array<{ id: string; subject: string; body_markdown: string }>;
+    const update = database.prepare("UPDATE threads SET otp_code = ? WHERE id = ? AND otp_code IS NOT ?");
+    for (const row of newest) {
+      const code = extractOtpCode(row.subject, row.body_markdown);
+      update.run(code, row.id, code);
+    }
+    database.prepare("INSERT OR IGNORE INTO schema_migrations (id) VALUES (?)").run(OTP_CODES_MIGRATION_ID);
+  })();
+};
+
 const SEARCH_INDEX_MIGRATION_ID = "messages-fts-v2";
 
 /** Rewrites a thread's search rows from its messages: one row per message, with the thread subject. */
@@ -434,6 +443,7 @@ const initialize = (database: Database): void => {
   `);
 
   migrateAiStorage(database);
+  migrateOtpCodes(database);
   migrateSearchIndex(database);
 
   const migrationId = "gmail-hydrated-threads-v1";
