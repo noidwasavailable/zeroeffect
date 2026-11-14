@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef } from "react";
 import type { AppAction } from "../actions";
 import { attachmentPath, type AttachmentSummary, type LabelSummary, type ThreadDetail, type ThreadMessage } from "../../shared/api";
 import { resolveInlineImages, sanitizeEmailHtml } from "../emailHtml";
+import { outboundUrl } from "../../shared/trackers";
 import { displayName, formatBytes, formatFullDate, formatListDate } from "../format";
 import { allMessagesExpanded, foldLayout, initialFold, toggleMessage, type MessageFold } from "../threadFolding";
 import { toolbarButtonClass } from "./ActionToolbar";
@@ -26,15 +27,21 @@ function ShadowHtml({ html }: { readonly html: string }) {
     if (!element) return;
     const root = element.shadowRoot ?? element.attachShadow({ mode: "open" });
     root.innerHTML = `<style>${SHADOW_STYLES}</style><div class="body">${html}</div>`;
-    // Links open in a new tab instead of navigating the app away.
-    const onClick = (event: Event) => {
+    // Links open in a new tab instead of navigating the app away, past click trackers where
+    // possible (shared/trackers.ts). Middle clicks get the same treatment.
+    const onClick = (event: MouseEvent) => {
+      if (event.button > 1) return;
       const anchor = (event.target as Element | null)?.closest?.("a[href]") as HTMLAnchorElement | null;
       if (!anchor) return;
       event.preventDefault();
-      if (/^(https?|mailto):/i.test(anchor.href)) window.open(anchor.href, "_blank", "noopener,noreferrer");
+      if (/^(https?|mailto):/i.test(anchor.href)) window.open(outboundUrl(anchor.href), "_blank", "noopener,noreferrer");
     };
-    root.addEventListener("click", onClick);
-    return () => root.removeEventListener("click", onClick);
+    root.addEventListener("click", onClick as EventListener);
+    root.addEventListener("auxclick", onClick as EventListener);
+    return () => {
+      root.removeEventListener("click", onClick as EventListener);
+      root.removeEventListener("auxclick", onClick as EventListener);
+    };
   }, [html]);
   return <div ref={host} />;
 }

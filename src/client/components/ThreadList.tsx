@@ -2,6 +2,7 @@ import { useEffect, useRef } from "react";
 import type { AppAction } from "../actions";
 import type { LabelSummary, ThreadSummary } from "../../shared/api";
 import { copyableOtp, openableLoginLink } from "../../shared/otp";
+import { unwrapTrackedUrl } from "../../shared/trackers";
 import { displayName, formatListDate } from "../format";
 import { Keycap } from "./Keycap";
 import { LabelChips } from "./LabelChips";
@@ -97,7 +98,7 @@ export function ThreadList({ threads, selectedIndex, openThreadId, labelCatalog,
                   onClick={(event) => { event.stopPropagation(); onOpenLoginLink(index); }}
                   onDoubleClick={(event) => event.stopPropagation()}
                 >
-                  Sign in → {new URL(loginLink).host}
+                  Sign in → {new URL(unwrapTrackedUrl(loginLink)).host}
                   {selected && openLoginLinkAction?.shortcut && <Keycap shortcut={openLoginLinkAction.shortcut} />}
                 </button>
               )}

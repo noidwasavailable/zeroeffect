@@ -1,4 +1,5 @@
 import type { AccountSummary, ThreadAction, ThreadSummary, ViewSummary } from "../shared/api";
+import { unwrapTrackedUrl } from "../shared/trackers";
 
 /**
  * Every user action is declared once here. The Cmd+K palette lists all of them, the action
@@ -296,7 +297,7 @@ export const buildActions = (context: ActionContext): ReadonlyArray<AppAction> =
     },
     {
       id: "thread.openLoginLink",
-      label: context.selectedLoginLink ? `Open sign-in link on ${new URL(context.selectedLoginLink).host} and mark read` : "Open sign-in link",
+      label: context.selectedLoginLink ? `Open sign-in link on ${new URL(unwrapTrackedUrl(context.selectedLoginLink)).host} and mark read` : "Open sign-in link",
       group: "Thread", shortcut: { key: "P" }, enabled: context.selectedLoginLink !== null, run: context.openLoginLink,
     },
     {

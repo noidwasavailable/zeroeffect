@@ -185,6 +185,7 @@ zero-effect/
 │       ├── filterDsl.ts            # DSL formatter (FilterExpr → canonical DSL)
 │       ├── searchText.ts           # Full-text tokenizer and matcher (both targets)
 │       ├── unicode61Table.ts       # Generated: SQLite unicode61 per-code-point table
+│       ├── trackers.ts             # Click-tracker unwrapping for links opened from email
 │       ├── schemas.ts              # Effect Schema definitions
 │       └── errors.ts               # Data.TaggedError definitions
 ├── tests/

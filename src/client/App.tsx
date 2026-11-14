@@ -22,6 +22,7 @@ import { parseFilterDsl } from "../shared/filterParser";
 import { copyableOtp, openableLoginLink, otpLabelNames } from "../shared/otp";
 import { copyText } from "./clipboard";
 import { openInNewTab } from "./openTab";
+import { outboundUrl } from "../shared/trackers";
 import { allMessagesExpanded, initialFold, revealMessage, toggleAllMessages, type MessageFold } from "./threadFolding";
 import { applyThreadAction } from "../shared/threadActions";
 import { BUILT_IN_VIEWS } from "../shared/views";
@@ -485,7 +486,7 @@ function Inbox({ accounts, route, navigate }: {
   const openLoginLink = useCallback((target: ThreadSummary | null) => {
     const link = target ? openableLoginLink(target, otpLabels) : null;
     if (!target || !link) return;
-    if (!openInNewTab(link)) {
+    if (!openInNewTab(outboundUrl(link))) {
       setNotice({ text: "The browser blocked the new tab. Allow pop-ups for ZeroEffect and try again.", tone: "error" });
       return;
     }
