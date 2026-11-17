@@ -227,6 +227,7 @@ export interface AiAuditSummary {
     readonly labelsAdded: ReadonlyArray<string>;
     readonly labelsRemoved: ReadonlyArray<string>;
     readonly ghostLabelsAdded: ReadonlyArray<string>;
+    readonly kept?: { readonly by: ReadonlyArray<string>; readonly overridden: ReadonlyArray<string> };
   };
   readonly reverted: boolean;
   readonly latencyMs: number;

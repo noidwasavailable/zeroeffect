@@ -68,7 +68,7 @@ const rule = (overrides: Partial<AiRule> & Pick<AiRule, "name">): AiRule => ({
 
 /** Mirrors the user's Inbox Zero export: four conversation statuses plus first-message-only categories. */
 const RULES: ReadonlyArray<AiRule> = [
-  rule({ name: "To Reply", systemType: "TO_REPLY", runOnThreads: true }),
+  rule({ name: "To Reply", systemType: "TO_REPLY", runOnThreads: true, actions: [{ type: "LABEL", label: "To Reply" }, { type: "KEEP" }] }),
   rule({ name: "Awaiting Reply", systemType: "AWAITING_REPLY", runOnThreads: true }),
   rule({ name: "FYI", systemType: "FYI", runOnThreads: true }),
   rule({ name: "Actioned", systemType: "ACTIONED", runOnThreads: true }),
@@ -164,13 +164,17 @@ describe("Phase 3: rule files and prompts", () => {
         actions: [{ type: "LABEL", label: "Receipt", to: null, cc: null, delayInMinutes: null }, { type: "MARK_READ", label: null }] },
       { name: "Auto reply", instructions: "Reply to these", enabled: true, automate: true, runOnThreads: true, systemType: null, conditionalOperator: "AND", from: null, to: null, subject: null, body: null, categoryFilterType: null,
         actions: [{ type: "DRAFT_EMAIL", content: "Thanks!" }] },
+      { name: "To Reply", instructions: "Needs my reply", enabled: true, automate: true, runOnThreads: true, systemType: "TO_REPLY", conditionalOperator: "AND", from: null, to: null, subject: null, body: null, categoryFilterType: null,
+        actions: [{ type: "LABEL", label: "To Reply" }] },
       { name: "Delayed", instructions: "Later", enabled: false, automate: false, runOnThreads: false, systemType: null, conditionalOperator: "OR", from: "boss@", to: null, subject: null, body: null, categoryFilterType: null,
         actions: [{ type: "ARCHIVE", delayInMinutes: 60 }] },
     ];
     const result = importInboxZeroRules(exported, "openai");
-    expect(result.imported).toEqual(["Receipt"]);
+    expect(result.imported).toEqual(["Receipt", "To Reply"]);
     expect(result.skipped.map((problem) => problem.rule)).toEqual(["Auto reply", "Auto reply", "Delayed"]);
     expect(result.file.rules[0]).toMatchObject({ actions: [{ type: "LABEL", label: "Receipt" }, { type: "MARK_READ" }] });
+    // A thread waiting on the user's reply is kept in the inbox, unread, whatever else matches it.
+    expect(result.file.rules[1]).toMatchObject({ actions: [{ type: "LABEL", label: "To Reply" }, { type: "KEEP" }] });
     // The stored file is readable JSON that parses back to the same rules.
     expect(parseRulesFile(formatRulesFile(result.file))).toMatchObject({ rules: result.file.rules, problems: [] });
   });
@@ -178,10 +182,11 @@ describe("Phase 3: rule files and prompts", () => {
   test("one invalid rule is reported without disabling the rest", () => {
     const loaded = parseRulesFile(JSON.stringify({
       version: 1, llmEndpointId: null,
-      rules: [RULES[4], { ...RULES[5], actions: [{ type: "FORWARD" }] }, { ...RULES[4] }, { ...RULES[6], precondition: "label:(" }],
+      rules: [RULES[4], { ...RULES[5], actions: [{ type: "FORWARD" }] }, { ...RULES[4] }, { ...RULES[6], precondition: "label:(" },
+        { ...RULES[0], actions: [{ type: "KEEP" }, { type: "MARK_READ" }] }],
     }));
     expect(loaded.rules.map((entry) => entry.name)).toEqual(["Newsletter"]);
-    expect(loaded.problems.map((problem) => problem.rule)).toEqual(["Marketing", "Newsletter", "Job Search"]);
+    expect(loaded.problems.map((problem) => problem.rule)).toEqual(["Marketing", "Newsletter", "Job Search", "To Reply"]);
     expect(parseRulesFile("{ not json").problems[0]?.message).toContain("invalid");
     expect(parseRulesFile(null)).toMatchObject({ rules: [], problems: [] });
   });
@@ -318,6 +323,26 @@ describe("Phase 3: one structured LLM call per thread", () => {
     const labels = (await env.thread("t-chat")).labels;
     expect(labels).toContain("Awaiting Reply");
     expect(labels).not.toContain("To Reply");
+  });
+
+  test("a rule that keeps the thread outweighs rules that would archive it or mark it read", async () => {
+    await env.deliver("t-job", { id: "m1", from: "Recruiter <sam@talent.example>", at: 100, labels: ["INBOX", "UNREAD"], body: "What are your salary expectations?" });
+    llmReplies.push(selection(["Job Search", "Conversations"], "TO_REPLY", "A recruiter asks for salary expectations."));
+    expect(await env.run("t-job")).toMatchObject({ appliedRules: ["Job Search", "To Reply"], conversationStatus: "TO_REPLY" });
+    // Both labels land; Job Search's MARK_READ does not.
+    expect(env.gmailChanges.at(-1)).toEqual({ threadId: "t-job", add: ["Label_job_search", "Label_to_reply"], remove: [] });
+    expect(await env.thread("t-job")).toMatchObject({ isArchived: false, isUnread: true });
+    const [audit] = await Effect.runPromise(env.db.listAiAudits("t-job"));
+    expect(audit?.changes.kept).toEqual({ by: ["To Reply"], overridden: ["Job Search"] });
+  });
+
+  test("label-only rules do not stop other rules from archiving or marking read", async () => {
+    await env.deliver("t-sale", { id: "m1", from: "Shop <hello@shop.example>", at: 100, labels: ["INBOX", "UNREAD"] });
+    llmReplies.push(selection(["Marketing", "Conversations"], "FYI"));
+    expect(await env.run("t-sale")).toMatchObject({ appliedRules: ["Marketing", "FYI"] });
+    expect(await env.thread("t-sale")).toMatchObject({ isArchived: true, isUnread: false });
+    const [audit] = await Effect.runPromise(env.db.listAiAudits("t-sale"));
+    expect(audit?.changes.kept).toBeUndefined();
   });
 
   test("automate=false rules become ghost labels, and undo restores the previous state", async () => {

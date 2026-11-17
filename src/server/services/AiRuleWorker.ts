@@ -241,6 +241,10 @@ const makeService = (
     const add = new Set<string>();
     const remove = new Set<string>();
     const suggested = new Set<string>();
+    // Labels add up, but attention does not: one rule keeping the thread (suggested ones too)
+    // outweighs any number of rules that would archive it or mark it read.
+    const keepers = finalRules.filter((rule) => rule.actions.some((action) => action.type === "KEEP"));
+    const overridden: string[] = [];
     for (const rule of finalRules) {
       if (!rule.automate) {
         // Suggestions carry labels only; archive / mark-read wait for an explicit decision.
@@ -248,6 +252,11 @@ const makeService = (
         continue;
       }
       for (const label of ruleLabels(rule)) add.add(label);
+      const quiets = rule.actions.some((action) => action.type === "ARCHIVE" || action.type === "MARK_READ");
+      if (quiets && keepers.length > 0) {
+        overridden.push(rule.name);
+        continue;
+      }
       if (rule.actions.some((action) => action.type === "ARCHIVE")) remove.add("INBOX");
       if (rule.actions.some((action) => action.type === "MARK_READ")) remove.add("UNREAD");
     }
@@ -294,6 +303,7 @@ const makeService = (
         labelsRemoved,
         ghostLabelsAdded: ghostAfter.filter((label) => !ghostBefore.includes(label)),
         ghostLabelsBefore: ghostChanged ? ghostBefore : ghostAfter,
+        ...(overridden.length > 0 ? { kept: { by: keepers.map((rule) => rule.name), overridden } } : {}),
       },
       reverted: false,
       latencyMs: llmResult?.latencyMs ?? 0,

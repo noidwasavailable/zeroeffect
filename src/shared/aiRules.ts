@@ -9,7 +9,12 @@ export type ConversationStatus = (typeof CONVERSATION_STATUSES)[number];
 export const isConversationStatus = (value: string | null | undefined): value is ConversationStatus =>
   CONVERSATION_STATUSES.some((status) => status === value);
 
-export const RULE_ACTION_TYPES = ["LABEL", "ARCHIVE", "MARK_READ"] as const;
+/**
+ * LABEL says what a thread is about; ARCHIVE and MARK_READ quiet it. KEEP (a ZeroEffect extension)
+ * says the thread needs the user: when any matched rule keeps a thread, no rule archives it or
+ * marks it read.
+ */
+export const RULE_ACTION_TYPES = ["LABEL", "ARCHIVE", "MARK_READ", "KEEP"] as const;
 export type RuleActionType = (typeof RULE_ACTION_TYPES)[number];
 
 export interface RuleAction {

@@ -5,6 +5,8 @@ import {
   RULE_ACTION_TYPES,
   type AiRule,
   type AiRulesFile,
+  type RuleAction,
+  type RuleActionType,
 } from "../../shared/aiRules";
 import { formatFilterExpr, renameFilterLabels } from "../../shared/filterDsl";
 import { parseFilterDsl } from "../../shared/filterParser";
@@ -68,6 +70,9 @@ const ruleProblems = (rule: AiRule): string[] => {
   if (rule.actions.length === 0 && !isConversationStatus(rule.systemType)) problems.push("Rule has no actions.");
   for (const action of rule.actions) {
     if (action.type === "LABEL" && !action.label?.trim()) problems.push("LABEL actions need a label.");
+  }
+  if (rule.actions.some((action) => action.type === "KEEP") && rule.actions.some((action) => action.type === "ARCHIVE" || action.type === "MARK_READ")) {
+    problems.push("KEEP cannot be combined with ARCHIVE or MARK_READ.");
   }
   if (rule.precondition?.trim()) {
     const parsed = parseFilterDsl(rule.precondition);
@@ -194,21 +199,25 @@ export const importInboxZeroRules = (exported: unknown, llmEndpointId: string | 
       }
       const extras = UNSUPPORTED_ACTION_FIELDS.filter((field) => action[field] !== null && action[field] !== undefined);
       if (extras.length > 0) issues.push(`${String(action.type)} action uses unsupported fields: ${extras.join(", ")}.`);
-      return [action.type === "LABEL" ? { type: "LABEL" as const, label: typeof action.label === "string" ? action.label : null } : { type: action.type as "ARCHIVE" | "MARK_READ" }];
+      return [action.type === "LABEL" ? { type: "LABEL" as const, label: typeof action.label === "string" ? action.label : null } : { type: action.type as Exclude<RuleActionType, "LABEL"> }];
     });
+    const systemType = typeof source.systemType === "string" ? source.systemType : null;
+    // A thread waiting on the user's reply must not be quietened by another rule that also matches it.
+    const keepsThread = systemType === "TO_REPLY" && !converted.some((action) => action.type !== "LABEL");
+    const ruleActions: RuleAction[] = keepsThread ? [...converted, { type: "KEEP" }] : converted;
     const candidate = {
       name,
       instructions: typeof source.instructions === "string" ? source.instructions : "",
       enabled: source.enabled !== false,
       automate: source.automate !== false,
       runOnThreads: source.runOnThreads === true,
-      systemType: typeof source.systemType === "string" ? source.systemType : null,
+      systemType,
       conditionalOperator: source.conditionalOperator === "OR" ? "OR" as const : "AND" as const,
       from: typeof source.from === "string" ? source.from : null,
       to: typeof source.to === "string" ? source.to : null,
       subject: typeof source.subject === "string" ? source.subject : null,
       body: typeof source.body === "string" ? source.body : null,
-      actions: converted,
+      actions: ruleActions,
     } satisfies AiRule;
     issues.push(...ruleProblems(candidate));
     if (rules.some((rule) => rule.name.toLowerCase() === name.toLowerCase())) issues.push("Another rule already uses this name.");

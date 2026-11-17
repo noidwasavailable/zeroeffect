@@ -90,6 +90,8 @@ export interface AiRunChanges {
   readonly labelsRemoved: ReadonlyArray<string>;
   readonly ghostLabelsAdded: ReadonlyArray<string>;
   readonly ghostLabelsBefore: ReadonlyArray<string>;
+  /** Set when KEEP rules (`by`) stopped other rules (`overridden`) from archiving or marking read. */
+  readonly kept?: { readonly by: ReadonlyArray<string>; readonly overridden: ReadonlyArray<string> };
 }
 
 export interface AiAuditRecord {
