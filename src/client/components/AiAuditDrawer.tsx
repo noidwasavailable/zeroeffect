@@ -12,8 +12,8 @@ const STATUS_LABELS: Record<string, string> = {
 };
 
 function Changes({ audit }: { readonly audit: AiAuditSummary }) {
-  const { labelsAdded, labelsRemoved, ghostLabelsAdded } = audit.changes;
-  if (labelsAdded.length + labelsRemoved.length + ghostLabelsAdded.length === 0) {
+  const { labelsAdded, labelsRemoved, ghostLabelsAdded, kept } = audit.changes;
+  if (labelsAdded.length + labelsRemoved.length + ghostLabelsAdded.length === 0 && !kept) {
     return <p className="text-xs text-zinc-500">No changes.</p>;
   }
   const describe = (label: string) => label === "INBOX" ? "Inbox (archived)" : label === "UNREAD" ? "Unread (marked read)" : label;
@@ -22,6 +22,7 @@ function Changes({ audit }: { readonly audit: AiAuditSummary }) {
       {labelsAdded.map((label) => <li key={`+${label}`} className="text-emerald-700 dark:text-emerald-400">+ {label}</li>)}
       {labelsRemoved.map((label) => <li key={`-${label}`} className="text-red-700 dark:text-red-400">− {describe(label)}</li>)}
       {ghostLabelsAdded.map((label) => <li key={`?${label}`} className="text-zinc-500">suggested: {label}</li>)}
+      {kept && <li className="text-zinc-500">kept in inbox, unread: {kept.by.join(", ")} overrode {kept.overridden.join(", ")}</li>}
     </ul>
   );
 }

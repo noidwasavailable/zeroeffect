@@ -31,7 +31,7 @@ const ruleIssues = (rule: AiRule, rules: ReadonlyArray<AiRule>): string[] => {
   if (rules.filter((other) => other.name.trim().toLowerCase() === rule.name.trim().toLowerCase()).length > 1) issues.push("Another rule has this name.");
   if (!rule.instructions.trim() && !rule.from && !rule.to && !rule.subject && !rule.body) issues.push("Add instructions or a static condition.");
   const isStatus = CONVERSATION_STATUSES.some((status) => status === rule.systemType);
-  if (rule.actions.length === 0 && !isStatus) issues.push("Add a label, archive or mark-read action.");
+  if (rule.actions.length === 0 && !isStatus) issues.push("Add a label, archive, mark-read or keep action.");
   if (rule.actions.some((action) => action.type === "LABEL" && !action.label?.trim())) issues.push("Label actions need a label name.");
   if (rule.precondition?.trim()) {
     const parsed = parseFilterDsl(rule.precondition);
@@ -62,11 +62,14 @@ function RuleEditor({ rule, issues, onChange, onDelete }: {
   const [labelsText, setLabelsText] = useState(() => rule.actions.flatMap((action) => action.type === "LABEL" ? [action.label ?? ""] : []).join(", "));
   const archive = rule.actions.some((action) => action.type === "ARCHIVE");
   const markRead = rule.actions.some((action) => action.type === "MARK_READ");
-  const setActions = (labels: string, nextArchive: boolean, nextMarkRead: boolean) => {
+  const keep = rule.actions.some((action) => action.type === "KEEP");
+  // Keep and the quieting actions exclude each other, so ticking one clears the other side.
+  const setActions = (labels: string, nextArchive: boolean, nextMarkRead: boolean, nextKeep = keep && !nextArchive && !nextMarkRead) => {
     const actions: RuleAction[] = [
       ...labels.split(",").map((label) => label.trim()).filter(Boolean).map((label) => ({ type: "LABEL" as const, label })),
-      ...(nextArchive ? [{ type: "ARCHIVE" as const }] : []),
-      ...(nextMarkRead ? [{ type: "MARK_READ" as const }] : []),
+      ...(nextArchive && !nextKeep ? [{ type: "ARCHIVE" as const }] : []),
+      ...(nextMarkRead && !nextKeep ? [{ type: "MARK_READ" as const }] : []),
+      ...(nextKeep ? [{ type: "KEEP" as const }] : []),
     ];
     onChange({ ...rule, actions });
   };
@@ -107,7 +110,9 @@ function RuleEditor({ rule, issues, onChange, onDelete }: {
         <div className="flex gap-4 text-sm">
           <label className="flex items-center gap-2"><input type="checkbox" checked={archive} onChange={(event) => setActions(labelsText, event.target.checked, markRead)} /> Archive</label>
           <label className="flex items-center gap-2"><input type="checkbox" checked={markRead} onChange={(event) => setActions(labelsText, archive, event.target.checked)} /> Mark read</label>
+          <label className="flex items-center gap-2"><input type="checkbox" checked={keep} onChange={(event) => setActions(labelsText, archive, markRead, event.target.checked)} /> Keep in inbox, unread</label>
         </div>
+        <span className="text-xs text-zinc-500">Keep wins: when this rule matches, no other rule archives the conversation or marks it read.</span>
       </fieldset>
       <details className="rounded-md border border-zinc-200 p-3 dark:border-zinc-800" open={Boolean(rule.precondition || rule.from || rule.to || rule.subject || rule.body)}>
         <summary className="cursor-pointer text-xs font-medium text-zinc-600 dark:text-zinc-400">Conditions (optional)</summary>
